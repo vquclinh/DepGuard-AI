@@ -1,6 +1,6 @@
-import { useState } from "react";
-import { FolderSearch, ShieldCheck } from "lucide-react";
-import { scanProject } from "@/hooks/useDepGuard";
+import { useState, useEffect } from "react";
+import { FolderSearch, ShieldCheck, Activity } from "lucide-react";
+import { scanProject, getProviders } from "@/hooks/useDepGuard";
 import { HealthScore } from "@/components/HealthScore";
 import { PackagesTable } from "@/components/PackagesTable";
 import type { PackageData } from "@/components/PackagesTable";
@@ -10,6 +10,7 @@ import type { LogEntry } from "@/components/UpdateLog";
 function App() {
   const [folderPath, setFolderPath] = useState("/mnt/vquclinh/PROJECT-CMAKE/DEPGUARD-AI/DepGuard-AI");
   const [isScanning, setIsScanning] = useState(false);
+  const [providerStatuses, setProviderStatuses] = useState<any[]>([]);
   
   const [healthData, setHealthData] = useState<{
     score: number;
@@ -30,6 +31,16 @@ function App() {
       },
     ]);
   };
+
+  useEffect(() => {
+    getProviders()
+      .then(data => {
+        if (data && data.providers) {
+          setProviderStatuses(data.providers);
+        }
+      })
+      .catch(err => console.error("Failed to load providers:", err));
+  }, []);
 
   const handleScan = async () => {
     if (!folderPath) return;
@@ -64,14 +75,34 @@ function App() {
     <div className="min-h-screen bg-[#0f0f0f] text-foreground font-sans flex flex-col">
       {/* Header */}
       <header className="border-b bg-card shadow-sm sticky top-0 z-10">
-        <div className="container mx-auto px-6 py-4 flex items-center gap-3">
-          <div className="bg-primary text-primary-foreground p-2 rounded-lg">
-            <ShieldCheck className="w-6 h-6" />
+        <div className="container mx-auto px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="bg-primary text-primary-foreground p-2 rounded-lg">
+              <ShieldCheck className="w-6 h-6" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold tracking-tight">DepGuard AI</h1>
+              <p className="text-xs text-muted-foreground font-medium">Autonomous Dependency Architect</p>
+            </div>
           </div>
-          <div>
-            <h1 className="text-xl font-bold tracking-tight">DepGuard AI</h1>
-            <p className="text-xs text-muted-foreground font-medium">Autonomous Dependency Architect</p>
-          </div>
+          
+          {providerStatuses.length > 0 && (
+            <div className="flex items-center gap-3 text-sm bg-muted/50 px-4 py-2 rounded-full border">
+              <span className="font-semibold text-muted-foreground flex items-center gap-1.5">
+                <Activity className="w-4 h-4" /> LLM Status:
+              </span>
+              <div className="flex items-center gap-3 ml-1">
+                {providerStatuses.map(p => {
+                  const isAvail = p.status === "available";
+                  return (
+                    <span key={p.name} className={`flex items-center gap-1 ${isAvail ? 'text-green-500 font-medium' : 'text-muted-foreground'}`}>
+                      {p.name.charAt(0).toUpperCase() + p.name.slice(1)} {isAvail ? "✅" : (p.name === "qwen" ? "⚡ Kaggle" : "❌")}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       </header>
 

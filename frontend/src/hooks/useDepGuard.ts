@@ -36,3 +36,12 @@ export async function rollbackPackage(checkpointId: string, folderPath: string) 
   }
   return response.json();
 }
+
+export async function getProviders() {
+  const response = await fetch('/api/providers');
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to fetch providers');
+  }
+  return response.json();
+}

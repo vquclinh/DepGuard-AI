@@ -28,7 +28,7 @@ const severityColors: Record<string, string> = {
 
 export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProps) {
   const [updating, setUpdating] = useState<Record<string, boolean>>({});
-  const [statuses, setStatuses] = useState<Record<string, { type: "success" | "error", error?: string, checkpoint?: string }>>({});
+  const [statuses, setStatuses] = useState<Record<string, { type: "success" | "error", error?: string, checkpoint?: string, provider?: string }>>({});
 
   const handleUpdate = async (pkg: PackageData) => {
     setUpdating(prev => ({ ...prev, [pkg.name]: true }));
@@ -37,7 +37,7 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
     try {
       const result = await updatePackage(folderPath, pkg);
       if (result.status === "success" || result.status === "updated_version_only") {
-        setStatuses(prev => ({ ...prev, [pkg.name]: { type: "success" } }));
+        setStatuses(prev => ({ ...prev, [pkg.name]: { type: "success", provider: result.llm_provider } }));
         onLog(`Successfully updated ${pkg.name}.`, "success");
       } else {
         setStatuses(prev => ({ ...prev, [pkg.name]: { type: "error", error: "Failed", checkpoint: result.checkpoint_id } }));
@@ -111,6 +111,12 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
                     {!isUpdating && status?.type === "success" && (
                       <span className="text-green-500 flex items-center gap-1">
                         <CheckCircle2 className="w-5 h-5" /> Updated
+                        {status.provider && status.provider !== "none" && (
+                          <span className="ml-1 text-xs px-2 py-0.5 bg-muted text-muted-foreground rounded-full border">
+                            via {status.provider.charAt(0).toUpperCase() + status.provider.slice(1)}
+                            {status.provider === "qwen" && " ⚡"}
+                          </span>
+                        )}
                       </span>
                     )}
 
