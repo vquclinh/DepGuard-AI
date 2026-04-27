@@ -13,9 +13,9 @@ from typing import Dict, List, Any
 from dotenv import load_dotenv
 
 try:
-    from anthropic import AsyncAnthropic
+    from tools.llm_router import LLMRouter
 except ImportError:
-    print("anthropic is required. Install with: pip install anthropic")
+    print("llm_router is required. Ensure you are running from the project root.")
     sys.exit(1)
 
 # Load environment variables
@@ -27,9 +27,7 @@ logger = logging.getLogger(__name__)
 
 class PatchAgent:
     def __init__(self):
-        self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-        self.anthropic_client = AsyncAnthropic(api_key=self.anthropic_api_key) if self.anthropic_api_key else None
-        self.model = "claude-sonnet-4-20250514"
+        self.router = LLMRouter()
 
     def _create_checkpoint(self, package: str) -> tuple[str, bool]:
         checkpoint_id = f"depguard_checkpoint_{uuid.uuid4().hex[:8]}"
@@ -67,11 +65,7 @@ class PatchAgent:
             return match.group(1)
         return response_text.strip()
 
-    async def _patch_file(self, filepath: str, matches: list, scout_context: dict) -> tuple[bool, str]:
-        if not self.anthropic_client:
-            logger.error("Anthropic API key not set. Cannot patch file.")
-            return False, "Missing API Key"
-
+    async def _patch_file(self, filepath: str, matches: list, scout_context: dict, task_type: str) -> tuple[bool, str, dict]:
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 original_content = f.read()
@@ -104,32 +98,26 @@ Code:
 """
 
         try:
-            response = await self.anthropic_client.messages.create(
-                model=self.model,
-                max_tokens=2000,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            response_text = response.content[0].text
+            response = await self.router.complete(system_prompt, prompt, max_tokens=2000, task_type=task_type)
+            response_text = response.content
             patched_content = self._extract_code(response_text)
+            llm_info = {"provider": response.provider, "fallback_used": response.fallback_used}
 
             # Validate AST
             try:
                 ast.parse(patched_content, filename=filepath)
             except SyntaxError as e:
                 logger.error(f"Validation failed for {filepath}: {e}")
-                return False, f"Syntax error in LLM output: {e}"
+                return False, f"Syntax error in LLM output: {e}", llm_info
 
             # Write file
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(patched_content)
 
-            return True, ""
+            return True, "", llm_info
         except Exception as e:
             logger.error(f"Error patching {filepath}: {e}")
-            return False, str(e)
+            return False, str(e), {}
 
     def _update_dependency_file(self, dep_file_path: str, package: str, from_v: str, to_v: str):
         try:
@@ -165,12 +153,20 @@ Code:
             "files_patched": [],
             "dependency_file_updated": "",
             "checkpoint_id": "",
-            "overall_status": "in_progress"
+            "overall_status": "in_progress",
+            "llm_provider": "none",
+            "fallback_used": False
         }
 
         if not matches_by_file:
             report["overall_status"] = "success"
             return report
+
+        breaking_changes = scout_output.get("breaking_changes", [])
+        if breaking_changes and all(c.get("type") == "renamed" for c in breaking_changes):
+            task_type = "patch_simple"
+        else:
+            task_type = "patch_complex"
 
         checkpoint_id, commit_made = self._create_checkpoint(package)
         report["checkpoint_id"] = checkpoint_id
@@ -178,7 +174,10 @@ Code:
         overall_success = True
         
         for filepath, matches in matches_by_file.items():
-            success, error_msg = await self._patch_file(filepath, matches, scout_output)
+            success, error_msg, llm_info = await self._patch_file(filepath, matches, scout_output, task_type)
+            if llm_info:
+                report["llm_provider"] = llm_info.get("provider", report["llm_provider"])
+                report["fallback_used"] = report["fallback_used"] or llm_info.get("fallback_used", False)
             
             lines_changed = list(set([m.get("line", 0) for m in matches]))
             
@@ -244,9 +243,8 @@ if __name__ == "__main__":
         class TestPatchAgent(unittest.TestCase):
             def setUp(self):
                 self.agent = PatchAgent()
-                self.agent.anthropic_api_key = "test"
-                self.agent.anthropic_client = MagicMock()
-                self.agent.anthropic_client.messages.create = AsyncMock()
+                self.agent.router = MagicMock()
+                self.agent.router.complete = AsyncMock()
                 self.test_dir = tempfile.mkdtemp()
                 
                 self.scout_output = {
@@ -280,8 +278,10 @@ if __name__ == "__main__":
                 mock_subprocess.return_value = mock_res
                 
                 mock_msg = MagicMock()
-                mock_msg.content = [MagicMock(text='```python\nimport numpy as np\nmask = np.bool_(1)\n```')]
-                self.agent.anthropic_client.messages.create.return_value = mock_msg
+                mock_msg.content = '```python\nimport numpy as np\nmask = np.bool_(1)\n```'
+                mock_msg.provider = "claude"
+                mock_msg.fallback_used = False
+                self.agent.router.complete.return_value = mock_msg
                 
                 report = self.agent.run_sync(self.scout_output, self.ast_output, self.dep_file)
                 
@@ -300,8 +300,10 @@ if __name__ == "__main__":
             @patch('subprocess.run')
             def test_syntax_error_rollback(self, mock_subprocess):
                 mock_msg = MagicMock()
-                mock_msg.content = [MagicMock(text='```python\nimport numpy as np\nmask = invalid syntax\n```')]
-                self.agent.anthropic_client.messages.create.return_value = mock_msg
+                mock_msg.content = '```python\nimport numpy as np\nmask = invalid syntax\n```'
+                mock_msg.provider = "claude"
+                mock_msg.fallback_used = False
+                self.agent.router.complete.return_value = mock_msg
                 
                 report = self.agent.run_sync(self.scout_output, self.ast_output, self.dep_file)
                 

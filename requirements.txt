@@ -4,3 +4,5 @@ z3-solver
 langgraph
 pydantic
 httpx
+google-genai
+openai

@@ -24,6 +24,7 @@ try:
     from agents.scout import ScoutAgent
     from agents.patch import PatchAgent
     from tools.ast_scanner import ASTScanner
+    from tools.llm_router import LLMRouter
 except ImportError as e:
     print(f"Warning: Could not import agents. Ensure you are running from the project root. ({e})")
 
@@ -69,8 +70,15 @@ class RollbackRequest(BaseModel):
 async def health_check():
     return {"status": "ok", "version": "1.0.0"}
 
+@app.get("/providers")
+def get_providers():
+    router = LLMRouter()
+    status = router.get_providers_status()
+    active_provider = next((p["name"] for p in status if p["status"] == "available"), "none")
+    return {"providers": status, "active_provider": active_provider}
+
 @app.post("/scan")
-async def scan_project(req: ScanRequest):
+def scan_project(req: ScanRequest):
     folder_path = Path(req.folder_path)
     if not folder_path.exists() or not folder_path.is_dir():
         logger.error(f"Scan failed: Folder path {folder_path} does not exist")
@@ -115,7 +123,9 @@ async def scan_project(req: ScanRequest):
 
 
 @app.post("/update")
-async def update_package(req: UpdateRequest):
+def update_package(req: UpdateRequest):
+    import time
+    start_time = time.time()
     folder_path = Path(req.folder_path)
     if not folder_path.exists() or not folder_path.is_dir():
         logger.error(f"Update failed: Folder path {folder_path} does not exist")
@@ -149,7 +159,10 @@ async def update_package(req: UpdateRequest):
                     "package": package,
                     "status": "updated_version_only",
                     "files_patched": [],
-                    "checkpoint_id": ""
+                    "checkpoint_id": "",
+                    "llm_provider": scout_output.get("llm_provider", "none"),
+                    "fallback_used": False,
+                    "latency_ms": int((time.time() - start_time) * 1000)
                 }
             except Exception as e:
                 logger.error(f"Error updating dependency file: {e}")
@@ -167,7 +180,10 @@ async def update_package(req: UpdateRequest):
             "package": patch_report.get("package"),
             "status": patch_report.get("overall_status"),
             "files_patched": patch_report.get("files_patched", []),
-            "checkpoint_id": patch_report.get("checkpoint_id", "")
+            "checkpoint_id": patch_report.get("checkpoint_id", ""),
+            "llm_provider": patch_report.get("llm_provider", "none"),
+            "fallback_used": patch_report.get("fallback_used", False),
+            "latency_ms": int((time.time() - start_time) * 1000)
         }
         
     except Exception as e:
@@ -176,7 +192,7 @@ async def update_package(req: UpdateRequest):
 
 
 @app.post("/rollback")
-async def rollback(req: RollbackRequest):
+def rollback(req: RollbackRequest):
     folder_path = Path(req.folder_path)
     if not folder_path.exists() or not folder_path.is_dir():
         logger.error(f"Rollback failed: Folder path {folder_path} does not exist")
