@@ -4,14 +4,7 @@ import json
 import logging
 import argparse
 from pathlib import Path
-
-try:
-    import tomllib
-except ModuleNotFoundError:
-    try:
-        import tomli as tomllib
-    except ModuleNotFoundError:
-        tomllib = None
+import tomllib
 
 import xml.etree.ElementTree as ET
 
@@ -32,9 +25,6 @@ class ScannerAgent:
         }
 
     def scan(self) -> list[dict]:
-        """
-        Recursively scan the root directory and parse all supported dependency files.
-        """
         results = []
         if not self.root_dir.exists() or not self.root_dir.is_dir():
             logger.error(f"Invalid directory: {self.root_dir}")
