@@ -1,9 +1,3 @@
-"""
-DepGuard AI API
-To run this API, execute:
-uvicorn api.main:app --reload --port 8000
-"""
-
 import os
 import sys
 import logging
@@ -48,6 +42,7 @@ app.add_middleware(
 async def startup_event():
     logger.info("DepGuard AI API running on http://localhost:8000")
 
+# --------------------------------- Request Forming ----------------------------------
 class ScanRequest(BaseModel):
     folder_path: str
 
@@ -66,10 +61,12 @@ class RollbackRequest(BaseModel):
     checkpoint_id: str
     folder_path: str
 
+# ------------------------------ Health Check Endpoint ---------------------------------
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "version": "1.0.0"}
 
+# ------------------------------ Check Providers Active --------------------------------
 @app.get("/providers")
 def get_providers():
     router = LLMRouter()
@@ -77,6 +74,7 @@ def get_providers():
     active_provider = next((p["name"] for p in status if p["status"] == "available"), "none")
     return {"providers": status, "active_provider": active_provider}
 
+# ------------------------------ Scan Dependencies Project -------------------------------
 @app.post("/scan")
 def scan_project(req: ScanRequest):
     folder_path = Path(req.folder_path)
@@ -121,7 +119,7 @@ def scan_project(req: ScanRequest):
         logger.error(f"Error in /scan: {e}")
         raise HTTPException(status_code=500, detail=f"Agent Error: {str(e)}")
 
-
+# --------------------------------- Update Endpoint -----------------------------------
 @app.post("/update")
 def update_package(req: UpdateRequest):
     import time
@@ -142,16 +140,25 @@ def update_package(req: UpdateRequest):
         
         if not breaking_changes:
             # Just update version in dep file directly
-            dep_file = pkg_info_dict.get("file_path")
-            package = pkg_info_dict.get("name")
-            from_v = pkg_info_dict.get("current_version")
-            to_v = pkg_info_dict.get("latest_version")
+            pkg = req.package_info
+
+            dep_file = pkg.file_path
+            package = pkg.name
+            from_v = pkg.current_version
+            to_v = pkg.latest_version
             
             # Simple version update implementation
             try:
                 with open(dep_file, "r", encoding="utf-8") as f:
                     content = f.read()
-                new_content = re.sub(rf'({package}[^\d\n]*){re.escape(from_v)}', rf'\g<1>{to_v}', content, flags=re.IGNORECASE)
+
+                new_content = re.sub(
+                    rf'({re.escape(package)}[^\d\n]*){re.escape(from_v)}',
+                    rf'\g<1>{to_v}',
+                    content,
+                    flags=re.IGNORECASE
+                )
+
                 with open(dep_file, "w", encoding="utf-8") as f:
                     f.write(new_content)
                 
@@ -174,7 +181,7 @@ def update_package(req: UpdateRequest):
         
         # Run patch agent
         patch_agent = PatchAgent()
-        patch_report = patch_agent.run_sync(scout_output, ast_output, pkg_info_dict.get("file_path"))
+        patch_report = patch_agent.run_sync(scout_output, ast_output, req.package_info.file_path)
         
         return {
             "package": patch_report.get("package"),
@@ -190,7 +197,7 @@ def update_package(req: UpdateRequest):
         logger.error(f"Error in /update: {e}")
         raise HTTPException(status_code=500, detail=f"Agent Error: {str(e)}")
 
-
+# -------------------------------------- Rollback ---------------------------------------
 @app.post("/rollback")
 def rollback(req: RollbackRequest):
     folder_path = Path(req.folder_path)
