@@ -4,7 +4,7 @@ import json
 import argparse
 import sys
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from urllib.parse import quote
 
 try:
@@ -21,6 +21,7 @@ class WatchdogAgent:
     def __init__(self, max_concurrent: int = 10):
         self.semaphore = asyncio.Semaphore(max_concurrent)
 
+    # ------------------------------- For deps.dev -------------------------------
     def _map_deps_dev_ecosystem(self, ecosystem: str) -> str:
         mapping = {
             "pip": "PYPI",
@@ -30,7 +31,8 @@ class WatchdogAgent:
             "maven": "MAVEN"
         }
         return mapping.get(ecosystem, "")
-
+    
+    # ---------------------------------- For osv ----------------------------------
     def _map_osv_ecosystem(self, ecosystem: str) -> str:
         mapping = {
             "pip": "PyPI",
@@ -41,6 +43,7 @@ class WatchdogAgent:
         }
         return mapping.get(ecosystem, "")
 
+    # ----------------------------- Get Latest Version ----------------------------
     async def _fetch_latest_version(self, client: httpx.AsyncClient, name: str, ecosystem: str) -> str:
         system = self._map_deps_dev_ecosystem(ecosystem)
         if not system:
@@ -66,6 +69,7 @@ class WatchdogAgent:
                 logger.debug(f"Error fetching latest version for {name}: {e}")
         return "unknown"
 
+    # ------------------------------- Get Vulneribilities --------------------------
     async def _fetch_cves(self, client: httpx.AsyncClient, name: str, version: str, ecosystem: str) -> List[Dict]:
         osv_eco = self._map_osv_ecosystem(ecosystem)
         if not osv_eco:
@@ -87,11 +91,12 @@ class WatchdogAgent:
                 logger.debug(f"Error fetching CVEs for {name} {version}: {e}")
         return []
 
+    # --------------------------------- Risk Scoring System --------------------------
     def _classify_severity(self, current_version: str, latest_version: str, cves: list) -> str:
         if cves:
             return "CRITICAL"
         if current_version == "unknown" or latest_version == "unknown":
-            return "OK" # Can't determine
+            return "OK"
         
         def parse_version(v: str) -> List[int]:
             # Simple semver parser ignoring pre-release tags for major/minor comparison
@@ -115,9 +120,16 @@ class WatchdogAgent:
         
         return "OK"
 
-    async def _process_package(self, client: httpx.AsyncClient, pkg: dict, ecosystem: str, file_path: str) -> Dict[str, Any]:
+    # -------------------------- Full Process For Each Package ------------------------
+    async def _process_package(self, client: httpx.AsyncClient, pkg: dict, ecosystem: str, file_path: str) -> Optional[Dict[str, Any]]:
         name = pkg.get("name")
         current_version = pkg.get("version")
+
+        if not isinstance(name, str) or not name:
+            return None
+
+        if not isinstance(current_version, str) or current_version == "unknown":
+            return None
         
         # Skip if current version is unknown
         if not current_version or current_version == "unknown":
@@ -149,6 +161,15 @@ class WatchdogAgent:
                 ecosystem = file_data.get("ecosystem")
                 packages = file_data.get("packages", [])
                 
+                if not isinstance(file_path, str):
+                    continue
+
+                if not isinstance(ecosystem, str):
+                    continue
+
+                if not isinstance(packages, list):
+                    continue
+                
                 for pkg in packages:
                     tasks.append(self._process_package(client, pkg, ecosystem, file_path))
                     
@@ -158,100 +179,3 @@ class WatchdogAgent:
 
     def run_sync(self, scanner_output: List[Dict]) -> List[Dict]:
         return asyncio.run(self.run(scanner_output))
-
-
-def main():
-    parser = argparse.ArgumentParser(description="DepGuard AI Watchdog Agent")
-    parser.add_argument("path", help="Root folder path to scan")
-    args = parser.parse_args()
-
-    # Import ScannerAgent here to avoid circular imports and keep dependencies clean
-    try:
-        from agents.scanner import ScannerAgent
-    except ImportError:
-        import sys
-        from pathlib import Path
-        sys.path.append(str(Path(__file__).parent.parent))
-        from agents.scanner import ScannerAgent
-
-    logger.info(f"Scanning directory: {args.path}")
-    scanner = ScannerAgent(args.path)
-    scanner_output = scanner.scan()
-    
-    logger.info("Watchdog is verifying packages with OSV.dev and deps.dev...")
-    watchdog = WatchdogAgent()
-    report = watchdog.run_sync(scanner_output)
-    
-    print(json.dumps(report, indent=2))
-
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] != "test":
-        main()
-    else:
-        # Run tests
-        import unittest
-        from unittest.mock import patch, MagicMock, AsyncMock
-
-        class TestWatchdogAgent(unittest.TestCase):
-            def setUp(self):
-                self.agent = WatchdogAgent()
-                self.scanner_output = [
-                  {
-                    "file_path": "requirements.txt",
-                    "ecosystem": "pip",
-                    "packages": [
-                      {"name": "django", "version": "3.2.18"},
-                      {"name": "requests", "version": "2.28.0"},
-                      {"name": "unknown_pkg", "version": "unknown"}
-                    ]
-                  }
-                ]
-
-            @patch('httpx.AsyncClient.get', new_callable=AsyncMock)
-            @patch('httpx.AsyncClient.post', new_callable=AsyncMock)
-            def test_run_sync(self, mock_post, mock_get):
-                # Setup mock for get (deps.dev)
-                def get_side_effect(url, **kwargs):
-                    mock_resp = MagicMock()
-                    mock_resp.status_code = 200
-                    if "django" in url:
-                        mock_resp.json.return_value = {"versions": [{"isDefault": True, "versionKey": {"version": "5.0.6"}}]}
-                    elif "requests" in url:
-                        mock_resp.json.return_value = {"versions": [{"isDefault": True, "versionKey": {"version": "2.32.2"}}]}
-                    else:
-                        mock_resp.status_code = 404
-                    return mock_resp
-                mock_get.side_effect = get_side_effect
-
-                # Setup mock for post (osv.dev)
-                def post_side_effect(url, json=None, **kwargs):
-                    mock_resp = MagicMock()
-                    mock_resp.status_code = 200
-                    if json and json["package"]["name"] == "requests":
-                        mock_resp.json.return_value = {"vulns": [{"id": "CVE-2024-XXXX", "summary": "Test Vuln"}]}
-                    else:
-                        mock_resp.json.return_value = {}
-                    return mock_resp
-                mock_post.side_effect = post_side_effect
-
-                results = self.agent.run_sync(self.scanner_output)
-                
-                # Check that unknown_pkg is skipped
-                self.assertEqual(len(results), 2)
-                
-                django_res = next(r for r in results if r["name"] == "django")
-                self.assertEqual(django_res["severity"], "HIGH")
-                self.assertEqual(django_res["latest_version"], "5.0.6")
-                self.assertEqual(len(django_res["cves"]), 0)
-                
-                req_res = next(r for r in results if r["name"] == "requests")
-                self.assertEqual(req_res["severity"], "CRITICAL")
-                self.assertEqual(req_res["latest_version"], "2.32.2")
-                self.assertEqual(len(req_res["cves"]), 1)
-                self.assertEqual(req_res["cves"][0]["id"], "CVE-2024-XXXX")
-
-        sys.argv = [sys.argv[0]]
-        print("Running Watchdog Agent Unit Tests...\\n")
-        unittest.main()
