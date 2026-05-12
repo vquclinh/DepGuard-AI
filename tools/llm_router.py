@@ -15,11 +15,14 @@ from anthropic import AsyncAnthropic, APIStatusError, RateLimitError, Authentica
 import google.genai as genai
 from google.genai import types as genai_types
 
+from anthropic.types import TextBlock
+
 from openai import AsyncOpenAI
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# Parse Response From LLMs
 @dataclass
 class LLMResponse:
     content: str
@@ -48,6 +51,7 @@ class LLMRouter:
         self.skip_claude = False
         self.qwen_status = "not_configured"
 
+        # Create Client For Each Models
         if self.gemini_api_key:
             self.gemini_client = genai.Client(api_key=self.gemini_api_key)
         else:
@@ -67,9 +71,7 @@ class LLMRouter:
         else:
             self.qwen_client = None
 
-        # Determine Qwen status on init if possible, 
-        # though synchronous ping might block, we will do a fast sync request or just assume available if set.
-        # Actually, the spec says "On LLMRouter __init__, ping GET {QWEN_BASE_URL}/v1/models"
+        # Determine Qwen status on init if possible 
         if self.qwen_base_url:
             try:
                 # Fast timeout sync check
@@ -85,6 +87,7 @@ class LLMRouter:
         combined = f"{system_prompt}|||{user_prompt}"
         return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
+    # Call Claude, if there is auth error, skip_claude will be True
     async def _call_claude(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
         if self.skip_claude or not self.anthropic_client:
             raise Exception("Claude skipped or not configured")
@@ -94,23 +97,38 @@ class LLMRouter:
                 model=self.claude_model,
                 max_tokens=max_tokens,
                 system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
+                messages=[
+                    {
+                        "role": "user",
+                        "content": user_prompt
+                    }
+                ]
             )
-            return response.content[0].text
+            texts: list[str] = []
+
+            for block in response.content:
+                if isinstance(block, TextBlock):
+                    texts.append(block.text)
+
+            return "\n".join(texts)
         except AuthenticationError as e:
             self.skip_claude = True
             raise e
         except (APIStatusError, RateLimitError) as e:
             raise e
 
+    # Call Gemini
     async def _call_gemini(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
         if not self.gemini_api_key or not self.gemini_client:
             raise Exception("Gemini API key not configured")
 
         import asyncio
         try:
+            client = self.gemini_client
+            assert client is not None
+
             def _sync_call():
-                response = self.gemini_client.models.generate_content(
+                response = client.models.generate_content(
                     model=self.gemini_model,
                     contents=user_prompt,
                     config=genai_types.GenerateContentConfig(
@@ -128,6 +146,7 @@ class LLMRouter:
         except Exception as e:
             raise e
 
+    # Call Qwen
     async def _call_qwen(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
         if self.qwen_status in ["offline", "not_configured"] or not self.qwen_client:
             raise Exception(f"Qwen skipped: status is {self.qwen_status}")
@@ -142,10 +161,11 @@ class LLMRouter:
                 max_tokens=max_tokens,
                 temperature=0.1
             )
-            return response.choices[0].message.content
+            return response.choices[0].message.content or ""
         except Exception as e:
             raise e
 
+    # Choose the order of models
     def _get_routing_order(self, task_type: str) -> List[str]:
         if task_type == "patch_simple":
             return ["qwen", "gemini", "claude"]
