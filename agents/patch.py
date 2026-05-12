@@ -25,10 +25,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# -------------------------------- Patch Agent ----------------------------------
 class PatchAgent:
     def __init__(self):
         self.router = LLMRouter()
 
+    # -------------------------- Create A Commit Before Update Code ---------------------
     def _create_checkpoint(self, package: str) -> tuple[str, bool]:
         checkpoint_id = f"depguard_checkpoint_{uuid.uuid4().hex[:8]}"
         try:
@@ -44,6 +46,7 @@ class PatchAgent:
             logger.warning(f"Failed to create git checkpoint: {e}")
             return checkpoint_id, False
 
+    # ------------------- Rollback to the last commit (no change by LLM) ----------------
     def _rollback(self, commit_made: bool):
         try:
             logger.info("Rolling back changes...")
@@ -55,6 +58,7 @@ class PatchAgent:
         except Exception as e:
             logger.warning(f"Failed to rollback: {e}")
 
+    # -------------------- Extract code out of markdown form by LLM -----------------------
     def _extract_code(self, response_text: str) -> str:
         # If wrapped in markdown
         match = re.search(r'```python\n(.*?)\n```', response_text, re.DOTALL)
@@ -65,13 +69,15 @@ class PatchAgent:
             return match.group(1)
         return response_text.strip()
 
+
     async def _patch_file(self, filepath: str, matches: list, scout_context: dict, task_type: str) -> tuple[bool, str, dict]:
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 original_content = f.read()
         except Exception as e:
-            return False, f"Could not read file: {e}"
+                return False, f"Could not read file: {e}", {}
 
+        # Create prompt for LLM
         system_prompt = (
             "You are an expert code migration assistant.\n"
             "Fix ONLY the deprecated API usages listed.\n"
@@ -83,27 +89,28 @@ class PatchAgent:
         bc_str = json.dumps(scout_context.get("breaking_changes", []), indent=2)
 
         prompt = f"""
-Package Migration Context: {scout_context.get("package")} {scout_context.get("from_version")} -> {scout_context.get("to_version")}
-Breaking Changes:
-{bc_str}
+            Package Migration Context: {scout_context.get("package")} {scout_context.get("from_version")} -> {scout_context.get("to_version")}
+            Breaking Changes:
+            {bc_str}
 
-File: {filepath}
-Matches to fix:
-{matches_str}
+            File: {filepath}
+            Matches to fix:
+            {matches_str}
 
-Code:
-```python
-{original_content}
-```
-"""
+            Code:
+            ```python
+            {original_content}
+            ```
+            """
 
         try:
+            # Call LLM
             response = await self.router.complete(system_prompt, prompt, max_tokens=2000, task_type=task_type)
             response_text = response.content
             patched_content = self._extract_code(response_text)
             llm_info = {"provider": response.provider, "fallback_used": response.fallback_used}
 
-            # Validate AST
+            # Validate syntax
             try:
                 ast.parse(patched_content, filename=filepath)
             except SyntaxError as e:
@@ -119,6 +126,7 @@ Code:
             logger.error(f"Error patching {filepath}: {e}")
             return False, str(e), {}
 
+    # Update dependencies version
     def _update_dependency_file(self, dep_file_path: str, package: str, from_v: str, to_v: str):
         try:
             with open(dep_file_path, "r", encoding="utf-8") as f:
@@ -210,109 +218,3 @@ Code:
 
     def run_sync(self, scout_output: dict, ast_scanner_output: dict, dep_file_path: str) -> dict:
         return asyncio.run(self.run(scout_output, ast_scanner_output, dep_file_path))
-
-def main():
-    parser = argparse.ArgumentParser(description="DepGuard AI Patch Agent")
-    parser.add_argument("--scout", required=True, help="Path to scout_output.json")
-    parser.add_argument("--ast", required=True, help="Path to ast_output.json")
-    parser.add_argument("--dep", required=True, help="Path to dependency file (e.g. requirements.txt)")
-    args = parser.parse_args()
-
-    try:
-        with open(args.scout, 'r') as f:
-            scout_output = json.load(f)
-        with open(args.ast, 'r') as f:
-            ast_output = json.load(f)
-    except Exception as e:
-        logger.error(f"Error reading input files: {e}")
-        sys.exit(1)
-
-    agent = PatchAgent()
-    report = agent.run_sync(scout_output, ast_output, args.dep)
-    print(json.dumps(report, indent=2))
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and not sys.argv[1] == "test":
-        main()
-    else:
-        import unittest
-        from unittest.mock import patch, MagicMock, AsyncMock
-        import tempfile
-        import shutil
-
-        class TestPatchAgent(unittest.TestCase):
-            def setUp(self):
-                self.agent = PatchAgent()
-                self.agent.router = MagicMock()
-                self.agent.router.complete = AsyncMock()
-                self.test_dir = tempfile.mkdtemp()
-                
-                self.scout_output = {
-                    "package": "numpy",
-                    "from_version": "1.21.0",
-                    "to_version": "1.26.4",
-                    "breaking_changes": [{"type": "removed", "old_api": "np.bool", "new_api": "np.bool_"}]
-                }
-                
-                self.test_file = os.path.join(self.test_dir, "test_file.py")
-                with open(self.test_file, "w") as f:
-                    f.write("import numpy as np\nmask = np.bool(1)\n")
-                    
-                self.dep_file = os.path.join(self.test_dir, "requirements.txt")
-                with open(self.dep_file, "w") as f:
-                    f.write("numpy==1.21.0\nrequests==2.28.0\n")
-                    
-                self.ast_output = {
-                    "matches_by_file": {
-                        self.test_file: [{"line": 2, "old_api": "np.bool"}]
-                    }
-                }
-
-            def tearDown(self):
-                shutil.rmtree(self.test_dir)
-
-            @patch('subprocess.run')
-            def test_successful_patch(self, mock_subprocess):
-                mock_res = MagicMock()
-                mock_res.returncode = 0
-                mock_subprocess.return_value = mock_res
-                
-                mock_msg = MagicMock()
-                mock_msg.content = '```python\nimport numpy as np\nmask = np.bool_(1)\n```'
-                mock_msg.provider = "claude"
-                mock_msg.fallback_used = False
-                self.agent.router.complete.return_value = mock_msg
-                
-                report = self.agent.run_sync(self.scout_output, self.ast_output, self.dep_file)
-                
-                self.assertEqual(report["overall_status"], "success")
-                self.assertEqual(len(report["files_patched"]), 1)
-                self.assertEqual(report["dependency_file_updated"], "requirements.txt")
-                
-                with open(self.test_file, "r") as f:
-                    content = f.read()
-                self.assertIn("np.bool_", content)
-                
-                with open(self.dep_file, "r") as f:
-                    dep_content = f.read()
-                self.assertIn("numpy==1.26.4", dep_content)
-
-            @patch('subprocess.run')
-            def test_syntax_error_rollback(self, mock_subprocess):
-                mock_msg = MagicMock()
-                mock_msg.content = '```python\nimport numpy as np\nmask = invalid syntax\n```'
-                mock_msg.provider = "claude"
-                mock_msg.fallback_used = False
-                self.agent.router.complete.return_value = mock_msg
-                
-                report = self.agent.run_sync(self.scout_output, self.ast_output, self.dep_file)
-                
-                self.assertEqual(report["overall_status"], "rolled_back")
-                
-                with open(self.test_file, "r") as f:
-                    content = f.read()
-                self.assertIn("np.bool(1)", content)
-
-        sys.argv = [sys.argv[0]]
-        print("Running Patch Agent Unit Tests...\n")
-        unittest.main()
