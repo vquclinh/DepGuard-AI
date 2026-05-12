@@ -25,10 +25,11 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# --------------------------------- Scout Agent ------------------------------------
 class ScoutAgent:
     def __init__(self):
         self.github_token = os.getenv("GITHUB_TOKEN")
-        self.router = LLMRouter()
+        self.router = LLMRouter() # Abstraction layer: OpenAI, Claude, Gemini, Qwen, local models
 
     def _map_deps_dev_ecosystem(self, ecosystem: str) -> str:
         mapping = {
@@ -40,6 +41,7 @@ class ScoutAgent:
         }
         return mapping.get(ecosystem, "")
 
+    # Get Github Repo (call Deps Dev API)
     async def _get_github_repo(self, client: httpx.AsyncClient, name: str, ecosystem: str) -> str:
         system = self._map_deps_dev_ecosystem(ecosystem)
         if not system: return ""
@@ -56,6 +58,7 @@ class ScoutAgent:
             logger.debug(f"Error fetching repo for {name}: {e}")
         return ""
 
+    # Parse the repo
     def _parse_github_owner_repo(self, repo_url: str) -> tuple[str, str]:
         parsed = urlparse(repo_url)
         path = parsed.path.strip("/")
@@ -64,6 +67,7 @@ class ScoutAgent:
         if len(parts) >= 2: return parts[0], parts[1]
         return "", ""
 
+    # Get Release History, Release Notes, Changelog Text
     async def _fetch_release_notes(self, client: httpx.AsyncClient, owner: str, repo: str, current_version: str, latest_version: str) -> str:
         url = f"https://api.github.com/repos/{owner}/{repo}/releases"
         headers = {"Accept": "application/vnd.github.v3+json"}
@@ -83,25 +87,26 @@ class ScoutAgent:
             logger.debug(f"Error fetching releases for {owner}/{repo}: {e}")
         return "\n".join(release_notes)
 
+    # Send Changelog for LLM
     async def _analyze_changelog_with_llm(self, package: str, from_v: str, to_v: str, changelog: str) -> dict:
         system_prompt = "You are a senior dependency management AI. Extract ONLY breaking changes from changelogs relevant to code usage. Format strictly as JSON."
         prompt = f"""
-Analyze the changelog for '{package}' from version {from_v} to {to_v} and extract ONLY breaking changes relevant to Python/the ecosystem API usage:
-Return a JSON object with this exact structure:
-{{
-  "breaking_changes": [
-    {{
-      "type": "removed|renamed|changed_signature",
-      "old_api": "fully qualified or clear name",
-      "new_api": "new name or workaround if applicable",
-      "description": "short description"
-    }}
-  ],
-  "confidence_score": 0.9
-}}
-Changelog:
-{changelog[:8000]}
-"""
+            Analyze the changelog for '{package}' from version {from_v} to {to_v} and extract ONLY breaking changes relevant to Python/the ecosystem API usage:
+            Return a JSON object with this exact structure:
+            {{
+            "breaking_changes": [
+                {{
+                "type": "removed|renamed|changed_signature",
+                "old_api": "fully qualified or clear name",
+                "new_api": "new name or workaround if applicable",
+                "description": "short description"
+                }}
+            ],
+            "confidence_score": 0.9
+            }}
+            Changelog:
+            {changelog[:8000]}
+            """
         try:
             response = await self.router.complete(system_prompt, prompt, max_tokens=1000, task_type="changelog")
             text = response.content
@@ -119,6 +124,19 @@ Changelog:
         current_version = package_info.get("current_version")
         latest_version = package_info.get("latest_version")
         ecosystem = package_info.get("ecosystem")
+
+        if not isinstance(name, str):
+            raise ValueError("Invalid package name")
+
+        if not isinstance(current_version, str):
+            raise ValueError("Invalid current_version")
+
+        if not isinstance(latest_version, str):
+            raise ValueError("Invalid latest_version")
+
+        if not isinstance(ecosystem, str):
+            raise ValueError("Invalid ecosystem")
+
         result = {
             "package": name, "from_version": current_version, "to_version": latest_version,
             "breaking_changes": [], "confidence_score": 0.0, "changelog_url": ""
@@ -139,6 +157,3 @@ Changelog:
 
     def run_sync(self, package_info: dict) -> dict:
         return asyncio.run(self.run(package_info))
-
-if __name__ == "__main__":
-    pass
