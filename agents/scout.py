@@ -144,11 +144,15 @@ class ScoutAgent:
         async with httpx.AsyncClient() as client:
             repo_url = await self._get_github_repo(client, name, ecosystem)
             if not repo_url: return result
+
             owner, repo = self._parse_github_owner_repo(repo_url)
             if not owner or not repo: return result
+            
             result["changelog_url"] = f"https://github.com/{owner}/{repo}/releases"
+
             changelog_text = await self._fetch_release_notes(client, owner, repo, current_version, latest_version)
             if not changelog_text: return result
+            
             llm_result = await self._analyze_changelog_with_llm(name, current_version, latest_version, changelog_text)
             result["breaking_changes"] = llm_result.get("breaking_changes", [])
             result["confidence_score"] = llm_result.get("confidence_score", 0.0)
