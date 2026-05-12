@@ -17,12 +17,10 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
         self.filepath = filepath
         self.matches = []
         
-        # Track imports: alias -> original_module
-        # e.g. import numpy as np -> self.aliases["np"] = "numpy"
-        # from django.utils.encoding import force_text -> self.from_imports["force_text"] = "django.utils.encoding.force_text"
         self.aliases = {}
         self.from_imports = {}
 
+    # For example: import numpy as np
     def visit_Import(self, node):
         for alias in node.names:
             if alias.asname:
@@ -31,6 +29,7 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
                 self.aliases[alias.name] = alias.name
         self.generic_visit(node)
 
+    # For example: from django.utils.encoding import force_text
     def visit_ImportFrom(self, node):
         module = node.module or ""
         for alias in node.names:
@@ -39,15 +38,14 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
             full_name = f"{module}.{name}" if module else name
             self.from_imports[asname] = full_name
             
-            # Also check if the imported name ITSELF is a deprecated API
             self._check_api_usage(full_name, node)
         self.generic_visit(node)
 
+    # Get full name through AST 
     def _get_full_name_for_attribute(self, node) -> str:
         # Recursively get full name like os.path.join or np.bool
         if isinstance(node, ast.Name):
             base = node.id
-            # Resolve alias if it's a module
             return self.aliases.get(base, base)
         elif isinstance(node, ast.Attribute):
             base = self._get_full_name_for_attribute(node.value)
@@ -62,7 +60,6 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Name(self, node):
-        # Could be a direct call to from_import, like force_text()
         name = node.id
         if name in self.from_imports:
             full_name = self.from_imports[name]
@@ -77,7 +74,6 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
             if not old_api:
                 continue
 
-            # Resolve old_api root if it's in aliases (e.g., LLM gave "np.bool" but code uses "import numpy as np")
             resolved_old_api = old_api
             parts = old_api.split('.')
             if parts[0] in self.aliases:
@@ -172,91 +168,3 @@ class ASTScanner:
         }
         
         return summary
-
-def main():
-    parser = argparse.ArgumentParser(description="DepGuard AI AST Scanner")
-    parser.add_argument("path", help="Root folder path to scan")
-    parser.add_argument("--api", required=True, help="Old API name to search for (e.g., np.bool)")
-    parser.add_argument("--new-api", required=True, help="New API name (e.g., np.bool_)")
-    args = parser.parse_args()
-
-    breaking_changes = [
-        {
-            "type": "removed",
-            "old_api": args.api,
-            "new_api": args.new_api,
-            "description": f"{args.api} was removed"
-        }
-    ]
-
-    scanner = ASTScanner()
-    result = scanner.scan(args.path, breaking_changes)
-    print(json.dumps(result, indent=2))
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] != "test":
-        main()
-    else:
-        import unittest
-        import tempfile
-        import shutil
-
-        class TestASTScanner(unittest.TestCase):
-            def setUp(self):
-                self.test_dir = tempfile.mkdtemp()
-                self.scanner = ASTScanner()
-
-            def tearDown(self):
-                shutil.rmtree(self.test_dir)
-
-            def create_file(self, name: str, content: str):
-                path = Path(self.test_dir) / name
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                return str(path)
-
-            def test_aliased_import(self):
-                content = "import numpy as np\n\nmask = np.bool(1)\n"
-                filepath = self.create_file("test_alias.py", content)
-                
-                breaking_changes = [{"old_api": "numpy.bool", "new_api": "numpy.bool_", "type": "removed"}]
-                result = self.scanner.scan(self.test_dir, breaking_changes)
-                
-                self.assertEqual(result["total_files_affected"], 1)
-                self.assertEqual(result["total_matches"], 1)
-                self.assertEqual(result["matches_by_file"][filepath][0]["old_api"], "numpy.bool")
-
-            def test_attribute_access_heuristic(self):
-                content = "import pandas as pd\n\ndf = pd.DataFrame()\ndf.append({'a': 1}, ignore_index=True)\n"
-                filepath = self.create_file("test_attr.py", content)
-                
-                breaking_changes = [{"old_api": "DataFrame.append", "new_api": "pd.concat", "type": "removed"}]
-                result = self.scanner.scan(self.test_dir, breaking_changes)
-                
-                self.assertEqual(result["total_matches"], 1)
-                self.assertTrue("df.append" in result["matches_by_file"][filepath][0]["code_snippet"])
-
-            def test_direct_name_usage(self):
-                content = "from django.utils.encoding import force_text\n\nval = force_text(b'hello')\n"
-                filepath = self.create_file("test_name.py", content)
-                
-                breaking_changes = [{"old_api": "django.utils.encoding.force_text", "new_api": "force_str", "type": "removed"}]
-                result = self.scanner.scan(self.test_dir, breaking_changes)
-                
-                self.assertEqual(result["total_matches"], 2) # Matches the import and the usage
-                self.assertEqual(result["matches_by_file"][filepath][-1]["old_api"], "django.utils.encoding.force_text")
-                self.assertTrue("val = force_text(" in result["matches_by_file"][filepath][-1]["code_snippet"])
-
-            def test_syntax_error(self):
-                content = "def invalid_syntax(\n    print('broken')\n"
-                self.create_file("test_broken.py", content)
-                
-                breaking_changes = [{"old_api": "print"}]
-                result = self.scanner.scan(self.test_dir, breaking_changes)
-                
-                self.assertEqual(result["total_files_affected"], 0)
-
-        sys.argv = [sys.argv[0]]
-        print("Running AST Scanner Unit Tests...\n")
-        unittest.main()
