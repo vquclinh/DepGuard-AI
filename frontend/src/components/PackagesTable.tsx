@@ -1,7 +1,19 @@
 import React, { useState, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { updatePackage, rollbackPackage } from "@/hooks/useDepGuard";
-import { AlertCircle, CheckCircle2, RotateCcw, ChevronRight, ChevronDown, Info } from "lucide-react";
+import { AlertCircle, CheckCircle2, RotateCcw, ChevronRight, ChevronDown, Info, ExternalLink } from "lucide-react";
+
+const getRegistryUrl = (ecosystem: string, packageName: string) => {
+  const name = encodeURIComponent(packageName);
+  switch (ecosystem.toLowerCase()) {
+    case 'npm': return `https://www.npmjs.com/package/${packageName}`;
+    case 'pypi': return `https://pypi.org/project/${packageName}/`;
+    case 'cargo': return `https://crates.io/crates/${packageName}`;
+    case 'go': return `https://pkg.go.dev/${packageName}`;
+    case 'maven': return `https://mvnrepository.com/artifact/${packageName.replace(':', '/')}`;
+    default: return `https://deps.dev/${ecosystem.toLowerCase()}/${name}`;
+  }
+};
 
 export interface PackageData {
   name: string;
@@ -237,6 +249,15 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
                               <p><strong>Resolved via:</strong> {pkg.resolved_from || "manifest"}</p>
                             </div>
                           </div>
+                          <a 
+                            href={getRegistryUrl(ecosystem, pkg.name)} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="p-1 hover:bg-muted text-muted-foreground hover:text-primary rounded transition-colors"
+                            title={`View ${pkg.name} on ${ecosystem} Registry`}
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
                         </div>
                         {isUnpinned && (
                           <div className="text-xs text-amber-500/80 mt-0.5">

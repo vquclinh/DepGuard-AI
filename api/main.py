@@ -191,51 +191,6 @@ async def scan_project_stream(folder_path: str):
         }
     )
 
-@app.post("/scan")
-def scan_project(req: ScanRequest):
-    folder_path = Path(req.folder_path)
-    if not folder_path.exists() or not folder_path.is_dir():
-        logger.error(f"Scan failed: Folder path {folder_path} does not exist")
-        raise HTTPException(status_code=400, detail="Folder path does not exist or is not a directory")
-
-    try:
-        # Phase 1: Scan
-        scanner = ScannerAgent(str(folder_path))
-        scanner_output = scanner.scan()
-        
-        # Phase 2: Watchdog
-        watchdog = WatchdogAgent()
-        watchdog_report = watchdog.run_sync(scanner_output, project_root=str(folder_path))
-        
-        # Compute health score
-        total_packages = len(watchdog_report)
-        counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNPINNED": 0, "OK": 0}
-        
-        for pkg in watchdog_report:
-            sev = pkg.get("severity", "OK")
-            counts[sev] = counts.get(sev, 0) + 1
-            
-        health_score = 100
-        if total_packages > 0:
-            score = (counts["OK"] * 100 + counts["LOW"] * 75 + counts["MEDIUM"] * 50 + counts["HIGH"] * 25 + counts["UNPINNED"] * 25 + counts["CRITICAL"] * 0)
-            health_score = int(score / total_packages)
-            
-        return {
-            "folder_path": str(folder_path),
-            "health_score": health_score,
-            "total_packages": total_packages,
-            "critical": counts["CRITICAL"],
-            "high": counts["HIGH"],
-            "medium": counts["MEDIUM"],
-            "low": counts["LOW"],
-            "unpinned": counts["UNPINNED"],
-            "ok": counts["OK"],
-            "packages": watchdog_report
-        }
-    except Exception as e:
-        logger.error(f"Error in /scan: {e}")
-        raise HTTPException(status_code=500, detail=f"Agent Error: {str(e)}")
-
 # --------------------------------- Update Endpoint -----------------------------------
 @app.post("/update")
 def update_package(req: UpdateRequest):
