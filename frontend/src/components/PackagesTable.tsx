@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { updatePackage, rollbackPackage } from "@/hooks/useDepGuard";
-import { AlertCircle, CheckCircle2, RotateCcw, ChevronRight, ChevronDown, Info, ExternalLink } from "lucide-react";
+import { AlertCircle, CheckCircle2, RotateCcw, ChevronRight, ChevronDown, MoreHorizontal, ExternalLink } from "lucide-react";
 
 const getRegistryUrl = (ecosystem: string, packageName: string) => {
   const name = encodeURIComponent(packageName);
@@ -46,6 +46,7 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
   const [updating, setUpdating] = useState<Record<string, boolean>>({});
   const [statuses, setStatuses] = useState<Record<string, { type: "success" | "error", error?: string, checkpoint?: string, provider?: string }>>({});
   const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
+  const [activePopup, setActivePopup] = useState<string | null>(null);
 
   // Filtering & Sorting State
   const [filterEcosystem, setFilterEcosystem] = useState<string>("All");
@@ -242,22 +243,51 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
                       <div className="flex flex-col">
                         <div className="flex items-center gap-2">
                           <span>{pkg.name}</span>
-                          <div className="relative group/tooltip cursor-help">
-                            <Info className="w-3.5 h-3.5 text-muted-foreground hover:text-foreground" />
-                            <div className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 w-48 p-2 bg-popover text-popover-foreground text-xs rounded-md shadow-md border opacity-0 group-hover/tooltip:opacity-100 transition-opacity pointer-events-none z-50">
-                              <p><strong>Source:</strong> {pkg.file_path.split('/').pop()}</p>
-                              <p><strong>Resolved via:</strong> {pkg.resolved_from || "manifest"}</p>
-                            </div>
+                          <div className="relative">
+                            <button 
+                              onClick={(e) => { e.stopPropagation(); setActivePopup(activePopup === pkg.name ? null : pkg.name); }}
+                              className={cn(
+                                "p-1.5 rounded-md transition-colors", 
+                                activePopup === pkg.name ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                              )}
+                              title="More information"
+                            >
+                              <MoreHorizontal className="w-4 h-4" />
+                            </button>
+                            
+                            {activePopup === pkg.name && (
+                              <>
+                                <div className="fixed inset-0 z-40" onClick={(e) => { e.stopPropagation(); setActivePopup(null); }} />
+                                <div className="absolute left-0 top-full mt-2 w-64 p-3 bg-popover text-popover-foreground text-sm rounded-lg shadow-lg border z-50 animate-in fade-in zoom-in-95 duration-200 cursor-default" onClick={e => e.stopPropagation()}>
+                                  <div className="font-semibold border-b border-border/50 pb-2 mb-2">Package Details</div>
+                                  <div className="space-y-2">
+                                    <p className="flex justify-between"><span className="text-muted-foreground">Source:</span> <span>{pkg.file_path.split('/').pop()}</span></p>
+                                    <p className="flex justify-between"><span className="text-muted-foreground">Resolved via:</span> <span className="capitalize">{pkg.resolved_from || "manifest"}</span></p>
+                                    <p className="flex justify-between"><span className="text-muted-foreground">Ecosystem:</span> <span className="capitalize">{ecosystem}</span></p>
+                                    
+                                    <div className="pt-2 mt-2 border-t border-border/50 flex flex-col gap-2">
+                                      <a 
+                                        href={getRegistryUrl(ecosystem, pkg.name)} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer"
+                                        className="text-primary hover:underline flex items-center gap-1.5"
+                                      >
+                                        <ExternalLink className="w-3.5 h-3.5" /> Registry Changelog
+                                      </a>
+                                      <a 
+                                        href={ecosystem.toLowerCase() === 'maven' ? getRegistryUrl(ecosystem, pkg.name) : `https://deps.dev/${ecosystem.toLowerCase()}/${encodeURIComponent(pkg.name)}`} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer"
+                                        className="text-primary hover:underline flex items-center gap-1.5"
+                                      >
+                                        <ExternalLink className="w-3.5 h-3.5" /> Deps.dev Insight
+                                      </a>
+                                    </div>
+                                  </div>
+                                </div>
+                              </>
+                            )}
                           </div>
-                          <a 
-                            href={getRegistryUrl(ecosystem, pkg.name)} 
-                            target="_blank" 
-                            rel="noopener noreferrer"
-                            className="p-1 hover:bg-muted text-muted-foreground hover:text-primary rounded transition-colors"
-                            title={`View ${pkg.name} on ${ecosystem} Registry`}
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
                         </div>
                         {isUnpinned && (
                           <div className="text-xs text-amber-500/80 mt-0.5">
