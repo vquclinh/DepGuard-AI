@@ -52,8 +52,13 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
     let filtered = packages.filter(pkg => {
       if (filterEcosystem !== "All" && pkg.ecosystem !== filterEcosystem) return false;
       if (filterSeverity !== "All" && pkg.severity !== filterSeverity) return false;
-      if (filterVulnerable && pkg.severity === "OK") return false;
-      if (filterOutdated && pkg.current_version === pkg.latest_version) return false;
+      if (filterVulnerable && (!pkg.cves || pkg.cves.length === 0)) return false;
+      if (filterOutdated) {
+        // Strip out 'v' prefixes and npm semver characters (^, ~, >=, etc) for clean comparison
+        const cur = (pkg.current_version || "").replace(/^[\^~=<>v\s]+/i, "");
+        const lat = (pkg.latest_version || "").replace(/^[\^~=<>v\s]+/i, "");
+        if (cur === lat) return false;
+      }
       if (filterUnpinned && pkg.severity !== "UNPINNED") return false;
       return true;
     });
