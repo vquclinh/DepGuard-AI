@@ -148,7 +148,7 @@ class WatchdogAgent:
 
         resolved_from = "manifest"
 
-        # ── Try to resolve from lockfile if version is unknown ──
+        # -------------- Try to resolve from lockfile if version is unknown ------------
         if not pinned or current_version == "unknown":
             lockfile_version = None
             if self._lockfile_resolver and project_root:
@@ -162,7 +162,6 @@ class WatchdogAgent:
                 pinned = True
                 resolved_from = "lockfile"
             else:
-                # Truly unresolvable — fetch latest and return UNPINNED
                 latest_version = await self._fetch_latest_version(client, name, ecosystem)
                 return {
                     "name": name,
@@ -180,7 +179,7 @@ class WatchdogAgent:
                     )
                 }
 
-        # ── Normal pinned flow ──
+        # Pinned package
         latest_task = self._fetch_latest_version(client, name, ecosystem)
         cves_task = self._fetch_cves(client, name, current_version, ecosystem)
         

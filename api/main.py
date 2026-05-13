@@ -209,7 +209,7 @@ def update_package(req: UpdateRequest):
         logger.error(f"Error in /update: {e}")
         raise HTTPException(status_code=500, detail=f"Agent Error: {str(e)}")
 
-# -------------------------------------- Rollback ---------------------------------------
+# ---------------------------------- Rollback Endpoint -----------------------------------
 @app.post("/rollback")
 def rollback(req: RollbackRequest):
     folder_path = Path(req.folder_path)

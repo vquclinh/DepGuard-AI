@@ -87,7 +87,6 @@ class ScannerAgent:
                 deps = data.get("project", {}).get("dependencies", [])
                 poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
                 
-                # Parse standard PEP 621 dependencies (array of strings)
                 pattern = re.compile(r'^([a-zA-Z0-9_\-\.]+)(?:\s*(?:==|>=|<=|~=|>|<)\s*([0-9a-zA-Z\.\-\+]+))?', re.IGNORECASE)
                 for dep in deps:
                     match = pattern.match(dep)
@@ -131,8 +130,6 @@ class ScannerAgent:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # Matches `require github.com/gin-gonic/gin v1.7.4`
-        # or inside a require (...) block
         pattern = re.compile(r'(?:require\s+|^|\t)([a-zA-Z0-9\.\-\/\_]+)\s+(v[0-9a-zA-Z\.\-\+]+)', re.MULTILINE)
         for match in pattern.finditer(content):
             packages.append({"name": match.group(1), "version": match.group(2), "pinned": True})
