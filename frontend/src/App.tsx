@@ -14,7 +14,7 @@ function App() {
   
   const [healthData, setHealthData] = useState<{
     score: number;
-    stats: { critical: number; high: number; medium: number; low: number; ok: number };
+    stats: { critical: number; high: number; medium: number; low: number; unpinned: number; ok: number };
   } | null>(null);
   
   const [packages, setPackages] = useState<PackageData[]>([]);
@@ -58,6 +58,7 @@ function App() {
           high: result.high,
           medium: result.medium,
           low: result.low,
+          unpinned: result.unpinned,
           ok: result.ok
         }
       });

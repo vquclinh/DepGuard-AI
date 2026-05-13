@@ -5,7 +5,7 @@ import asyncio
 import logging
 import argparse
 import sys
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from urllib.parse import quote, urlparse
 from dotenv import load_dotenv
 
@@ -88,10 +88,18 @@ class ScoutAgent:
         return "\n".join(release_notes)
 
     # Send Changelog for LLM
-    async def _analyze_changelog_with_llm(self, package: str, from_v: str, to_v: str, changelog: str) -> dict:
+    async def _analyze_changelog_with_llm(
+        self, package: str, from_v: str, to_v: str, changelog: str, api_usages: Optional[list[str]] = None
+    ) -> dict:
         system_prompt = "You are a senior dependency management AI. Extract ONLY breaking changes from changelogs relevant to code usage. Format strictly as JSON."
+        
+        usage_constraint = ""
+        if api_usages:
+            usages_str = ", ".join(api_usages)
+            usage_constraint = f"\nCRITICAL: You MUST ONLY extract breaking changes that affect these specific APIs used in the project: [{usages_str}]. Ignore all other breaking changes."
+
         prompt = f"""
-            Analyze the changelog for '{package}' from version {from_v} to {to_v} and extract ONLY breaking changes relevant to Python/the ecosystem API usage:
+            Analyze the changelog for '{package}' from version {from_v} to {to_v} and extract ONLY breaking changes relevant to Python/the ecosystem API usage:{usage_constraint}
             Return a JSON object with this exact structure:
             {{
             "breaking_changes": [
@@ -119,7 +127,7 @@ class ScoutAgent:
             logger.error(f"Error calling LLM: {e}")
         return {"breaking_changes": [], "confidence_score": 0.0, "llm_provider": "none"}
 
-    async def run(self, package_info: dict) -> dict:
+    async def run(self, package_info: dict, api_usages: Optional[list[str]] = None) -> dict:
         name = package_info.get("name")
         current_version = package_info.get("current_version")
         latest_version = package_info.get("latest_version")
@@ -153,11 +161,11 @@ class ScoutAgent:
             changelog_text = await self._fetch_release_notes(client, owner, repo, current_version, latest_version)
             if not changelog_text: return result
             
-            llm_result = await self._analyze_changelog_with_llm(name, current_version, latest_version, changelog_text)
+            llm_result = await self._analyze_changelog_with_llm(name, current_version, latest_version, changelog_text, api_usages)
             result["breaking_changes"] = llm_result.get("breaking_changes", [])
             result["confidence_score"] = llm_result.get("confidence_score", 0.0)
             result["llm_provider"] = llm_result.get("llm_provider", "none")
         return result
 
-    def run_sync(self, package_info: dict) -> dict:
-        return asyncio.run(self.run(package_info))
+    def run_sync(self, package_info: dict, api_usages: Optional[list[str]] = None) -> dict:
+        return asyncio.run(self.run(package_info, api_usages))

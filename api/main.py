@@ -89,11 +89,11 @@ def scan_project(req: ScanRequest):
         
         # Phase 2: Watchdog
         watchdog = WatchdogAgent()
-        watchdog_report = watchdog.run_sync(scanner_output)
+        watchdog_report = watchdog.run_sync(scanner_output, project_root=str(folder_path))
         
         # Compute health score
         total_packages = len(watchdog_report)
-        counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "OK": 0}
+        counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNPINNED": 0, "OK": 0}
         
         for pkg in watchdog_report:
             sev = pkg.get("severity", "OK")
@@ -101,7 +101,7 @@ def scan_project(req: ScanRequest):
             
         health_score = 100
         if total_packages > 0:
-            score = (counts["OK"] * 100 + counts["LOW"] * 75 + counts["MEDIUM"] * 50 + counts["HIGH"] * 25 + counts["CRITICAL"] * 0)
+            score = (counts["OK"] * 100 + counts["LOW"] * 75 + counts["MEDIUM"] * 50 + counts["HIGH"] * 25 + counts["UNPINNED"] * 25 + counts["CRITICAL"] * 0)
             health_score = int(score / total_packages)
             
         return {
@@ -112,6 +112,7 @@ def scan_project(req: ScanRequest):
             "high": counts["HIGH"],
             "medium": counts["MEDIUM"],
             "low": counts["LOW"],
+            "unpinned": counts["UNPINNED"],
             "ok": counts["OK"],
             "packages": watchdog_report
         }
@@ -132,16 +133,22 @@ def update_package(req: UpdateRequest):
     try:
         pkg_info_dict = req.package_info.dict()
         
-        # Phase 3: Scout
+        ast_scanner = ASTScanner()
+        
+        # Step 1: Find API usages in codebase first
+        api_usages = ast_scanner.find_api_usages(str(folder_path), pkg_info_dict.get("name", ""))
+        
+        # Step 2: Run targeted Scout
         scout = ScoutAgent()
-        scout_output = scout.run_sync(pkg_info_dict)
+        scout_output = scout.run_sync(pkg_info_dict, api_usages)
         
         breaking_changes = scout_output.get("breaking_changes", [])
         
+        pkg = req.package_info
+        is_unknown = pkg.current_version == "unknown"
+        
         if not breaking_changes:
             # Just update version in dep file directly
-            pkg = req.package_info
-
             dep_file = pkg.file_path
             package = pkg.name
             from_v = pkg.current_version
@@ -165,6 +172,9 @@ def update_package(req: UpdateRequest):
                 return {
                     "package": package,
                     "status": "updated_version_only",
+                    "api_usages_found": api_usages,
+                    "version_was_unknown": is_unknown,
+                    "pinned_to": to_v if is_unknown else "",
                     "files_patched": [],
                     "checkpoint_id": "",
                     "llm_provider": scout_output.get("llm_provider", "none"),
@@ -175,8 +185,7 @@ def update_package(req: UpdateRequest):
                 logger.error(f"Error updating dependency file: {e}")
                 raise HTTPException(status_code=500, detail=f"Failed to update dependency file: {e}")
 
-        # If breaking changes exist, run ASTScanner and PatchAgent
-        ast_scanner = ASTScanner()
+        # If breaking changes exist, run full ASTScanner for lines/cols
         ast_output = ast_scanner.scan(str(folder_path), breaking_changes)
         
         # Run patch agent
@@ -186,6 +195,9 @@ def update_package(req: UpdateRequest):
         return {
             "package": patch_report.get("package"),
             "status": patch_report.get("overall_status"),
+            "api_usages_found": api_usages,
+            "version_was_unknown": is_unknown,
+            "pinned_to": pkg.latest_version if is_unknown else "",
             "files_patched": patch_report.get("files_patched", []),
             "checkpoint_id": patch_report.get("checkpoint_id", ""),
             "llm_provider": patch_report.get("llm_provider", "none"),

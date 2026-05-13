@@ -10,7 +10,9 @@ from collections import defaultdict
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# --------------------------------- Find all the old API ------------------------------- 
 class DeprecatedAPIVisitor(ast.NodeVisitor):
+    # Constructor
     def __init__(self, breaking_changes: list, file_lines: list, filepath: str):
         self.breaking_changes = breaking_changes
         self.file_lines = file_lines
@@ -20,7 +22,7 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
         self.aliases = {}
         self.from_imports = {}
 
-    # For example: import numpy as np
+    # Handle import alias: "import numpy as np"
     def visit_Import(self, node):
         for alias in node.names:
             if alias.asname:
@@ -29,7 +31,7 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
                 self.aliases[alias.name] = alias.name
         self.generic_visit(node)
 
-    # For example: from django.utils.encoding import force_text
+    # Handle from import: "from django.utils.encoding import force_text"
     def visit_ImportFrom(self, node):
         module = node.module or ""
         for alias in node.names:
@@ -41,9 +43,8 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
             self._check_api_usage(full_name, node)
         self.generic_visit(node)
 
-    # Get full name through AST 
+    # Convert alias to the real name: make "np.bool" to "numpy.bool"
     def _get_full_name_for_attribute(self, node) -> str:
-        # Recursively get full name like os.path.join or np.bool
         if isinstance(node, ast.Name):
             base = node.id
             return self.aliases.get(base, base)
@@ -53,12 +54,14 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
                 return f"{base}.{node.attr}"
         return ""
 
+    # Handle object.attribute: "np.bool" or "pandas.DataFrame.append"
     def visit_Attribute(self, node):
         full_name = self._get_full_name_for_attribute(node)
         if full_name:
             self._check_api_usage(full_name, node)
         self.generic_visit(node)
 
+    # Handle "like_this()"
     def visit_Name(self, node):
         name = node.id
         if name in self.from_imports:
@@ -83,18 +86,13 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
             if full_name == old_api or full_name == resolved_old_api:
                 match = True
             elif isinstance(node, ast.Attribute) and old_api.endswith("." + node.attr):
-                # Heuristic for instance methods like DataFrame.append vs df.append
-                # Without type checking, if the old API is Class.method and we see instance.method, we flag it.
                 match = True
             elif isinstance(node, ast.Name) and old_api == node.id:
-                # Direct usage of an un-aliased function name e.g. "force_text"
                 match = True
             elif old_api == full_name.split('.')[-1] and full_name.endswith(old_api):
-                # Match when old_api is "force_text" and full_name is "django.utils.encoding.force_text"
                 match = True
 
             if match:
-                # Avoid duplicates for the same AST node line/col
                 line = getattr(node, "lineno", -1)
                 col = getattr(node, "col_offset", -1)
                 if any(m["line"] == line and m["col"] == col for m in self.matches):
@@ -115,9 +113,85 @@ class DeprecatedAPIVisitor(ast.NodeVisitor):
                     "type": bc.get("type", "")
                 })
 
+# -------------------------------- Find API that using in project --------------------------
+class APIUsageVisitor(ast.NodeVisitor):
+    def __init__(self, target_package: str):
+        self.target_package = target_package
+        self.used_apis = set()
+        self.aliases = {}
+        self.from_imports = {}
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            if alias.name.startswith(self.target_package):
+                asname = alias.asname or alias.name
+                self.aliases[asname] = alias.name
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        module = node.module or ""
+        if module.startswith(self.target_package):
+            for alias in node.names:
+                name = alias.name
+                asname = alias.asname or name
+                full_name = f"{module}.{name}"
+                self.from_imports[asname] = full_name
+                self.used_apis.add(full_name)
+        self.generic_visit(node)
+
+    def _get_full_name_for_attribute(self, node) -> str:
+        if isinstance(node, ast.Name):
+            return self.aliases.get(node.id, node.id)
+        elif isinstance(node, ast.Attribute):
+            base = self._get_full_name_for_attribute(node.value)
+            if base:
+                return f"{base}.{node.attr}"
+        return ""
+
+    def visit_Attribute(self, node):
+        full_name = self._get_full_name_for_attribute(node)
+        if full_name and full_name.startswith(self.target_package):
+            self.used_apis.add(full_name)
+        self.generic_visit(node)
+
+    def visit_Name(self, node):
+        name = node.id
+        if name in self.from_imports:
+            self.used_apis.add(self.from_imports[name])
+        self.generic_visit(node)
+
+
 class ASTScanner:
     def __init__(self):
         pass
+
+    def find_api_usages(self, root_folder: str, package_name: str) -> list[str]:
+        root = Path(root_folder)
+        ignore_dirs = {'venv', '.venv', '__pycache__', 'node_modules', '.git'}
+        all_used_apis = set()
+
+        if not root.exists() or not root.is_dir():
+            logger.error(f"Invalid directory: {root_folder}")
+            return []
+
+        for filepath in root.rglob("*.py"):
+            if any(part in ignore_dirs for part in filepath.parts):
+                continue
+                
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                tree = ast.parse(content, filename=str(filepath))
+                visitor = APIUsageVisitor(package_name)
+                visitor.visit(tree)
+                all_used_apis.update(visitor.used_apis)
+            except Exception as e:
+                logger.debug(f"Error parsing {filepath} for API usage: {e}")
+
+        # Try to clean up standard base module usage if a sub-attribute is more specific
+        # e.g., if we have both "requests" and "requests.get", keep both for safety, 
+        # but in many cases we just pass the raw list.
+        return sorted(list(all_used_apis))
 
     def scan(self, root_folder: str, breaking_changes: list) -> dict:
         root = Path(root_folder)

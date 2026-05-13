@@ -13,6 +13,11 @@ except ImportError:
     print("httpx is required. Please install it using `pip install httpx`")
     sys.exit(1)
 
+try:
+    from tools.lockfile_resolver import LockfileResolver
+except ImportError:
+    LockfileResolver = None  # type: ignore
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -20,6 +25,7 @@ logger = logging.getLogger(__name__)
 class WatchdogAgent:
     def __init__(self, max_concurrent: int = 10):
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self._lockfile_resolver = LockfileResolver() if LockfileResolver else None
 
     # ------------------------------- For deps.dev -------------------------------
     def _map_deps_dev_ecosystem(self, ecosystem: str) -> str:
@@ -121,21 +127,60 @@ class WatchdogAgent:
         return "OK"
 
     # -------------------------- Full Process For Each Package ------------------------
-    async def _process_package(self, client: httpx.AsyncClient, pkg: dict, ecosystem: str, file_path: str) -> Optional[Dict[str, Any]]:
+    async def _process_package(
+        self,
+        client: httpx.AsyncClient,
+        pkg: dict,
+        ecosystem: str,
+        file_path: str,
+        project_root: str = ""
+    ) -> Optional[Dict[str, Any]]:
         name = pkg.get("name")
         current_version = pkg.get("version")
+
+        if not isinstance(current_version, str):
+            current_version = "unknown"
+
+        pinned = pkg.get("pinned", current_version != "unknown")
 
         if not isinstance(name, str) or not name:
             return None
 
-        if not isinstance(current_version, str) or current_version == "unknown":
-            return None
-        
-        # Skip if current version is unknown
-        if not current_version or current_version == "unknown":
-            return None
-            
-        # Fetch latest version and CVEs concurrently
+        resolved_from = "manifest"
+
+        # ── Try to resolve from lockfile if version is unknown ──
+        if not pinned or current_version == "unknown":
+            lockfile_version = None
+            if self._lockfile_resolver and project_root:
+                try:
+                    lockfile_version = self._lockfile_resolver.resolve(name, project_root)
+                except Exception as e:
+                    logger.debug(f"LockfileResolver error for {name}: {e}")
+
+            if lockfile_version:
+                current_version = lockfile_version
+                pinned = True
+                resolved_from = "lockfile"
+            else:
+                # Truly unresolvable — fetch latest and return UNPINNED
+                latest_version = await self._fetch_latest_version(client, name, ecosystem)
+                return {
+                    "name": name,
+                    "current_version": "unknown",
+                    "latest_version": latest_version,
+                    "ecosystem": ecosystem,
+                    "severity": "UNPINNED",
+                    "pinned": False,
+                    "resolved_from": "none",
+                    "cves": [],
+                    "file_path": file_path,
+                    "message": (
+                        f"No version pinned. Installing latest ({latest_version}). "
+                        "Scanning full changelog for breaking changes."
+                    )
+                }
+
+        # ── Normal pinned flow ──
         latest_task = self._fetch_latest_version(client, name, ecosystem)
         cves_task = self._fetch_cves(client, name, current_version, ecosystem)
         
@@ -149,11 +194,13 @@ class WatchdogAgent:
             "latest_version": latest_version,
             "ecosystem": ecosystem,
             "severity": severity,
+            "pinned": pinned,
+            "resolved_from": resolved_from,
             "cves": cves,
             "file_path": file_path
         }
 
-    async def run(self, scanner_output: List[Dict]) -> List[Dict]:
+    async def run(self, scanner_output: List[Dict], project_root: str = "") -> List[Dict]:
         tasks = []
         async with httpx.AsyncClient() as client:
             for file_data in scanner_output:
@@ -171,11 +218,13 @@ class WatchdogAgent:
                     continue
                 
                 for pkg in packages:
-                    tasks.append(self._process_package(client, pkg, ecosystem, file_path))
+                    tasks.append(
+                        self._process_package(client, pkg, ecosystem, file_path, project_root)
+                    )
                     
             results = await asyncio.gather(*tasks)
             
         return [r for r in results if r is not None]
 
-    def run_sync(self, scanner_output: List[Dict]) -> List[Dict]:
-        return asyncio.run(self.run(scanner_output))
+    def run_sync(self, scanner_output: List[Dict], project_root: str = "") -> List[Dict]:
+        return asyncio.run(self.run(scanner_output, project_root))

@@ -63,18 +63,17 @@ class ScannerAgent:
 
     def _parse_requirements(self, filepath: Path) -> list[dict]:
         packages = []
-        # Regex matches name and optional version specifier: django==3.2.18, numpy>=1.0, requests
         pattern = re.compile(r'^([a-zA-Z0-9_\-\.]+)(?:\s*(?:==|>=|<=|~=|>|<)\s*([0-9a-zA-Z\.\-\+]+))?', re.IGNORECASE)
         with open(filepath, 'r', encoding='utf-8') as f:
             for line in f:
-                line = line.split('#')[0].strip() # Remove comments
+                line = line.split('#')[0].strip()
                 if not line or line.startswith('-'):
                     continue
                 match = pattern.match(line)
                 if match:
                     name = match.group(1)
                     version = match.group(2) or "unknown"
-                    packages.append({"name": name, "version": version})
+                    packages.append({"name": name, "version": version, "pinned": version != "unknown"})
         return packages
 
     def _parse_pyproject(self, filepath: Path) -> list[dict]:
@@ -95,15 +94,16 @@ class ScannerAgent:
                     if match:
                         name = match.group(1)
                         version = match.group(2) or "unknown"
-                        packages.append({"name": name, "version": version})
+                        packages.append({"name": name, "version": version, "pinned": version != "unknown"})
                 
-                # Parse poetry dependencies (dict)
                 for name, version in poetry_deps.items():
                     if name.lower() == "python": 
                         continue
                     if isinstance(version, dict):
                         version = version.get("version", "unknown")
-                    packages.append({"name": name, "version": str(version).strip('^~')})
+                    clean_v = str(version).strip('^~*')
+                    pinned = bool(clean_v) and clean_v != "unknown" and clean_v != "*"
+                    packages.append({"name": name, "version": clean_v or "unknown", "pinned": pinned})
             except Exception as e:
                 logger.warning(f"Failed to parse TOML {filepath}: {e}")
         else:
@@ -119,9 +119,9 @@ class ScannerAgent:
                 dev_deps = data.get("devDependencies", {})
                 
                 for name, version in deps.items():
-                    packages.append({"name": name, "version": version})
+                    packages.append({"name": name, "version": version, "pinned": True})
                 for name, version in dev_deps.items():
-                    packages.append({"name": name, "version": version})
+                    packages.append({"name": name, "version": version, "pinned": True})
             except json.JSONDecodeError:
                 logger.warning(f"Malformed JSON in {filepath}")
         return packages
@@ -135,7 +135,7 @@ class ScannerAgent:
         # or inside a require (...) block
         pattern = re.compile(r'(?:require\s+|^|\t)([a-zA-Z0-9\.\-\/\_]+)\s+(v[0-9a-zA-Z\.\-\+]+)', re.MULTILINE)
         for match in pattern.finditer(content):
-            packages.append({"name": match.group(1), "version": match.group(2)})
+            packages.append({"name": match.group(1), "version": match.group(2), "pinned": True})
         return packages
 
     def _parse_cargo_toml(self, filepath: Path) -> list[dict]:
@@ -148,7 +148,7 @@ class ScannerAgent:
                     for name, version in deps.items():
                         if isinstance(version, dict):
                             version = version.get("version", "unknown")
-                        packages.append({"name": name, "version": version})
+                        packages.append({"name": name, "version": version, "pinned": version != "unknown"})
                 except Exception as e:
                     logger.warning(f"Error parsing Cargo.toml: {e}")
         return packages
@@ -169,7 +169,7 @@ class ScannerAgent:
                 
                 if group_id is not None and artifact_id is not None and version is not None:
                     name = f"{group_id.text}:{artifact_id.text}"
-                    packages.append({"name": name, "version": version.text})
+                    packages.append({"name": name, "version": version.text, "pinned": True})
         except Exception as e:
             logger.warning(f"Error parsing pom.xml {filepath}: {e}")
         return packages

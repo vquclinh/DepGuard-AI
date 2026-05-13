@@ -23,6 +23,7 @@ const severityColors: Record<string, string> = {
   HIGH: "bg-orange-500/10 text-orange-500 border-orange-500/20",
   MEDIUM: "bg-yellow-500/10 text-yellow-500 border-yellow-500/20",
   LOW: "bg-blue-500/10 text-blue-500 border-blue-500/20",
+  UNPINNED: "bg-amber-500/10 text-amber-500 border-amber-500/20",
   OK: "bg-green-500/10 text-green-500 border-green-500/20"
 };
 
@@ -89,10 +90,19 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
               const status = statuses[pkg.name];
               const isUpdating = updating[pkg.name];
               const isOk = pkg.severity === "OK";
+              const isUnpinned = pkg.severity === "UNPINNED";
+              const btnLabel = isUnpinned ? "Scan & Pin" : "Update";
 
               return (
                 <tr key={pkg.name} className="hover:bg-muted/30 transition-colors">
-                  <td className="px-6 py-4 font-medium">{pkg.name}</td>
+                  <td className="px-6 py-4 font-medium">
+                    <div>{pkg.name}</div>
+                    {isUnpinned && (
+                      <div className="text-xs text-amber-500/80 mt-0.5">
+                        ⚠ Version not pinned — full changelog scan applied
+                      </div>
+                    )}
+                  </td>
                   <td className="px-6 py-4 font-mono text-muted-foreground">{pkg.current_version}</td>
                   <td className="px-6 py-4 font-mono text-foreground">{pkg.latest_version}</td>
                   <td className="px-6 py-4">
@@ -144,10 +154,12 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
                           "px-4 py-1.5 text-sm font-medium rounded-md transition-colors",
                           isOk 
                             ? "bg-muted text-muted-foreground cursor-not-allowed" 
+                            : isUnpinned
+                            ? "bg-amber-500 text-white hover:bg-amber-600"
                             : "bg-primary text-primary-foreground hover:bg-primary/90"
                         )}
                       >
-                        Update
+                        {btnLabel}
                       </button>
                     )}
                   </td>

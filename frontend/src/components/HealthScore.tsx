@@ -7,6 +7,7 @@ interface HealthScoreProps {
     high: number;
     medium: number;
     low: number;
+    unpinned: number;
     ok: number;
   };
 }
@@ -62,6 +63,7 @@ export function HealthScore({ score, stats }: HealthScoreProps) {
         <Badge label="High" count={stats.high} color="bg-orange-500/10 text-orange-500 border-orange-500/20" />
         <Badge label="Medium" count={stats.medium} color="bg-yellow-500/10 text-yellow-500 border-yellow-500/20" />
         <Badge label="Low" count={stats.low} color="bg-blue-500/10 text-blue-500 border-blue-500/20" />
+        <Badge label="Unpinned" count={stats.unpinned} color="bg-amber-500/10 text-amber-500 border-amber-500/20" />
         <Badge label="OK" count={stats.ok} color="bg-green-500/10 text-green-500 border-green-500/20" />
       </div>
     </div>
