@@ -76,26 +76,47 @@ class WatchdogAgent:
         return "unknown"
 
     # ------------------------------- Get Vulneribilities --------------------------
-    async def _fetch_cves(self, client: httpx.AsyncClient, name: str, version: str, ecosystem: str) -> List[Dict]:
-        osv_eco = self._map_osv_ecosystem(ecosystem)
-        if not osv_eco:
-            return []
+    async def _fetch_cves_batch(self, client: httpx.AsyncClient, packages: List[Dict]) -> Dict[str, List[Dict]]:
+        url = "https://api.osv.dev/v1/querybatch"
+        queries = []
+        mapping_keys = []
+
+        for pkg in packages:
+            osv_eco = self._map_osv_ecosystem(pkg["ecosystem"])
+            version = pkg.get("version")
+            
+            # Only check CVE if not unknown
+            if osv_eco and version and version != "unknown":
+                queries.append({
+                    "version": version,
+                    "package": {"name": pkg["name"], "ecosystem": osv_eco}
+                })
+                mapping_keys.append(f"{pkg['ecosystem']}::{pkg['name']}::{version}")
+
+        if not queries:
+            return {}
+
+        results_map = {}
         
-        url = "https://api.osv.dev/v1/query"
-        payload = {
-            "version": version,
-            "package": {"name": name, "ecosystem": osv_eco}
-        }
-        async with self.semaphore:
+        chunk_size = 500
+        for i in range(0, len(queries), chunk_size):
+            chunk_queries = queries[i:i + chunk_size]
+            chunk_keys = mapping_keys[i:i + chunk_size]
+
             try:
-                response = await client.post(url, json=payload, timeout=10.0)
+                response = await client.post(url, json={"queries": chunk_queries}, timeout=20.0)
                 if response.status_code == 200:
                     data = response.json()
-                    vulns = data.get("vulns", [])
-                    return [{"id": v.get("id"), "summary": v.get("summary", "")} for v in vulns]
+                    batch_results = data.get("results", [])
+
+                    for idx, res in enumerate(batch_results):
+                        vulns = res.get("vulns", [])
+                        parsed_vulns = [{"id": v.get("id"), "summary": v.get("summary", "")} for v in vulns]
+                        results_map[chunk_keys[idx]] = parsed_vulns
             except Exception as e:
-                logger.debug(f"Error fetching CVEs for {name} {version}: {e}")
-        return []
+                logger.debug(f"Error fetching OSV batch: {e}")
+
+        return results_map
 
     # --------------------------------- Risk Scoring System --------------------------
     def _classify_severity(self, current_version: str, latest_version: str, cves: list) -> str:
@@ -131,65 +152,43 @@ class WatchdogAgent:
         self,
         client: httpx.AsyncClient,
         pkg: dict,
-        ecosystem: str,
-        file_path: str,
-        project_root: str = "",
+        cves_list: list,
         progress_callback = None
     ) -> Optional[Dict[str, Any]]:
         name = pkg.get("name")
-        current_version = pkg.get("version")
-
-        if not isinstance(current_version, str):
-            current_version = "unknown"
-
-        pinned = pkg.get("pinned", current_version != "unknown")
+        current_version = str(pkg.get("version", "unknown"))
+        ecosystem = str(pkg.get("ecosystem", "unknown")) 
+        pinned = pkg.get("pinned")
+        resolved_from = pkg.get("resolved_from", "manifest")
+        file_path = pkg.get("file_path")
 
         if not isinstance(name, str) or not name:
             return None
 
-        resolved_from = "manifest"
-
-        # -------------- Try to resolve from lockfile if version is unknown ------------
-        if not pinned or current_version == "unknown":
-            lockfile_version = None
-            if self._lockfile_resolver and project_root:
-                try:
-                    lockfile_version = self._lockfile_resolver.resolve(name, project_root)
-                except Exception as e:
-                    logger.debug(f"LockfileResolver error for {name}: {e}")
-
-            if lockfile_version:
-                current_version = lockfile_version
-                pinned = True
-                resolved_from = "lockfile"
-            else:
-                latest_version = await self._fetch_latest_version(client, name, ecosystem)
-                return {
-                    "name": name,
-                    "current_version": "unknown",
-                    "latest_version": latest_version,
-                    "ecosystem": ecosystem,
-                    "severity": "UNPINNED",
-                    "pinned": False,
-                    "resolved_from": "none",
-                    "cves": [],
-                    "file_path": file_path,
-                    "message": (
-                        f"No version pinned. Installing latest ({latest_version}). "
-                        "Scanning full changelog for breaking changes."
-                    )
-                }
-
         if progress_callback:
-            await progress_callback({"phase": "Checking CVEs", "package": name})
+            await progress_callback({"phase": "Fetching updates", "package": name})
 
-        # Pinned package
-        latest_task = self._fetch_latest_version(client, name, ecosystem)
-        cves_task = self._fetch_cves(client, name, current_version, ecosystem)
-        
-        latest_version, cves = await asyncio.gather(latest_task, cves_task)
-        
-        severity = self._classify_severity(current_version, latest_version, cves)
+        latest_version = await self._fetch_latest_version(client, name, ecosystem)
+
+        # Unpinned Case
+        if not pinned or current_version == "unknown":
+            return {
+                "name": name,
+                "current_version": "unknown",
+                "latest_version": latest_version,
+                "ecosystem": ecosystem,
+                "severity": "UNPINNED",
+                "pinned": False,
+                "resolved_from": "none",
+                "cves": [],
+                "file_path": file_path,
+                "message": (
+                    f"No version pinned. Installing latest ({latest_version}). "
+                    "Scanning full changelog for breaking changes."
+                )
+            }
+
+        severity = self._classify_severity(current_version, latest_version, cves_list)
         
         return {
             "name": name,
@@ -199,25 +198,69 @@ class WatchdogAgent:
             "severity": severity,
             "pinned": pinned,
             "resolved_from": resolved_from,
-            "cves": cves,
+            "cves": cves_list,
             "file_path": file_path
         }
 
     async def run(self, scanner_output: List[Dict], project_root: str = "", progress_callback = None) -> List[Dict]:
+        all_packages = []
+        
+        # Step 1: handle lockfile
+        for file_data in scanner_output:
+            file_path = file_data.get("file_path")
+            ecosystem = file_data.get("ecosystem")
+            packages = file_data.get("packages", [])
+            
+            if not isinstance(file_path, str) or not isinstance(ecosystem, str) or not isinstance(packages, list):
+                continue
+                
+            for pkg in packages:
+                name = pkg.get("name")
+                current_version = pkg.get("version")
+                
+                if not isinstance(current_version, str):
+                    current_version = "unknown"
+                    
+                pinned = pkg.get("pinned", current_version != "unknown")
+                resolved_from = "manifest"
+
+                if (not pinned or current_version == "unknown") and self._lockfile_resolver and project_root:
+                    try:
+                        lock_v = self._lockfile_resolver.resolve(name, project_root)
+                        if lock_v:
+                            current_version = lock_v
+                            pinned = True
+                            resolved_from = "lockfile"
+                    except Exception as e:
+                        logger.debug(f"LockfileResolver error for {name}: {e}")
+
+                all_packages.append({
+                    "name": name,
+                    "version": current_version,
+                    "pinned": pinned,
+                    "ecosystem": ecosystem,
+                    "file_path": file_path,
+                    "resolved_from": resolved_from
+                })
+
+        # Call fetch cves batch
         tasks = []
         async with httpx.AsyncClient() as client:
-            for file_data in scanner_output:
-                file_path = file_data.get("file_path")
-                ecosystem = file_data.get("ecosystem")
-                packages = file_data.get("packages", [])
+            if progress_callback and all_packages:
+                await progress_callback({
+                    "phase": "Checking Vulnerabilities", 
+                    "message": f"Batch querying OSV for {len(all_packages)} packages..."
+                })
                 
-                if not isinstance(file_path, str) or not isinstance(ecosystem, str) or not isinstance(packages, list):
-                    continue
+            cves_map = await self._fetch_cves_batch(client, all_packages)
+            
+            for pkg in all_packages:
+                key = f"{pkg['ecosystem']}::{pkg['name']}::{pkg['version']}"
+                pkg_cves = cves_map.get(key, [])
                 
-                for pkg in packages:
-                    tasks.append(
-                        self._process_package(client, pkg, ecosystem, file_path, project_root, progress_callback)
-                    )
+                tasks.append(
+                    self._process_package(client, pkg, pkg_cves, progress_callback)
+                )
                     
             results = await asyncio.gather(*tasks)
             
