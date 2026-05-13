@@ -133,7 +133,8 @@ class WatchdogAgent:
         pkg: dict,
         ecosystem: str,
         file_path: str,
-        project_root: str = ""
+        project_root: str = "",
+        progress_callback = None
     ) -> Optional[Dict[str, Any]]:
         name = pkg.get("name")
         current_version = pkg.get("version")
@@ -179,6 +180,9 @@ class WatchdogAgent:
                     )
                 }
 
+        if progress_callback:
+            await progress_callback({"phase": "Checking CVEs", "package": name})
+
         # Pinned package
         latest_task = self._fetch_latest_version(client, name, ecosystem)
         cves_task = self._fetch_cves(client, name, current_version, ecosystem)
@@ -199,7 +203,7 @@ class WatchdogAgent:
             "file_path": file_path
         }
 
-    async def run(self, scanner_output: List[Dict], project_root: str = "") -> List[Dict]:
+    async def run(self, scanner_output: List[Dict], project_root: str = "", progress_callback = None) -> List[Dict]:
         tasks = []
         async with httpx.AsyncClient() as client:
             for file_data in scanner_output:
@@ -207,23 +211,17 @@ class WatchdogAgent:
                 ecosystem = file_data.get("ecosystem")
                 packages = file_data.get("packages", [])
                 
-                if not isinstance(file_path, str):
-                    continue
-
-                if not isinstance(ecosystem, str):
-                    continue
-
-                if not isinstance(packages, list):
+                if not isinstance(file_path, str) or not isinstance(ecosystem, str) or not isinstance(packages, list):
                     continue
                 
                 for pkg in packages:
                     tasks.append(
-                        self._process_package(client, pkg, ecosystem, file_path, project_root)
+                        self._process_package(client, pkg, ecosystem, file_path, project_root, progress_callback)
                     )
                     
             results = await asyncio.gather(*tasks)
             
         return [r for r in results if r is not None]
 
-    def run_sync(self, scanner_output: List[Dict], project_root: str = "") -> List[Dict]:
-        return asyncio.run(self.run(scanner_output, project_root))
+    def run_sync(self, scanner_output: List[Dict], project_root: str = "", progress_callback = None) -> List[Dict]:
+        return asyncio.run(self.run(scanner_output, project_root, progress_callback))

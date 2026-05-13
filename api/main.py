@@ -3,9 +3,12 @@ import sys
 import logging
 import subprocess
 import re
+import asyncio
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import json
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -74,7 +77,120 @@ def get_providers():
     active_provider = next((p["name"] for p in status if p["status"] == "available"), "none")
     return {"providers": status, "active_provider": active_provider}
 
+# ------------------------------ Browse Directory --------------------------------------
+def _open_native_dialog():
+    try:
+        # Try zenity (Linux)
+        result = subprocess.run(
+            ["zenity", "--file-selection", "--directory", "--title=Select Project Directory"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+            
+        # Fallback to kdialog if zenity fails or user cancels
+        if result.returncode != 1:  # 1 usually means cancel in zenity
+            result = subprocess.run(
+                ["kdialog", "--getexistingdirectory"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+    except Exception as e:
+        logger.error(f"Error with native dialog: {e}")
+    return ""
+
+@app.get("/browse")
+async def browse_directory():
+    try:
+        folder = await asyncio.to_thread(_open_native_dialog)
+        return {"path": folder or ""}
+    except Exception as e:
+        logger.error(f"Error opening folder dialog: {e}")
+        return {"path": ""}
+
 # ------------------------------ Scan Dependencies Project -------------------------------
+@app.get("/scan-stream")
+async def scan_project_stream(folder_path: str):
+    folder_path_obj = Path(folder_path)
+    if not folder_path_obj.exists() or not folder_path_obj.is_dir():
+        raise HTTPException(status_code=400, detail="Folder path does not exist or is not a directory")
+
+    async def event_generator():
+        try:
+            # Phase 1: Scan
+            yield f"data: {json.dumps({'phase': 'Scanning files', 'message': 'Finding manifests...'})}\n\n"
+            scanner = ScannerAgent(str(folder_path_obj))
+            
+            # We run the scanner in a thread since it's synchronous
+            scanner_output = await asyncio.to_thread(scanner.scan)
+            
+            total_packages = sum(len(f.get("packages", [])) for f in scanner_output)
+            yield f"data: {json.dumps({'phase': 'Resolving versions', 'message': f'Found {total_packages} packages', 'total_packages': total_packages})}\n\n"
+            
+            queue = asyncio.Queue()
+            async def progress_callback(msg):
+                await queue.put(msg)
+                
+            async def run_watchdog():
+                try:
+                    watchdog = WatchdogAgent()
+                    report = await watchdog.run(scanner_output, project_root=str(folder_path_obj), progress_callback=progress_callback)
+                    await queue.put({"done": True, "report": report})
+                except Exception as e:
+                    await queue.put({"error": str(e)})
+                
+            task = asyncio.create_task(run_watchdog())
+            
+            while True:
+                msg = await queue.get()
+                if "error" in msg:
+                    yield f"data: {json.dumps({'error': msg['error']})}\n\n"
+                    break
+                    
+                if "done" in msg:
+                    watchdog_report = msg["report"]
+                    
+                    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNPINNED": 0, "OK": 0}
+                    for pkg in watchdog_report:
+                        sev = pkg.get("severity", "OK")
+                        counts[sev] = counts.get(sev, 0) + 1
+                        
+                    health_score = 100
+                    if total_packages > 0:
+                        score = (counts["OK"] * 100 + counts["LOW"] * 75 + counts["MEDIUM"] * 50 + counts["HIGH"] * 25 + counts["UNPINNED"] * 25 + counts["CRITICAL"] * 0)
+                        health_score = int(score / total_packages)
+                        
+                    final_data = {
+                        "phase": "Completed",
+                        "folder_path": str(folder_path_obj),
+                        "health_score": health_score,
+                        "total_packages": total_packages,
+                        "critical": counts["CRITICAL"],
+                        "high": counts["HIGH"],
+                        "medium": counts["MEDIUM"],
+                        "low": counts["LOW"],
+                        "unpinned": counts["UNPINNED"],
+                        "ok": counts["OK"],
+                        "packages": watchdog_report
+                    }
+                    yield f"data: {json.dumps(final_data)}\n\n"
+                    break
+                    
+                yield f"data: {json.dumps(msg)}\n\n"
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+    )
+
 @app.post("/scan")
 def scan_project(req: ScanRequest):
     folder_path = Path(req.folder_path)

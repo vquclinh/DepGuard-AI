@@ -11,6 +11,38 @@ export async function scanProject(folderPath: string) {
   return response.json();
 }
 
+export function scanProjectStream(folderPath: string, onMessage: (msg: any) => void, onError: (err: string) => void) {
+  const url = `/api/scan-stream?folder_path=${encodeURIComponent(folderPath)}`;
+  const eventSource = new EventSource(url);
+
+  eventSource.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.error) {
+        onError(data.error);
+        eventSource.close();
+      } else if (data.phase === "Completed") {
+        onMessage(data);
+        eventSource.close();
+      } else {
+        onMessage(data);
+      }
+    } catch (err) {
+      onError('Failed to parse stream event');
+      eventSource.close();
+    }
+  };
+
+  eventSource.onerror = () => {
+    onError('Connection to scan stream lost.');
+    eventSource.close();
+  };
+
+  return () => {
+    eventSource.close();
+  };
+}
+
 export async function updatePackage(folderPath: string, packageInfo: object) {
   const response = await fetch('/api/update', {
     method: 'POST',
@@ -42,6 +74,15 @@ export async function getProviders() {
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to fetch providers');
+  }
+  return response.json();
+}
+
+export async function browseProject() {
+  const response = await fetch('/api/browse');
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to open folder browser');
   }
   return response.json();
 }

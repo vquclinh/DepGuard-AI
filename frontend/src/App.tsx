@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { FolderSearch, ShieldCheck, Activity } from "lucide-react";
-import { scanProject, getProviders } from "@/hooks/useDepGuard";
+import { scanProjectStream, getProviders, browseProject } from "@/hooks/useDepGuard";
 import { HealthScore } from "@/components/HealthScore";
 import { PackagesTable } from "@/components/PackagesTable";
 import type { PackageData } from "@/components/PackagesTable";
@@ -11,6 +11,12 @@ function App() {
   const [folderPath, setFolderPath] = useState("/mnt/vquclinh/PROJECT-CMAKE/DEPGUARD-AI/DepGuard-AI");
   const [isScanning, setIsScanning] = useState(false);
   const [providerStatuses, setProviderStatuses] = useState<any[]>([]);
+  const [scanProgress, setScanProgress] = useState<{
+    phase: string;
+    message?: string;
+    package?: string;
+    total_packages?: number;
+  } | null>(null);
   
   const [healthData, setHealthData] = useState<{
     score: number;
@@ -42,34 +48,54 @@ function App() {
       .catch(err => console.error("Failed to load providers:", err));
   }, []);
 
-  const handleScan = async () => {
+  const handleBrowse = async () => {
+    try {
+      const result = await browseProject();
+      if (result && result.path) {
+        setFolderPath(result.path);
+        addLog(`Selected directory: ${result.path}`, "info");
+      }
+    } catch (e: any) {
+      addLog(`Browse failed: ${e.message}`, "error");
+    }
+  };
+
+  const handleScan = () => {
     if (!folderPath) return;
     
     setIsScanning(true);
+    setScanProgress({ phase: "Initializing..." });
     addLog(`Initiating scan for: ${folderPath}`, "info");
     
-    try {
-      const result = await scanProject(folderPath);
-      
-      setHealthData({
-        score: result.health_score,
-        stats: {
-          critical: result.critical,
-          high: result.high,
-          medium: result.medium,
-          low: result.low,
-          unpinned: result.unpinned,
-          ok: result.ok
+    scanProjectStream(
+      folderPath,
+      (data) => {
+        if (data.phase === "Completed") {
+          setHealthData({
+            score: data.health_score,
+            stats: {
+              critical: data.critical,
+              high: data.high,
+              medium: data.medium,
+              low: data.low,
+              unpinned: data.unpinned,
+              ok: data.ok
+            }
+          });
+          setPackages(data.packages);
+          addLog(`Scan complete. Found ${data.total_packages} packages.`, "success");
+          setIsScanning(false);
+          setScanProgress(null);
+        } else {
+          setScanProgress(data);
         }
-      });
-      
-      setPackages(result.packages);
-      addLog(`Scan complete. Found ${result.total_packages} packages.`, "success");
-    } catch (e: any) {
-      addLog(`Scan failed: ${e.message}`, "error");
-    } finally {
-      setIsScanning(false);
-    }
+      },
+      (error) => {
+        addLog(`Scan failed: ${error}`, "error");
+        setIsScanning(false);
+        setScanProgress(null);
+      }
+    );
   };
 
   return (
@@ -111,26 +137,36 @@ function App() {
       <main className="flex-1 container mx-auto px-6 py-8 flex flex-col gap-8 max-w-6xl">
         
         {/* Scanner Input */}
-        <section className="bg-card border rounded-2xl p-6 shadow-sm">
-          <div className="flex flex-col md:flex-row gap-4 items-end">
+        <section className="bg-card border border-border/60 rounded-2xl p-6 shadow-sm relative overflow-hidden">
+          <div className="flex flex-col md:flex-row gap-4 items-end relative z-10">
             <div className="flex-1 space-y-2 w-full">
-              <label className="text-sm font-semibold ml-1">Target Project Directory</label>
-              <div className="relative">
-                <FolderSearch className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
-                <input
-                  type="text"
-                  value={folderPath}
-                  onChange={(e) => setFolderPath(e.target.value)}
-                  placeholder="e.g. /path/to/your/project"
-                  className="w-full bg-background border rounded-lg pl-10 pr-4 py-3 text-sm focus:ring-2 focus:ring-primary focus:outline-none transition-all"
-                  onKeyDown={(e) => e.key === 'Enter' && handleScan()}
-                />
+              <label className="text-sm font-semibold ml-1 text-muted-foreground uppercase tracking-wider">Target Project Directory</label>
+              <div className="flex gap-2">
+                <div className="relative flex-1">
+                  <FolderSearch className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
+                  <input
+                    type="text"
+                    value={folderPath}
+                    onChange={(e) => setFolderPath(e.target.value)}
+                    placeholder="e.g. /path/to/your/project"
+                    className="w-full bg-background border border-border/60 rounded-lg pl-10 pr-4 py-3 text-sm focus:ring-2 focus:ring-primary focus:border-primary focus:outline-none transition-all"
+                    onKeyDown={(e) => e.key === 'Enter' && handleScan()}
+                    disabled={isScanning}
+                  />
+                </div>
+                <button
+                  onClick={handleBrowse}
+                  disabled={isScanning}
+                  className="bg-secondary text-secondary-foreground hover:bg-secondary/80 border border-border/60 px-4 py-3 rounded-lg font-semibold transition-all h-[46px] flex items-center justify-center shrink-0 disabled:opacity-50"
+                >
+                  Browse
+                </button>
               </div>
             </div>
             <button
               onClick={handleScan}
               disabled={isScanning || !folderPath}
-              className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-semibold transition-all h-[46px] flex items-center justify-center shrink-0"
+              className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-semibold transition-all h-[46px] flex items-center justify-center shrink-0 shadow-sm"
             >
               {isScanning ? (
                 <span className="flex items-center gap-2">
@@ -142,6 +178,33 @@ function App() {
               )}
             </button>
           </div>
+
+          {/* Progress Overlay */}
+          {isScanning && scanProgress && (
+            <div className="mt-6 pt-6 border-t border-border/50 animate-in fade-in slide-in-from-top-2 duration-300">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-primary animate-pulse" />
+                  <span className="text-sm font-semibold">{scanProgress.phase}</span>
+                </div>
+                {scanProgress.total_packages && (
+                  <span className="text-xs text-muted-foreground font-mono">
+                    Total Packages: {scanProgress.total_packages}
+                  </span>
+                )}
+              </div>
+              {scanProgress.message && (
+                <p className="text-sm text-muted-foreground truncate font-mono bg-muted/30 px-3 py-1.5 rounded border border-border/40">
+                  {scanProgress.message}
+                </p>
+              )}
+              {scanProgress.package && (
+                <p className="text-sm text-muted-foreground truncate font-mono bg-muted/30 px-3 py-1.5 rounded border border-border/40">
+                  Analyzing: <span className="text-foreground">{scanProgress.package}</span>
+                </p>
+              )}
+            </div>
+          )}
         </section>
 
         {/* Results Area */}
