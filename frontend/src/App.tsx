@@ -43,11 +43,25 @@ function App() {
       .catch(err => console.error("Failed to load providers:", err));
   }, []);
 
+  const resetProjectScanState = () => {
+    setHealthData(null);
+    setPackages([]);
+    setScanProgress(null);
+    setIsScanning(false);
+  };
+
+  const handleFolderPathChange = (path: string) => {
+    if (path !== folderPath) {
+      resetProjectScanState();
+    }
+    setFolderPath(path);
+  };
+
   const handleBrowse = async () => {
     try {
       const result = await browseProject();
       if (result && result.path) {
-        setFolderPath(result.path);
+        handleFolderPathChange(result.path);
         addLog(`Selected directory: ${result.path}`, "info");
       }
     } catch (e: any) {
@@ -150,7 +164,7 @@ function App() {
         >
           <DashboardView
             folderPath={folderPath}
-            setFolderPath={setFolderPath}
+            setFolderPath={handleFolderPathChange}
             isScanning={isScanning}
             scanProgress={scanProgress}
             healthData={healthData}

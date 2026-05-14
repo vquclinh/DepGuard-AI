@@ -61,14 +61,24 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
 
   const visiblePackages = packages.slice(0, 12);
 
-  const loadFiles = async () => {
+  const resetWorkspaceState = () => {
+    setFiles([]);
+    setFileQuery("");
+    setSelectedFile("");
+    setFileContent("");
+    setChangedFiles([]);
+    setActiveChangedFile("");
+    setExpandedFolders(new Set([""]));
+  };
+
+  const loadFiles = async (selectFirstFile = false) => {
     if (!folderPath) return;
 
     setIsLoadingFiles(true);
     try {
       const data = await getProjectFiles(folderPath);
       setFiles(data.files);
-      if (!selectedFile && data.files.length > 0) {
+      if ((selectFirstFile || !selectedFile) && data.files.length > 0) {
         setSelectedFile(data.files[0].path);
       }
     } catch (error) {
@@ -95,7 +105,8 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
   };
 
   useEffect(() => {
-    void loadFiles();
+    resetWorkspaceState();
+    void loadFiles(true);
   }, [folderPath]);
 
   useEffect(() => {
@@ -205,7 +216,12 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
             </div>
           </div>
           <div className="min-h-0 flex-1 overflow-auto px-2 py-2">
-            {explorerTree.children.length === 0 ? (
+            {isLoadingFiles && files.length === 0 ? (
+              <div className="flex items-center gap-2 rounded-lg border border-dashed p-3 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Loading project files...
+              </div>
+            ) : explorerTree.children.length === 0 ? (
               <div className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground">No files found.</div>
             ) : (
               explorerTree.children.map((node) => (
@@ -247,7 +263,12 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
             </button>
           </div>
 
-          {isLoadingContent ? (
+          {isLoadingFiles && !selectedFile ? (
+            <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Loading project workspace
+            </div>
+          ) : isLoadingContent ? (
             <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto text-sm text-muted-foreground">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               Loading file
