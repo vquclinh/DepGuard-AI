@@ -69,6 +69,55 @@ class ImpactGraphRequest(BaseModel):
     folder_path: str
     force_rebuild: bool = False
 
+class FileContentRequest(BaseModel):
+    folder_path: str
+    file_path: str
+
+FILE_EXPLORER_IGNORE_DIRS = {
+    "venv", ".venv", "env", "node_modules", "__pycache__",
+    ".git", "dist", "build", ".pytest_cache", ".depguard_cache",
+}
+
+FILE_EXPLORER_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".toml", ".yaml", ".yml",
+    ".md", ".txt", ".css", ".html", ".lock", ".svg",
+}
+
+def _safe_project_path(folder_path: Path, file_path: str) -> Path:
+    root = folder_path.resolve()
+    candidate = Path(file_path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="File path is outside the project")
+    return resolved
+
+def _read_text_if_exists(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+def _capture_files(folder_path: Path, file_paths: list[str]) -> dict[str, str]:
+    captured = {}
+    for file_path in file_paths:
+        try:
+            resolved = _safe_project_path(folder_path, file_path)
+        except HTTPException:
+            continue
+        if resolved.exists() and resolved.is_file():
+            try:
+                relative = resolved.relative_to(folder_path.resolve()).as_posix()
+            except ValueError:
+                relative = str(resolved)
+            captured[relative] = _read_text_if_exists(resolved)
+    return captured
+
 # ------------------------------ Health Check Endpoint ---------------------------------
 @app.get("/health")
 async def health_check():
@@ -135,6 +184,57 @@ def get_impact_graph(req: ImpactGraphRequest):
     except Exception as e:
         logger.error(f"Error building impact graph: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to build impact graph: {e}")
+
+# ------------------------------ IDE File Explorer --------------------------------------
+@app.get("/files")
+def list_project_files(folder_path: str):
+    folder_path_obj = Path(folder_path)
+    if not folder_path_obj.exists() or not folder_path_obj.is_dir():
+        raise HTTPException(status_code=400, detail="Folder path does not exist or is not a directory")
+
+    root = folder_path_obj.resolve()
+    files = []
+    try:
+        for current_root, dirs, filenames in os.walk(root):
+            dirs[:] = [name for name in dirs if name not in FILE_EXPLORER_IGNORE_DIRS]
+            for filename in filenames:
+                path = Path(current_root) / filename
+                if path.suffix and path.suffix.lower() not in FILE_EXPLORER_EXTENSIONS:
+                    continue
+                if path.stat().st_size > 2_000_000:
+                    continue
+                relative = path.relative_to(root).as_posix()
+                files.append({
+                    "path": relative,
+                    "name": filename,
+                    "extension": path.suffix.lower(),
+                    "size": path.stat().st_size,
+                })
+        return {"files": sorted(files, key=lambda item: item["path"])}
+    except Exception as e:
+        logger.error(f"Error listing files: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list files: {e}")
+
+@app.post("/file-content")
+def get_file_content(req: FileContentRequest):
+    folder_path = Path(req.folder_path)
+    if not folder_path.exists() or not folder_path.is_dir():
+        raise HTTPException(status_code=400, detail="Folder path does not exist or is not a directory")
+
+    path = _safe_project_path(folder_path, req.file_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    try:
+        relative = path.relative_to(folder_path.resolve()).as_posix()
+        return {
+            "path": relative,
+            "content": _read_text_if_exists(path),
+            "size": path.stat().st_size,
+        }
+    except Exception as e:
+        logger.error(f"Error reading file content: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to read file: {e}")
 
 # ------------------------------ Browse Directory --------------------------------------
 def _open_native_dialog():
@@ -276,6 +376,7 @@ def update_package(req: UpdateRequest):
         
         pkg = req.package_info
         is_unknown = pkg.current_version == "unknown"
+        changed_file_candidates = {pkg.file_path}
         
         if not breaking_changes:
             # Just update version in dep file directly
@@ -283,6 +384,7 @@ def update_package(req: UpdateRequest):
             package = pkg.name
             from_v = pkg.current_version
             to_v = pkg.latest_version
+            before_files = _capture_files(folder_path, [dep_file])
             
             # Simple version update implementation
             try:
@@ -298,6 +400,13 @@ def update_package(req: UpdateRequest):
 
                 with open(dep_file, "w", encoding="utf-8") as f:
                     f.write(new_content)
+
+                after_files = _capture_files(folder_path, [dep_file])
+                changed_files = [
+                    {"file": file_path, "before": before, "after": after_files.get(file_path, ""), "status": "modified"}
+                    for file_path, before in before_files.items()
+                    if before != after_files.get(file_path, "")
+                ]
                 
                 return {
                     "package": package,
@@ -309,6 +418,7 @@ def update_package(req: UpdateRequest):
                     "checkpoint_id": "",
                     "llm_provider": scout_output.get("llm_provider", "none"),
                     "fallback_used": False,
+                    "changed_files": changed_files,
                     "latency_ms": int((time.time() - start_time) * 1000)
                 }
             except Exception as e:
@@ -317,10 +427,26 @@ def update_package(req: UpdateRequest):
 
         # If breaking changes exist, run full ASTScanner for lines/cols
         ast_output = ast_scanner.scan(str(folder_path), breaking_changes)
+        changed_file_candidates.update(ast_output.get("matches_by_file", {}).keys())
+        before_files = _capture_files(folder_path, list(changed_file_candidates))
         
         # Run patch agent
         patch_agent = PatchAgent()
         patch_report = patch_agent.run_sync(scout_output, ast_output, req.package_info.file_path)
+        patched_files = [item.get("file", "") for item in patch_report.get("files_patched", []) if item.get("file")]
+        changed_file_candidates.update(patched_files)
+        after_files = _capture_files(folder_path, list(changed_file_candidates))
+        changed_files = []
+        for file_path in sorted(set(before_files) | set(after_files)):
+            before = before_files.get(file_path, "")
+            after = after_files.get(file_path, "")
+            if before != after:
+                changed_files.append({
+                    "file": file_path,
+                    "before": before,
+                    "after": after,
+                    "status": "modified",
+                })
         
         return {
             "package": patch_report.get("package"),
@@ -332,6 +458,7 @@ def update_package(req: UpdateRequest):
             "checkpoint_id": patch_report.get("checkpoint_id", ""),
             "llm_provider": patch_report.get("llm_provider", "none"),
             "fallback_used": patch_report.get("fallback_used", False),
+            "changed_files": changed_files,
             "latency_ms": int((time.time() - start_time) * 1000)
         }
         

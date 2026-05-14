@@ -43,7 +43,25 @@ export function scanProjectStream(folderPath: string, onMessage: (msg: any) => v
   };
 }
 
-export async function updatePackage(folderPath: string, packageInfo: object) {
+export interface ChangedFile {
+  file: string;
+  before: string;
+  after: string;
+  status: string;
+}
+
+export interface UpdatePackageResponse {
+  package: string;
+  status: string;
+  files_patched?: { file: string; lines_changed?: number[]; status: string; error?: string }[];
+  changed_files?: ChangedFile[];
+  checkpoint_id?: string;
+  llm_provider?: string;
+  fallback_used?: boolean;
+  latency_ms?: number;
+}
+
+export async function updatePackage(folderPath: string, packageInfo: object): Promise<UpdatePackageResponse> {
   const response = await fetch('/api/update', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -83,6 +101,35 @@ export async function browseProject() {
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to open folder browser');
+  }
+  return response.json();
+}
+
+export interface ProjectFile {
+  path: string;
+  name: string;
+  extension: string;
+  size: number;
+}
+
+export async function getProjectFiles(folderPath: string): Promise<{ files: ProjectFile[] }> {
+  const response = await fetch(`/api/files?folder_path=${encodeURIComponent(folderPath)}`);
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to list project files');
+  }
+  return response.json();
+}
+
+export async function getFileContent(folderPath: string, filePath: string): Promise<{ path: string; content: string; size: number }> {
+  const response = await fetch('/api/file-content', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder_path: folderPath, file_path: filePath })
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to read file');
   }
   return response.json();
 }

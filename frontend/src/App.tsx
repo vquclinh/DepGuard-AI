@@ -1,28 +1,22 @@
 import { useState, useEffect } from "react";
-import { FolderSearch, ShieldCheck, Activity } from "lucide-react";
+import { ShieldCheck, Activity } from "lucide-react";
 import { scanProjectStream, getProviders, browseProject } from "@/hooks/useDepGuard";
-import { HealthScore } from "@/components/HealthScore";
-import { PackagesTable } from "@/components/PackagesTable";
 import type { PackageData } from "@/components/PackagesTable";
-import { UpdateLog } from "@/components/UpdateLog";
 import type { LogEntry } from "@/components/UpdateLog";
-import { ProjectDependencyGraph } from "@/components/ProjectDependencyGraph";
+import { DashboardView, type HealthData, type ScanProgress } from "@/components/DashboardView";
+import { IdeWorkspaceView } from "@/components/IdeWorkspaceView";
+import { cn } from "@/lib/utils";
+
+type ViewMode = "dashboard" | "ide";
 
 function App() {
+  const [viewMode, setViewMode] = useState<ViewMode>("dashboard");
   const [folderPath, setFolderPath] = useState("/mnt/vquclinh/PROJECT-CMAKE/DEPGUARD-AI/DepGuard-AI");
   const [isScanning, setIsScanning] = useState(false);
   const [providerStatuses, setProviderStatuses] = useState<any[]>([]);
-  const [scanProgress, setScanProgress] = useState<{
-    phase: string;
-    message?: string;
-    package?: string;
-    total_packages?: number;
-  } | null>(null);
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   
-  const [healthData, setHealthData] = useState<{
-    score: number;
-    stats: { critical: number; high: number; medium: number; low: number; unpinned: number; ok: number };
-  } | null>(null);
+  const [healthData, setHealthData] = useState<HealthData | null>(null);
   
   const [packages, setPackages] = useState<PackageData[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -101,7 +95,6 @@ function App() {
 
   return (
     <div className="min-h-screen bg-[#0f0f0f] text-foreground font-sans flex flex-col">
-      {/* Header */}
       <header className="border-b bg-card shadow-sm sticky top-0 z-10">
         <div className="container mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -134,109 +127,48 @@ function App() {
         </div>
       </header>
 
-      {/* Main Content */}
-      <main className="flex-1 container mx-auto px-6 py-8 flex flex-col gap-8 max-w-7xl">
-        
-        {/* Scanner Input */}
-        <section className="bg-card border border-border/60 rounded-2xl p-6 shadow-sm relative overflow-hidden">
-          <div className="flex flex-col md:flex-row gap-4 items-end relative z-10">
-            <div className="flex-1 space-y-2 w-full">
-              <label className="text-sm font-semibold ml-1 text-muted-foreground uppercase tracking-wider">Target Project Directory</label>
-              <div className="flex gap-2">
-                <div className="relative flex-1">
-                  <FolderSearch className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
-                  <input
-                    type="text"
-                    value={folderPath}
-                    onChange={(e) => setFolderPath(e.target.value)}
-                    placeholder="e.g. /path/to/your/project"
-                    className="w-full bg-background border border-border/60 rounded-lg pl-10 pr-4 py-3 text-sm focus:ring-2 focus:ring-primary focus:border-primary focus:outline-none transition-all"
-                    onKeyDown={(e) => e.key === 'Enter' && handleScan()}
-                    disabled={isScanning}
-                  />
-                </div>
-                <button
-                  onClick={handleBrowse}
-                  disabled={isScanning}
-                  className="bg-secondary text-secondary-foreground hover:bg-secondary/80 border border-border/60 px-4 py-3 rounded-lg font-semibold transition-all h-[46px] flex items-center justify-center shrink-0 disabled:opacity-50"
-                >
-                  Browse
-                </button>
-              </div>
-            </div>
-            <button
-              onClick={handleScan}
-              disabled={isScanning || !folderPath}
-              className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed px-8 py-3 rounded-lg font-semibold transition-all h-[46px] flex items-center justify-center shrink-0 shadow-sm"
-            >
-              {isScanning ? (
-                <span className="flex items-center gap-2">
-                  <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-                  Scanning...
-                </span>
-              ) : (
-                "Scan Project"
-              )}
-            </button>
-          </div>
-
-          {/* Progress Overlay */}
-          {isScanning && scanProgress && (
-            <div className="mt-6 pt-6 border-t border-border/50 animate-in fade-in slide-in-from-top-2 duration-300">
-              <div className="flex items-center justify-between mb-2">
-                <div className="flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-primary animate-pulse" />
-                  <span className="text-sm font-semibold">{scanProgress.phase}</span>
-                </div>
-                {scanProgress.total_packages && (
-                  <span className="text-xs text-muted-foreground font-mono">
-                    Total Packages: {scanProgress.total_packages}
-                  </span>
-                )}
-              </div>
-              {scanProgress.message && (
-                <p className="text-sm text-muted-foreground truncate font-mono bg-muted/30 px-3 py-1.5 rounded border border-border/40">
-                  {scanProgress.message}
-                </p>
-              )}
-              {scanProgress.package && (
-                <p className="text-sm text-muted-foreground truncate font-mono bg-muted/30 px-3 py-1.5 rounded border border-border/40">
-                  Analyzing: <span className="text-foreground">{scanProgress.package}</span>
-                </p>
-              )}
-            </div>
+      <div className="relative flex-1 overflow-x-hidden">
+        <div
+          className={cn(
+            "transition-all duration-300 ease-out",
+            viewMode === "dashboard"
+              ? "relative translate-x-0 opacity-100"
+              : "pointer-events-none absolute inset-x-0 top-0 -translate-x-4 opacity-0"
           )}
-        </section>
-
-        <ProjectDependencyGraph folderPath={folderPath} />
-
-        {/* Results Area */}
-        <div className="flex flex-col lg:flex-row gap-8 items-start">
-          
-          <div className="w-full lg:w-1/3 flex flex-col gap-8 shrink-0">
-            {healthData && (
-              <section className="animate-in fade-in slide-in-from-bottom-4 duration-500">
-                <HealthScore score={healthData.score} stats={healthData.stats} />
-              </section>
-            )}
-            
-            <section className="sticky top-24 w-full">
-              <h3 className="text-sm font-semibold mb-3 ml-1 text-muted-foreground uppercase tracking-wider">Activity Log</h3>
-              <UpdateLog logs={logs} />
-            </section>
-          </div>
-
-          <div className="w-full lg:w-2/3 flex flex-col gap-8">
-            {packages.length > 0 && (
-              <section className="animate-in fade-in slide-in-from-bottom-6 duration-700">
-                <h3 className="text-sm font-semibold mb-3 ml-1 text-muted-foreground uppercase tracking-wider">Dependencies ({packages.length})</h3>
-                <PackagesTable folderPath={folderPath} packages={packages} onLog={addLog} />
-              </section>
-            )}
-          </div>
-          
+          aria-hidden={viewMode !== "dashboard"}
+        >
+          <DashboardView
+            folderPath={folderPath}
+            setFolderPath={setFolderPath}
+            isScanning={isScanning}
+            scanProgress={scanProgress}
+            healthData={healthData}
+            packages={packages}
+            logs={logs}
+            onBrowse={handleBrowse}
+            onScan={handleScan}
+            onLog={addLog}
+            onOpenIde={() => setViewMode("ide")}
+          />
         </div>
-      </main>
+
+        <div
+          className={cn(
+            "transition-all duration-300 ease-out",
+            viewMode === "ide"
+              ? "relative translate-x-0 opacity-100"
+              : "pointer-events-none absolute inset-x-0 top-0 translate-x-4 opacity-0"
+          )}
+          aria-hidden={viewMode !== "ide"}
+        >
+          <IdeWorkspaceView
+            folderPath={folderPath}
+            packages={packages}
+            onLog={addLog}
+            onBack={() => setViewMode("dashboard")}
+          />
+        </div>
+      </div>
     </div>
   );
 }
