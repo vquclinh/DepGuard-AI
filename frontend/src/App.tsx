@@ -6,6 +6,7 @@ import { PackagesTable } from "@/components/PackagesTable";
 import type { PackageData } from "@/components/PackagesTable";
 import { UpdateLog } from "@/components/UpdateLog";
 import type { LogEntry } from "@/components/UpdateLog";
+import { ProjectDependencyGraph } from "@/components/ProjectDependencyGraph";
 
 function App() {
   const [folderPath, setFolderPath] = useState("/mnt/vquclinh/PROJECT-CMAKE/DEPGUARD-AI/DepGuard-AI");
@@ -134,7 +135,7 @@ function App() {
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 container mx-auto px-6 py-8 flex flex-col gap-8 max-w-6xl">
+      <main className="flex-1 container mx-auto px-6 py-8 flex flex-col gap-8 max-w-7xl">
         
         {/* Scanner Input */}
         <section className="bg-card border border-border/60 rounded-2xl p-6 shadow-sm relative overflow-hidden">
@@ -206,6 +207,8 @@ function App() {
             </div>
           )}
         </section>
+
+        <ProjectDependencyGraph folderPath={folderPath} />
 
         {/* Results Area */}
         <div className="flex flex-col lg:flex-row gap-8 items-start">

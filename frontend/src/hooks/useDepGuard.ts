@@ -86,3 +86,48 @@ export async function browseProject() {
   }
   return response.json();
 }
+
+export interface ProjectGraphNode {
+  id: string;
+  label: string;
+  file: string;
+  type: "function" | "method" | "class" | "module_level" | "decorator";
+  parent: string | null;
+  startLine: number;
+  endLine: number;
+  source: string;
+  calls: string[];
+  referencesSymbols: string[];
+  definesSymbols: string[];
+  callReturnUsage: Record<string, string[]>;
+}
+
+export interface ProjectGraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  type: string;
+}
+
+export interface ProjectGraphResponse {
+  nodes: ProjectGraphNode[];
+  edges: ProjectGraphEdge[];
+  stats: {
+    nodes: number;
+    edges: number;
+    files: number;
+  };
+}
+
+export async function getImpactGraph(folderPath: string, forceRebuild = false): Promise<ProjectGraphResponse> {
+  const response = await fetch('/api/impact-graph', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder_path: folderPath, force_rebuild: forceRebuild })
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to fetch impact graph');
+  }
+  return response.json();
+}

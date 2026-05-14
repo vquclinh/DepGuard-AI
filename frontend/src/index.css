@@ -223,3 +223,28 @@
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
 }
+
+.depguard-flow .react-flow__controls {
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 0.5rem;
+  box-shadow: none;
+}
+
+.depguard-flow .react-flow__controls-button {
+  border-bottom: 1px solid hsl(var(--border));
+  background: hsl(var(--card));
+  color: hsl(var(--foreground));
+  fill: hsl(var(--foreground));
+}
+
+.depguard-flow .react-flow__controls-button:hover {
+  background: hsl(var(--muted));
+}
+
+.depguard-flow .react-flow__minimap {
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 0.5rem;
+  background: hsl(var(--card));
+}

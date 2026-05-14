@@ -21,6 +21,7 @@ try:
     from agents.scout import ScoutAgent
     from agents.patch import PatchAgent
     from tools.ast_scanner import ASTScanner
+    from tools.impact_graph import ImpactGraphBuilder
     from tools.llm_router import LLMRouter
 except ImportError as e:
     print(f"Warning: Could not import agents. Ensure you are running from the project root. ({e})")
@@ -64,6 +65,10 @@ class RollbackRequest(BaseModel):
     checkpoint_id: str
     folder_path: str
 
+class ImpactGraphRequest(BaseModel):
+    folder_path: str
+    force_rebuild: bool = False
+
 # ------------------------------ Health Check Endpoint ---------------------------------
 @app.get("/health")
 async def health_check():
@@ -76,6 +81,60 @@ def get_providers():
     status = router.get_providers_status()
     active_provider = next((p["name"] for p in status if p["status"] == "available"), "none")
     return {"providers": status, "active_provider": active_provider}
+
+# ------------------------------ Project Impact Graph ----------------------------------
+@app.post("/impact-graph")
+def get_impact_graph(req: ImpactGraphRequest):
+    folder_path = Path(req.folder_path)
+    if not folder_path.exists() or not folder_path.is_dir():
+        raise HTTPException(status_code=400, detail="Folder path does not exist or is not a directory")
+
+    try:
+        builder = ImpactGraphBuilder(str(folder_path))
+        graph = builder.build(force_rebuild=req.force_rebuild)
+
+        nodes = []
+        edges = []
+        for node_id, node in graph.nodes.items():
+            location = node.location
+            node_type = location.context_type
+            nodes.append({
+                "id": node_id,
+                "label": location.name or "module level",
+                "file": location.file,
+                "type": node_type,
+                "parent": location.parent,
+                "startLine": location.start_line,
+                "endLine": location.end_line,
+                "source": location.source,
+                "calls": node.calls,
+                "referencesSymbols": node.references_symbols,
+                "definesSymbols": node.defines_symbols,
+                "callReturnUsage": node.call_return_usage,
+            })
+
+        for caller_id, callees in graph.calls.items():
+            for callee_id in callees:
+                if caller_id in graph.nodes and callee_id in graph.nodes:
+                    edges.append({
+                        "id": f"{caller_id}-->{callee_id}",
+                        "source": caller_id,
+                        "target": callee_id,
+                        "type": "calls",
+                    })
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "stats": {
+                "nodes": len(nodes),
+                "edges": len(edges),
+                "files": len({node["file"] for node in nodes}),
+            },
+        }
+    except Exception as e:
+        logger.error(f"Error building impact graph: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to build impact graph: {e}")
 
 # ------------------------------ Browse Directory --------------------------------------
 def _open_native_dialog():
