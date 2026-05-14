@@ -94,8 +94,13 @@ function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#0f0f0f] text-foreground font-sans flex flex-col">
-      <header className="border-b bg-card shadow-sm sticky top-0 z-10">
+    <div
+      className={cn(
+        "bg-[#0f0f0f] text-foreground font-sans flex flex-col",
+        viewMode === "ide" ? "h-screen overflow-hidden" : "min-h-screen"
+      )}
+    >
+      <header className="border-b bg-card shadow-sm sticky top-0 z-10 shrink-0">
         <div className="container mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="bg-primary text-primary-foreground p-2 rounded-lg">
@@ -127,13 +132,19 @@ function App() {
         </div>
       </header>
 
-      <div className="relative flex-1 overflow-x-hidden">
+      <div
+        className={cn(
+          "relative flex-1 min-h-0",
+          viewMode === "ide" ? "overflow-hidden" : "overflow-x-hidden"
+        )}
+      >
         <div
           className={cn(
             "transition-all duration-300 ease-out",
             viewMode === "dashboard"
               ? "relative translate-x-0 opacity-100"
-              : "pointer-events-none absolute inset-x-0 top-0 -translate-x-4 opacity-0"
+              : "pointer-events-none absolute inset-x-0 top-0 -translate-x-4 opacity-0",
+            viewMode === "dashboard" ? "" : "h-full"
           )}
           aria-hidden={viewMode !== "dashboard"}
         >
@@ -156,8 +167,8 @@ function App() {
           className={cn(
             "transition-all duration-300 ease-out",
             viewMode === "ide"
-              ? "relative translate-x-0 opacity-100"
-              : "pointer-events-none absolute inset-x-0 top-0 translate-x-4 opacity-0"
+              ? "relative h-full translate-x-0 opacity-100"
+              : "pointer-events-none absolute inset-x-0 top-0 h-full translate-x-4 opacity-0"
           )}
           aria-hidden={viewMode !== "ide"}
         >

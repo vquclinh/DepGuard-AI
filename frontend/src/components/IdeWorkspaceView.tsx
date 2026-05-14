@@ -166,24 +166,23 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
   };
 
   return (
-    <main className="flex min-h-[calc(100vh-73px)] flex-col bg-background">
-      <div className="flex items-center justify-between border-b bg-card px-5 py-3">
+    <main className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
+      <div className="flex h-11 shrink-0 items-center justify-between border-b bg-card px-3">
         <button
           onClick={onBack}
-          className="inline-flex h-10 items-center gap-2 rounded-lg border bg-background px-3 text-sm font-semibold transition hover:bg-muted"
+          className="inline-flex h-8 items-center gap-2 rounded-md border bg-background px-2.5 text-xs font-semibold transition hover:bg-muted"
         >
           <ArrowLeft className="h-4 w-4" />
           Back to Dashboard
         </button>
         <div className="hidden min-w-0 text-right md:block">
-          <p className="truncate text-sm font-medium">{folderPath}</p>
-          <p className="text-xs text-muted-foreground">IDE Workspace</p>
+          <p className="max-w-[520px] truncate text-xs font-medium">{folderPath}</p>
         </div>
       </div>
 
-      <div className="grid min-h-0 flex-1 lg:grid-cols-[20%_55%_25%]">
-        <aside className="min-h-[260px] min-w-0 border-b bg-card/70 lg:border-b-0 lg:border-r">
-          <div className="flex items-center gap-2 border-b px-4 py-3">
+      <div className="grid min-h-0 flex-1 overflow-hidden lg:grid-cols-[20%_55%_25%]">
+        <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-card/70 lg:border-b-0 lg:border-r">
+          <div className="flex h-10 shrink-0 items-center gap-2 border-b px-3">
             <FolderTree className="h-4 w-4" />
             <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Explorer</h2>
             <button
@@ -194,18 +193,18 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
               {isLoadingFiles ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             </button>
           </div>
-          <div className="border-b p-3">
+          <div className="shrink-0 border-b p-2">
             <div className="relative">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
               <input
                 value={fileQuery}
                 onChange={(event) => setFileQuery(event.target.value)}
                 placeholder="Search files"
-                className="h-9 w-full rounded-md border bg-background pl-8 pr-2 text-sm outline-none transition focus:border-primary"
+                className="h-8 w-full rounded-md border bg-background pl-8 pr-2 text-sm outline-none transition focus:border-primary"
               />
             </div>
           </div>
-          <div className="max-h-[calc(100vh-220px)] overflow-y-auto px-2 py-3">
+          <div className="min-h-0 flex-1 overflow-auto px-2 py-2">
             {explorerTree.children.length === 0 ? (
               <div className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground">No files found.</div>
             ) : (
@@ -227,12 +226,12 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
           </div>
         </aside>
 
-        <section className="relative flex min-h-[480px] min-w-0 flex-col border-b bg-[#101010] lg:border-b-0 lg:border-r">
-          <div className="flex items-center justify-between border-b bg-card px-4 py-3">
+        <section className="relative flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-[#101010] lg:border-b-0 lg:border-r">
+          <div className="flex h-10 shrink-0 items-center justify-between border-b bg-card px-3">
             <div className="flex min-w-0 items-center gap-2">
               <GitCompareArrows className="h-4 w-4 shrink-0" />
               <div className="min-w-0">
-                <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                <h2 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                   {currentChangedFile ? "Diff Viewer" : "Editor"}
                 </h2>
                 <p className="truncate text-xs text-muted-foreground">{selectedFile || "Select a file"}</p>
@@ -241,7 +240,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
             <button
               onClick={() => selectedFile && loadContent(selectedFile)}
               disabled={!selectedFile || isLoadingContent}
-              className="inline-flex h-8 items-center gap-2 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-50"
+              className="inline-flex h-7 items-center gap-2 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-50"
             >
               {isLoadingContent ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
               Reload
@@ -249,7 +248,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
           </div>
 
           {isLoadingContent ? (
-            <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+            <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto text-sm text-muted-foreground">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               Loading file
             </div>
@@ -269,12 +268,12 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
           )}
         </section>
 
-        <aside className="min-h-[320px] overflow-y-auto bg-card/70">
-          <div className="flex items-center gap-2 border-b px-4 py-3">
+        <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-card/70">
+          <div className="flex h-10 shrink-0 items-center gap-2 border-b px-3">
             <PackageOpen className="h-4 w-4" />
             <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Dependencies</h2>
           </div>
-          <div className="space-y-3 p-3">
+          <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
             {visiblePackages.length === 0 ? (
               <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
                 Run a scan from the dashboard to populate dependency actions.
@@ -312,7 +311,7 @@ function CodeViewer({ content }: { content: string }) {
   const lines = content ? content.split("\n") : ["Select a file from the explorer."];
 
   return (
-    <pre className="flex-1 overflow-auto p-4 font-mono text-xs leading-6 text-zinc-300">
+    <pre className="min-h-0 flex-1 overflow-auto p-4 font-mono text-xs leading-6 text-zinc-300">
       {lines.map((line, index) => (
         <div key={`${index}-${line}`} className="flex min-w-max">
           <span className="mr-4 w-10 select-none text-right text-zinc-600">{index + 1}</span>
@@ -394,7 +393,7 @@ function DiffViewer({ before, after }: { before: string; after: string }) {
   const diff = useMemo(() => buildLineDiff(before, after), [after, before]);
 
   return (
-    <pre className="flex-1 overflow-auto p-4 font-mono text-xs leading-6 text-zinc-300">
+    <pre className="min-h-0 flex-1 overflow-auto p-4 font-mono text-xs leading-6 text-zinc-300">
       {diff.map((line, index) => (
         <div
           key={`${index}-${line.type}-${line.text}`}
