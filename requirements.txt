@@ -6,3 +6,6 @@ pydantic
 httpx
 google-genai
 openai
+tree-sitter>=0.21.0
+tree-sitter-python>=0.21.0
+tree-sitter-javascript>=0.21.0

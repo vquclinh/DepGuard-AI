@@ -18,6 +18,11 @@ except ImportError:
     print("llm_router is required. Ensure you are running from the project root.")
     sys.exit(1)
 
+try:
+    from tools.impact_graph import ImpactFinder
+except ImportError:
+    ImpactFinder = None
+
 # Load environment variables
 load_dotenv()
 
@@ -27,8 +32,31 @@ logger = logging.getLogger(__name__)
 
 # -------------------------------- Patch Agent ----------------------------------
 class PatchAgent:
-    def __init__(self):
+    def __init__(self, project_root: str | None = None):
         self.router = LLMRouter()
+        self.project_root = project_root or os.getcwd()
+        self._impact_finder = None
+
+    def _get_impact_context(self, filepath: str, matches: list) -> str:
+        if ImpactFinder is None:
+            return ""
+
+        changed_lines = sorted({
+            match.get("line")
+            for match in matches
+            if isinstance(match.get("line"), int) and match.get("line") > 0
+        })
+        if not changed_lines:
+            return ""
+
+        try:
+            if self._impact_finder is None:
+                self._impact_finder = ImpactFinder(self.project_root)
+            impact = self._impact_finder.find_impact(filepath, changed_lines, max_depth=2)
+            return impact.to_llm_context()
+        except Exception as e:
+            logger.debug(f"Could not build impact context for {filepath}: {e}")
+            return ""
 
     # -------------------------- Create A Commit Before Update Code ---------------------
     def _create_checkpoint(self, package: str) -> tuple[str, bool]:
@@ -87,6 +115,7 @@ class PatchAgent:
 
         matches_str = json.dumps(matches, indent=2)
         bc_str = json.dumps(scout_context.get("breaking_changes", []), indent=2)
+        impact_context = self._get_impact_context(filepath, matches)
 
         prompt = f"""
             Package Migration Context: {scout_context.get("package")} {scout_context.get("from_version")} -> {scout_context.get("to_version")}
@@ -96,6 +125,9 @@ class PatchAgent:
             File: {filepath}
             Matches to fix:
             {matches_str}
+
+            Related Impact Context:
+            {impact_context or "No related impact context available."}
 
             Code:
             ```python
