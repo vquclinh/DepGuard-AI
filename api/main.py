@@ -78,9 +78,12 @@ FILE_EXPLORER_IGNORE_DIRS = {
     ".git", "dist", "build", ".pytest_cache", ".depguard_cache",
 }
 
-FILE_EXPLORER_EXTENSIONS = {
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".toml", ".yaml", ".yml",
-    ".md", ".txt", ".css", ".html", ".lock", ".svg",
+FILE_EXPLORER_BINARY_EXTENSIONS = {
+    ".7z", ".a", ".ai", ".avi", ".bin", ".bmp", ".class", ".dll", ".dmg",
+    ".doc", ".docx", ".dylib", ".eot", ".exe", ".gif", ".gz", ".ico",
+    ".jar", ".jpeg", ".jpg", ".mov", ".mp3", ".mp4", ".o", ".obj", ".otf",
+    ".pdf", ".png", ".pyc", ".rar", ".so", ".sqlite", ".sqlite3", ".tar",
+    ".ttf", ".webp", ".woff", ".woff2", ".xls", ".xlsx", ".zip",
 }
 
 def _safe_project_path(folder_path: Path, file_path: str) -> Path:
@@ -102,6 +105,18 @@ def _read_text_if_exists(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return ""
+
+def _is_explorer_file(path: Path) -> bool:
+    if path.suffix.lower() in FILE_EXPLORER_BINARY_EXTENSIONS:
+        return False
+    try:
+        if path.stat().st_size > 2_000_000:
+            return False
+        with open(path, "rb") as f:
+            chunk = f.read(2048)
+        return b"\x00" not in chunk
+    except OSError:
+        return False
 
 def _capture_files(folder_path: Path, file_paths: list[str]) -> dict[str, str]:
     captured = {}
@@ -199,9 +214,7 @@ def list_project_files(folder_path: str):
             dirs[:] = [name for name in dirs if name not in FILE_EXPLORER_IGNORE_DIRS]
             for filename in filenames:
                 path = Path(current_root) / filename
-                if path.suffix and path.suffix.lower() not in FILE_EXPLORER_EXTENSIONS:
-                    continue
-                if path.stat().st_size > 2_000_000:
+                if not _is_explorer_file(path):
                     continue
                 relative = path.relative_to(root).as_posix()
                 files.append({
