@@ -15,6 +15,11 @@ try:
 except ImportError:
     MultiLanguageScanner = None
 
+try:
+    from tools.lsp_client import OptionalLSPImpactProvider
+except ImportError:
+    OptionalLSPImpactProvider = None
+
 
 @dataclass
 class CodeLocation:
@@ -1061,6 +1066,11 @@ class ImpactFinder:
         builder = ImpactGraphBuilder(str(self.project_root))
         self.graph = builder.build()
         self.parser = TreeSitterParser(str(self.project_root))
+        self.lsp_provider = (
+            OptionalLSPImpactProvider(str(self.project_root), self.parser)
+            if OptionalLSPImpactProvider
+            else None
+        )
 
     def find_impact(
         self,
@@ -1104,6 +1114,8 @@ class ImpactFinder:
                 for changed_node in changed_nodes:
                     attrs.extend(self._return_attributes_used(user, changed_node))
                 self._add_impacted(impacted, user, 1, reason, sorted(set(attrs)))
+
+        self._add_lsp_impacts(file_path, changed_lines, changed_nodes, changed_ids, impacted)
 
         impacted_nodes = sorted(impacted.values(), key=lambda item: (item.depth, item.node.id))
         summary = self._summary(changed_nodes, impacted_nodes)
@@ -1182,6 +1194,63 @@ class ImpactFinder:
     def _summary(self, changed_nodes: list[GraphNode], impacted_nodes: list[ImpactedNode]) -> str:
         changed = ", ".join(node.id for node in changed_nodes) or "no matching nodes"
         return f"Changed nodes: {changed}. Impacted nodes found: {len(impacted_nodes)}."
+
+    def _add_lsp_impacts(
+        self,
+        file_path: str,
+        changed_lines: list[int],
+        changed_nodes: list[GraphNode],
+        changed_ids: set[str],
+        impacted: dict[str, ImpactedNode],
+    ) -> None:
+        if not self.lsp_provider:
+            return
+
+        for changed_node in changed_nodes:
+            declaration_line, declaration_character = self._lsp_symbol_position(changed_node, file_path)
+            extra_positions = [(line, 0) for line in changed_lines if changed_node.location.start_line <= line <= changed_node.location.end_line]
+            locations = self.lsp_provider.related_locations(
+                self._absolute_file(changed_node.location.file),
+                declaration_line,
+                declaration_character,
+                extra_positions=extra_positions,
+            )
+            for location in locations:
+                node = self.get_node_at_line(location.file, location.line)
+                if not node or node.id in changed_ids:
+                    continue
+                attrs = self._return_attributes_used(node, changed_node)
+                reason = "uses return value" if attrs else "lsp reference/call hierarchy"
+                self._add_impacted(impacted, node, 1, reason, attrs)
+
+    def _lsp_symbol_position(self, node: GraphNode, fallback_file_path: str) -> tuple[int, int]:
+        line = node.location.start_line
+        character = 0
+        name = node.location.name
+        if not name:
+            return line, character
+
+        path = Path(self._absolute_file(node.location.file))
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            try:
+                lines = Path(fallback_file_path).read_text(encoding="utf-8").splitlines()
+            except OSError:
+                return line, character
+
+        for line_number in range(node.location.start_line, min(node.location.end_line, node.location.start_line + 5) + 1):
+            if 0 < line_number <= len(lines):
+                index = lines[line_number - 1].find(name)
+                if index >= 0:
+                    return line_number, index
+        return line, character
+
+    def _absolute_file(self, file_path: str) -> str:
+        path = Path(file_path)
+        if path.is_absolute():
+            return str(path)
+        return str((self.project_root / path).resolve())
 
 
 class _PythonNodeAnalyzer(ast.NodeVisitor):

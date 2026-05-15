@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from tools.impact_graph import ImpactFinder, TreeSitterParser
+from tools.lsp_client import LSPLocation
 
 
 def write_project(root: Path) -> None:
@@ -313,3 +314,31 @@ def test_java_impact_tracks_method_return_usage(tmp_path):
 
     assert "Api.java::handle" in impacted
     assert impacted["Api.java::handle"].affected_attributes == [".json()"]
+
+
+def test_lsp_locations_are_added_as_semantic_impacts(tmp_path):
+    source = "\n".join([
+        "function changed() {",
+        "  return 1;",
+        "}",
+        "",
+        "function reviewMe() {",
+        "  console.log('semantic reference only');",
+        "}",
+        "",
+    ])
+    path = tmp_path / "app.js"
+    path.write_text(source, encoding="utf-8")
+
+    class FakeLSPProvider:
+        def related_locations(self, file_path, declaration_line, declaration_character, extra_positions=None):
+            return [LSPLocation(file=str(path), line=5, character=9)]
+
+    finder = ImpactFinder(str(tmp_path))
+    finder.lsp_provider = FakeLSPProvider()
+
+    result = finder.find_impact(str(path), [1], max_depth=1)
+    impacted = impacted_by_id(result)
+
+    assert "app.js::reviewMe" in impacted
+    assert impacted["app.js::reviewMe"].impact_reason == "lsp reference/call hierarchy"
