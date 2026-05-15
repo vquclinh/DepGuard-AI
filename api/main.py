@@ -23,6 +23,8 @@ try:
     from agents.watchdog import WatchdogAgent
     from agents.scout import ScoutAgent
     from agents.patch import PatchAgent
+    from agents.checker import ProjectChecker
+    from agents.repair import RepairAgent
     from tools.ast_scanner import ASTScanner
     from tools.impact_graph import ImpactGraphBuilder
     from tools.llm_router import LLMRouter
@@ -127,6 +129,18 @@ def _is_explorer_file(path: Path) -> bool:
         return b"\x00" not in chunk
     except OSError:
         return False
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 def _capture_files(folder_path: Path, file_paths: list[str]) -> dict[str, str]:
     captured = {}
@@ -601,11 +615,44 @@ def apply_preview(req: ApplyPreviewRequest):
                 pass
 
         PREVIEW_SESSIONS.pop(req.session_id, None)
+        verification = ProjectChecker(str(folder_path)).run()
+        repair = {
+            "status": "not_needed",
+            "attempts": [],
+            "final_verification": verification,
+        }
+        if (
+            verification.get("status") == "failed"
+            and files_accepted
+            and _env_bool("DEPGUARD_AUTO_REPAIR", True)
+        ):
+            max_attempts = max(0, _env_int("DEPGUARD_REPAIR_MAX_ATTEMPTS", 1))
+            repair_agent = RepairAgent(str(folder_path))
+            attempts = []
+            for attempt_number in range(1, max_attempts + 1):
+                repair_report = repair_agent.repair_sync(verification, files_accepted)
+                verification = ProjectChecker(str(folder_path)).run()
+                attempts.append({
+                    "attempt": attempt_number,
+                    "repair": repair_report,
+                    "verification": verification,
+                })
+                if verification.get("status") != "failed":
+                    break
+                if repair_report.get("status") not in {"success", "partial"}:
+                    break
+            repair = {
+                "status": "repaired" if verification.get("status") == "passed" else "failed",
+                "attempts": attempts,
+                "final_verification": verification,
+            }
         return {
             "status": "success",
             "files_accepted": files_accepted,
             "files_rejected": files_rejected,
             "dependency_file_updated": dependency_file_updated,
+            "verification": verification,
+            "repair": repair,
         }
     except Exception as e:
         logger.error(f"Error applying preview: {e}")
