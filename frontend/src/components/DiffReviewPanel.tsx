@@ -325,10 +325,6 @@ export function DiffReviewActivityPanel({ activity }: { activity: DiffReviewActi
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
-      <div className="flex h-10 shrink-0 items-center gap-2 border-b px-3">
-        <Activity className="h-4 w-4" />
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Progress</h2>
-      </div>
       <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
         <div className="rounded-lg border bg-background p-3">
           <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Review</p>
@@ -404,7 +400,7 @@ function FileNavigator({
   const nextFile = files[currentFileIndex + 1] ?? null;
 
   return (
-    <div className="absolute bottom-4 left-1/2 z-20 w-[min(720px,calc(100%-2rem))] -translate-x-1/2 rounded-xl border bg-card/95 p-2 shadow-2xl backdrop-blur">
+    <div className="absolute bottom-4 left-1/2 z-20 w-[min(620px,calc(100%-2rem))] -translate-x-1/2 rounded-xl border bg-card/95 p-2 shadow-2xl backdrop-blur">
       {isFileListOpen && (
         <div className="absolute bottom-full left-1/2 mb-2 max-h-64 w-[min(560px,calc(100vw-3rem))] -translate-x-1/2 overflow-auto rounded-xl border bg-card p-2 shadow-2xl">
           <div className="mb-2 px-2 text-xs font-semibold text-muted-foreground">
@@ -432,17 +428,21 @@ function FileNavigator({
           </div>
         </div>
       )}
-      <div className="flex items-center gap-2">
-        <button
-          onClick={() => onGoToFile(currentFileIndex - 1)}
-          disabled={currentFileIndex === 0}
-          title={previousFile?.relative_path ?? "No previous file"}
-          className="inline-flex h-8 min-w-0 shrink items-center gap-1 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-40"
-        >
-          <ChevronLeft className="h-4 w-4" />
-          <span className="hidden sm:inline">Prev</span>
-          {previousFile && <span className="max-w-[110px] truncate text-muted-foreground">{shortFileName(previousFile.relative_path)}</span>}
-        </button>
+      <div className="flex items-start gap-2">
+        <div className="min-w-0 shrink">
+          <button
+            onClick={() => onGoToFile(currentFileIndex - 1)}
+            disabled={currentFileIndex === 0}
+            title={previousFile?.relative_path ?? "No previous file"}
+            className="inline-flex h-8 items-center gap-1 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-40"
+          >
+            <ChevronLeft className="h-4 w-4" />
+            Prev
+          </button>
+          <div className="mt-1 max-w-[88px] truncate text-center text-[10px] text-muted-foreground">
+            {previousFile ? shortFileName(previousFile.relative_path) : "No file"}
+          </div>
+        </div>
         <button
           onClick={() => setIsFileListOpen((current) => !current)}
           className="min-w-0 flex-1 rounded-md bg-muted px-2 py-1.5 text-center text-xs font-semibold transition hover:bg-muted/80"
@@ -450,7 +450,7 @@ function FileNavigator({
         >
           <span>{files.length} file{files.length === 1 ? "" : "s"} changed</span>
           <span className="mx-2 text-muted-foreground">|</span>
-          <span className="truncate">{currentFileIndex + 1}/{files.length} {shortFileName(currentFile.relative_path)}</span>
+          <span>{currentFileIndex + 1}/{files.length}</span>
         </button>
         <button
           onClick={onAcceptFile}
@@ -466,16 +466,20 @@ function FileNavigator({
           <X className="h-4 w-4" />
           Reject
         </button>
-        <button
-          onClick={() => onGoToFile(currentFileIndex + 1)}
-          disabled={currentFileIndex === files.length - 1}
-          title={nextFile?.relative_path ?? "No next file"}
-          className="inline-flex h-8 min-w-0 shrink items-center gap-1 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-40"
-        >
-          {nextFile && <span className="max-w-[110px] truncate text-muted-foreground">{shortFileName(nextFile.relative_path)}</span>}
-          <span className="hidden sm:inline">Next</span>
-          <ChevronRight className="h-4 w-4" />
-        </button>
+        <div className="min-w-0 shrink">
+          <button
+            onClick={() => onGoToFile(currentFileIndex + 1)}
+            disabled={currentFileIndex === files.length - 1}
+            title={nextFile?.relative_path ?? "No next file"}
+            className="inline-flex h-8 items-center gap-1 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-40"
+          >
+            Next
+            <ChevronRight className="h-4 w-4" />
+          </button>
+          <div className="mt-1 max-w-[88px] truncate text-center text-[10px] text-muted-foreground">
+            {nextFile ? shortFileName(nextFile.relative_path) : "No file"}
+          </div>
+        </div>
       </div>
     </div>
   );
