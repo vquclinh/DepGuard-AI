@@ -13,6 +13,7 @@ import {
   type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { createPortal } from "react-dom";
 import { AlertCircle, Loader2, Maximize2, RefreshCw, Search, Workflow, X } from "lucide-react";
 import { getImpactGraph, type ProjectGraphNode, type ProjectGraphResponse } from "@/hooks/useDepGuard";
 import { cn } from "@/lib/utils";
@@ -124,6 +125,16 @@ export function ProjectDependencyGraph({ folderPath }: ProjectDependencyGraphPro
     }
   }, [folderPath, isOpen]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = originalOverflow;
+    };
+  }, [isOpen]);
+
   const filteredGraph = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     const visibleNodes = (graph?.nodes ?? []).filter((node) => {
@@ -225,6 +236,134 @@ export function ProjectDependencyGraph({ folderPath }: ProjectDependencyGraphPro
     setEnabledTypes((current) => ({ ...current, [type]: !current[type] }));
   };
 
+  const graphOverlay = isOpen ? (
+    <div className="fixed inset-0 z-[100] h-dvh overflow-hidden bg-background/95 backdrop-blur-md">
+      <div className="flex h-full min-h-0 flex-col overflow-hidden">
+        <div className="flex shrink-0 flex-col gap-3 border-b bg-card/85 px-4 py-3 shadow-sm lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="rounded-lg border bg-background p-2">
+              <Workflow className="h-5 w-5" />
+            </div>
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">Project Graph</h3>
+              <p className="truncate text-sm text-foreground">
+                {graph ? `${graph.stats.nodes} nodes, ${graph.stats.edges} edges, ${graph.stats.files} files` : "Ready"}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex min-w-0 flex-col gap-2 md:flex-row md:items-center">
+            <div className="relative min-w-0 md:w-[280px]">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search graph"
+                className="h-9 w-full rounded-lg border bg-background pl-9 pr-3 text-sm outline-none transition focus:border-primary"
+              />
+            </div>
+            <button
+              onClick={() => void loadGraph(true)}
+              disabled={isLoading}
+              title="Rebuild graph"
+              className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border bg-background px-3 text-sm font-semibold transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Refresh
+            </button>
+            <button
+              onClick={() => void flowInstance?.fitView({ padding: 0.18, duration: 350, maxZoom: 1.1 })}
+              disabled={!flowInstance || flowNodes.length === 0}
+              title="Fit graph to view"
+              className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border bg-background px-3 text-sm font-semibold transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <Maximize2 className="h-4 w-4" />
+              Fit
+            </button>
+            <button
+              onClick={() => setIsOpen(false)}
+              title="Close graph"
+              className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border bg-background px-3 text-sm font-semibold transition hover:bg-muted"
+            >
+              <X className="h-4 w-4" />
+              Close
+            </button>
+          </div>
+        </div>
+
+        <div className="grid min-h-0 flex-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(360px,30vw)]">
+          <div className="flex min-h-0 flex-col overflow-hidden">
+            <div className="flex shrink-0 flex-wrap items-center gap-2 border-b px-4 py-2">
+              {(Object.keys(typeLabels) as ProjectGraphNode["type"][]).map((type) => (
+                <button
+                  key={type}
+                  onClick={() => toggleType(type)}
+                  className={cn(
+                    "inline-flex h-8 items-center gap-2 rounded-md border px-2.5 text-xs font-medium transition",
+                    enabledTypes[type] ? "bg-background text-foreground" : "bg-muted/40 text-muted-foreground opacity-60"
+                  )}
+                >
+                  <span className={cn("h-2 w-2 rounded-full", nodeStyles[type].dot)} />
+                  {typeLabels[type]}
+                </button>
+              ))}
+            </div>
+
+            <div className="relative min-h-0 flex-1 overflow-hidden bg-background">
+              {error && (
+                <div className="absolute left-4 top-4 z-10 flex max-w-lg items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600">
+                  <AlertCircle className="h-4 w-4 shrink-0" />
+                  {error}
+                </div>
+              )}
+
+              {isLoading && !graph ? (
+                <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Loading graph
+                </div>
+              ) : (
+                <ReactFlow
+                  className="depguard-flow"
+                  nodes={flowNodes}
+                  edges={flowEdges}
+                  nodeTypes={nodeTypes}
+                  minZoom={0.18}
+                  maxZoom={1.8}
+                  onInit={setFlowInstance}
+                  onNodeClick={(_, node) => setSelectedNodeId(node.id)}
+                  onPaneClick={() => setSelectedNodeId(null)}
+                  proOptions={{ hideAttribution: true }}
+                >
+                  <Background gap={28} size={1} color="rgb(148 163 184 / 0.12)" />
+                  <Controls showInteractive={false} />
+                  <MiniMap
+                    pannable
+                    zoomable
+                    nodeColor={(node) => nodeStyles[(node.data as GraphNodeData).graphNode.type].minimap}
+                    maskColor="rgb(0 0 0 / 0.08)"
+                  />
+                </ReactFlow>
+              )}
+            </div>
+          </div>
+
+          <aside className="min-h-0 min-w-0 overflow-hidden border-t bg-background/70 lg:border-l lg:border-t-0">
+            <div className="h-full overflow-y-auto p-4">
+              {selectedNode ? (
+                <NodeInfoTable node={selectedNode} />
+              ) : (
+                <div className="flex h-full min-h-[240px] items-center justify-center rounded-lg border border-dashed text-sm text-muted-foreground">
+                  Select a node
+                </div>
+              )}
+            </div>
+          </aside>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   return (
     <>
       <section className="rounded-xl border bg-card p-4">
@@ -248,131 +387,7 @@ export function ProjectDependencyGraph({ folderPath }: ProjectDependencyGraphPro
         </div>
       </section>
 
-      {isOpen && (
-        <div className="fixed inset-0 z-50 bg-background/95 backdrop-blur-md">
-          <div className="flex h-full flex-col">
-            <div className="flex flex-col gap-4 border-b bg-card/85 p-4 shadow-sm lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex items-center gap-3">
-                <div className="rounded-lg border bg-background p-2">
-                  <Workflow className="h-5 w-5" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">Project Graph</h3>
-                  <p className="text-sm text-foreground">
-                    {graph ? `${graph.stats.nodes} nodes, ${graph.stats.edges} edges, ${graph.stats.files} files` : "Ready"}
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex flex-col gap-3 md:flex-row md:items-center">
-                <div className="relative min-w-0 md:w-[280px]">
-                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                  <input
-                    value={query}
-                    onChange={(event) => setQuery(event.target.value)}
-                    placeholder="Search graph"
-                    className="h-10 w-full rounded-lg border bg-background pl-9 pr-3 text-sm outline-none transition focus:border-primary"
-                  />
-                </div>
-                <button
-                  onClick={() => void loadGraph(true)}
-                  disabled={isLoading}
-                  title="Rebuild graph"
-                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border bg-background px-3 text-sm font-semibold transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {isLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                  Refresh
-                </button>
-                <button
-                  onClick={() => void flowInstance?.fitView({ padding: 0.18, duration: 350, maxZoom: 1.1 })}
-                  disabled={!flowInstance || flowNodes.length === 0}
-                  title="Fit graph to view"
-                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border bg-background px-3 text-sm font-semibold transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  <Maximize2 className="h-4 w-4" />
-                  Fit
-                </button>
-                <button
-                  onClick={() => setIsOpen(false)}
-                  title="Close graph"
-                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border bg-background px-3 text-sm font-semibold transition hover:bg-muted"
-                >
-                  <X className="h-4 w-4" />
-                  Close
-                </button>
-              </div>
-            </div>
-
-            <div className="grid min-h-0 flex-1 lg:grid-cols-[minmax(0,1fr)_minmax(420px,34vw)]">
-              <div className="flex min-h-0 flex-col">
-                <div className="flex flex-wrap items-center gap-2 border-b px-4 py-3">
-                  {(Object.keys(typeLabels) as ProjectGraphNode["type"][]).map((type) => (
-                    <button
-                      key={type}
-                      onClick={() => toggleType(type)}
-                      className={cn(
-                        "inline-flex h-8 items-center gap-2 rounded-md border px-2.5 text-xs font-medium transition",
-                        enabledTypes[type] ? "bg-background text-foreground" : "bg-muted/40 text-muted-foreground opacity-60"
-                      )}
-                    >
-                      <span className={cn("h-2 w-2 rounded-full", nodeStyles[type].dot)} />
-                      {typeLabels[type]}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="relative min-h-[520px] flex-1 bg-background">
-                  {error && (
-                    <div className="absolute left-4 top-4 z-10 flex max-w-lg items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600">
-                      <AlertCircle className="h-4 w-4 shrink-0" />
-                      {error}
-                    </div>
-                  )}
-
-                  {isLoading && !graph ? (
-                    <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Loading graph
-                    </div>
-                  ) : (
-                    <ReactFlow
-                      className="depguard-flow"
-                      nodes={flowNodes}
-                      edges={flowEdges}
-                      nodeTypes={nodeTypes}
-                      minZoom={0.18}
-                      maxZoom={1.8}
-                      onInit={setFlowInstance}
-                      onNodeClick={(_, node) => setSelectedNodeId(node.id)}
-                      onPaneClick={() => setSelectedNodeId(null)}
-                      proOptions={{ hideAttribution: true }}
-                    >
-                      <Background gap={28} size={1} color="rgb(148 163 184 / 0.12)" />
-                      <Controls showInteractive={false} />
-                      <MiniMap
-                        pannable
-                        zoomable
-                        nodeColor={(node) => nodeStyles[(node.data as GraphNodeData).graphNode.type].minimap}
-                        maskColor="rgb(0 0 0 / 0.08)"
-                      />
-                    </ReactFlow>
-                  )}
-                </div>
-              </div>
-
-              <aside className="min-w-0 overflow-y-auto border-t bg-background/70 p-4 lg:border-l lg:border-t-0">
-                {selectedNode ? (
-                  <NodeInfoTable node={selectedNode} />
-                ) : (
-                  <div className="flex h-full min-h-[240px] items-center justify-center rounded-lg border border-dashed text-sm text-muted-foreground">
-                    Select a node
-                  </div>
-                )}
-              </aside>
-            </div>
-          </div>
-        </div>
-      )}
+      {graphOverlay ? createPortal(graphOverlay, document.body) : null}
     </>
   );
 }

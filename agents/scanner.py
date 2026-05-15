@@ -13,6 +13,14 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 class ScannerAgent:
+    IGNORE_DIRS = {
+        ".git", ".hg", ".svn",
+        ".venv", "venv", "env",
+        "__pycache__", ".pytest_cache",
+        "node_modules", "target", "build", "dist",
+        ".next", ".turbo", "coverage",
+    }
+
     def __init__(self, root_dir: str):
         self.root_dir = Path(root_dir)
         self.supported_files = {
@@ -30,16 +38,22 @@ class ScannerAgent:
             logger.error(f"Invalid directory: {self.root_dir}")
             return results
 
-        for filepath in self.root_dir.rglob("*"):
-            if filepath.name in self.supported_files and filepath.is_file():
-                # Skip some common directories that we don't want to scan
-                if any(part.startswith('.') or part in ['node_modules', 'venv', 'env', '__pycache__', 'target', 'build'] for part in filepath.parts):
+        for root, dirs, files in os.walk(self.root_dir):
+            dirs[:] = [
+                dirname for dirname in dirs
+                if dirname not in self.IGNORE_DIRS and not dirname.startswith(".")
+            ]
+
+            for filename in files:
+                parser = self.supported_files.get(filename)
+                if not parser:
                     continue
 
+                filepath = Path(root) / filename
                 try:
-                    packages = self.supported_files[filepath.name](filepath)
+                    packages = parser(filepath)
                     if packages:
-                        ecosystem = self._get_ecosystem(filepath.name)
+                        ecosystem = self._get_ecosystem(filename)
                         results.append({
                             "file_path": str(filepath),
                             "ecosystem": ecosystem,

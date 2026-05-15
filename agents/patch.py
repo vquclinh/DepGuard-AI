@@ -23,6 +23,11 @@ try:
 except ImportError:
     ImpactFinder = None
 
+try:
+    from tools.ast_scanner import ASTScanner as TreeSitterScanner
+except ImportError:
+    TreeSitterScanner = None
+
 # Load environment variables
 load_dotenv()
 
@@ -36,6 +41,7 @@ class PatchAgent:
         self.router = LLMRouter()
         self.project_root = project_root or os.getcwd()
         self._impact_finder = None
+        self.syntax_scanner = TreeSitterScanner() if TreeSitterScanner else None
 
     def _get_impact_context(self, filepath: str, matches: list) -> str:
         if ImpactFinder is None:
@@ -89,13 +95,68 @@ class PatchAgent:
     # -------------------- Extract code out of markdown form by LLM -----------------------
     def _extract_code(self, response_text: str) -> str:
         # If wrapped in markdown
-        match = re.search(r'```python\n(.*?)\n```', response_text, re.DOTALL)
-        if match:
-            return match.group(1)
-        match = re.search(r'```\n(.*?)\n```', response_text, re.DOTALL)
+        match = re.search(r'```(?:[A-Za-z0-9_+\-.#]+)?\n(.*?)\n```', response_text, re.DOTALL)
         if match:
             return match.group(1)
         return response_text.strip()
+
+    def _code_fence_language(self, filepath: str) -> str:
+        extension = os.path.splitext(filepath)[1].lower()
+        return {
+            ".py": "python",
+            ".pyw": "python",
+            ".js": "javascript",
+            ".jsx": "jsx",
+            ".mjs": "javascript",
+            ".cjs": "javascript",
+            ".ts": "typescript",
+            ".tsx": "tsx",
+            ".mts": "typescript",
+            ".cts": "typescript",
+            ".rs": "rust",
+            ".go": "go",
+            ".java": "java",
+            ".kt": "kotlin",
+            ".kts": "kotlin",
+            ".c": "c",
+            ".h": "c",
+            ".cc": "cpp",
+            ".cpp": "cpp",
+            ".cxx": "cpp",
+            ".hpp": "cpp",
+            ".cs": "csharp",
+            ".php": "php",
+            ".rb": "ruby",
+            ".swift": "swift",
+            ".dart": "dart",
+            ".lua": "lua",
+            ".ex": "elixir",
+            ".exs": "elixir",
+            ".hs": "haskell",
+            ".html": "html",
+            ".htm": "html",
+            ".css": "css",
+            ".scss": "scss",
+            ".sass": "scss",
+        }.get(extension, "")
+
+    def _validate_patched_content(self, filepath: str, patched_content: str) -> str | None:
+        if self.syntax_scanner:
+            validation_error = self.syntax_scanner.validate_source(filepath, patched_content)
+            if validation_error:
+                return validation_error
+
+            language = self.syntax_scanner.detect_language(filepath)
+            if language and self.syntax_scanner.parsers.get(language):
+                return None
+
+        if filepath.endswith((".py", ".pyw")):
+            try:
+                ast.parse(patched_content, filename=filepath)
+            except SyntaxError as e:
+                return f"Syntax error in LLM output: {e}"
+
+        return None
 
     async def _generate_patched_content(self, filepath: str, matches: list, scout_context: dict, task_type: str) -> tuple[bool, str, dict, str, str]:
         try:
@@ -114,6 +175,7 @@ class PatchAgent:
         matches_str = json.dumps(matches, indent=2)
         bc_str = json.dumps(scout_context.get("breaking_changes", []), indent=2)
         impact_context = self._get_impact_context(filepath, matches)
+        code_language = self._code_fence_language(filepath)
 
         prompt = f"""
             Package Migration Context: {scout_context.get("package")} {scout_context.get("from_version")} -> {scout_context.get("to_version")}
@@ -128,7 +190,7 @@ class PatchAgent:
             {impact_context or "No related impact context available."}
 
             Code:
-            ```python
+            ```{code_language}
             {original_content}
             ```
             """
@@ -140,12 +202,10 @@ class PatchAgent:
             patched_content = self._extract_code(response_text)
             llm_info = {"provider": response.provider, "fallback_used": response.fallback_used}
 
-            # Validate syntax
-            try:
-                ast.parse(patched_content, filename=filepath)
-            except SyntaxError as e:
-                logger.error(f"Validation failed for {filepath}: {e}")
-                return False, f"Syntax error in LLM output: {e}", llm_info, original_content, patched_content
+            validation_error = self._validate_patched_content(filepath, patched_content)
+            if validation_error:
+                logger.error(f"Validation failed for {filepath}: {validation_error}")
+                return False, validation_error, llm_info, original_content, patched_content
 
             return True, "", llm_info, original_content, patched_content
         except Exception as e:

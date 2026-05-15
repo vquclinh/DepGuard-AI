@@ -162,3 +162,154 @@ def test_parser_tracks_decorators_defaults_reassignment_and_class_fields(tmp_pat
     assert view.call_return_usage["fetch"] == [".text"]
     assert "Loader.value" in view.references_symbols
     assert "Loader.value" in init.defines_symbols
+
+
+def test_generic_tree_sitter_graph_handles_javascript_callers(tmp_path):
+    source = "\n".join([
+        "function fetchData() {",
+        "  return 1;",
+        "}",
+        "",
+        "function handle() {",
+        "  return fetchData();",
+        "}",
+        "",
+    ])
+    path = tmp_path / "app.js"
+    path.write_text(source, encoding="utf-8")
+
+    finder = ImpactFinder(str(tmp_path))
+    result = finder.find_impact(str(path), [1], max_depth=1)
+    impacted = impacted_by_id(result)
+
+    assert "app.js::fetchData" in [node.id for node in result.changed_nodes]
+    assert "app.js::handle" in impacted
+    assert impacted["app.js::handle"].impact_reason == "calls changed function"
+
+
+def test_rust_graph_splits_functions_even_without_tree_sitter_grammar(tmp_path):
+    source = "\n".join([
+        "use anyhow::Result;",
+        "",
+        "pub async fn create_auth_client() -> Result<()> {",
+        "    Ok(())",
+        "}",
+        "",
+        "pub async fn authenticate() -> Result<()> {",
+        "    create_auth_client().await?;",
+        "    Ok(())",
+        "}",
+        "",
+    ])
+    path = tmp_path / "auth.rs"
+    path.write_text(source, encoding="utf-8")
+
+    parser = TreeSitterParser(str(tmp_path))
+    parser.parsers.pop("rust", None)
+    nodes = {node.id: node for node in parser.parse_file(str(path))}
+
+    assert "auth.rs::create_auth_client" in nodes
+    assert "auth.rs::authenticate" in nodes
+    assert "auth.rs::module_level::1-1" in nodes
+    assert nodes["auth.rs::create_auth_client"].location.context_type == "function"
+    assert "create_auth_client" in nodes["auth.rs::authenticate"].calls
+
+
+def test_rust_impact_tracks_return_value_usage(tmp_path):
+    source = "\n".join([
+        "pub fn fetch_data() -> Response {",
+        "    Response::new()",
+        "}",
+        "",
+        "pub fn handle() {",
+        "    let resp = fetch_data();",
+        "    resp.status_code();",
+        "    let again = resp;",
+        "    again.text;",
+        "}",
+        "",
+    ])
+    path = tmp_path / "auth.rs"
+    path.write_text(source, encoding="utf-8")
+
+    finder = ImpactFinder(str(tmp_path))
+    result = finder.find_impact(str(path), [1], max_depth=1)
+    impacted = impacted_by_id(result)
+
+    assert "auth.rs::handle" in impacted
+    assert impacted["auth.rs::handle"].impact_reason == "uses return value"
+    assert impacted["auth.rs::handle"].affected_attributes == [".status_code()", ".text"]
+
+
+def test_go_impact_tracks_selector_return_usage(tmp_path):
+    source = "\n".join([
+        "package main",
+        "",
+        "func FetchData() Response {",
+        "    return Response{}",
+        "}",
+        "",
+        "func Handle() {",
+        "    resp := FetchData()",
+        "    resp.JSON()",
+        "}",
+        "",
+    ])
+    path = tmp_path / "main.go"
+    path.write_text(source, encoding="utf-8")
+
+    finder = ImpactFinder(str(tmp_path))
+    result = finder.find_impact(str(path), [3], max_depth=1)
+    impacted = impacted_by_id(result)
+
+    assert "main.go::Handle" in impacted
+    assert impacted["main.go::Handle"].affected_attributes == [".JSON()"]
+
+
+def test_javascript_impact_tracks_arrow_function_and_member_usage(tmp_path):
+    source = "\n".join([
+        "export function fetchData() {",
+        "  return api.get();",
+        "}",
+        "",
+        "export const handle = () => {",
+        "  const data = fetchData();",
+        "  data.text;",
+        "  data.json();",
+        "}",
+        "",
+    ])
+    path = tmp_path / "app.ts"
+    path.write_text(source, encoding="utf-8")
+
+    finder = ImpactFinder(str(tmp_path))
+    result = finder.find_impact(str(path), [1], max_depth=1)
+    impacted = impacted_by_id(result)
+
+    assert "app.ts::handle" in impacted
+    assert impacted["app.ts::handle"].affected_attributes == [".json()", ".text"]
+
+
+def test_java_impact_tracks_method_return_usage(tmp_path):
+    source = "\n".join([
+        "class Api {",
+        "    Response fetchData() {",
+        "        return new Response();",
+        "    }",
+        "",
+        "    void handle() {",
+        "        Response resp = fetchData();",
+        "        resp.json();",
+        "    }",
+        "}",
+        "",
+    ])
+    path = tmp_path / "Api.java"
+    path.write_text(source, encoding="utf-8")
+
+    finder = ImpactFinder(str(tmp_path))
+    result = finder.find_impact(str(path), [2], max_depth=1)
+    impacted = impacted_by_id(result)
+
+    assert "Api.java::handle" in impacted
+    assert impacted["Api.java::handle"].affected_attributes == [".json()"]

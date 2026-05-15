@@ -2,12 +2,18 @@ import ast
 import json
 import logging
 import os
+import re
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+try:
+    from tools.ast_scanner import ASTScanner as MultiLanguageScanner
+except ImportError:
+    MultiLanguageScanner = None
 
 
 @dataclass
@@ -87,16 +93,42 @@ class ImpactResult:
 class TreeSitterParser:
     """Parse project files into graph nodes.
 
-    Python files use the standard ast module as a reliable fallback and primary
-    extractor for semantic details. When tree-sitter packages are installed, the
-    parser objects are initialized so JavaScript/TypeScript files can be parsed
-    and unsupported languages can be skipped cleanly.
+    Python keeps the standard ast extractor for richer data-flow details. All
+    other supported extensions use Tree-sitter when a grammar is installed, with
+    a conservative module-level fallback so non-Python projects still show up in
+    the graph.
     """
+
+    GENERIC_FUNCTION_TYPES = {
+        "function_definition", "function_declaration", "function_item",
+        "method_definition", "method_declaration", "function_declarator",
+        "arrow_function", "generator_function_declaration",
+        "async_function_declaration", "constructor_declaration",
+    }
+    GENERIC_CLASS_TYPES = {
+        "class_definition", "class_declaration", "struct_item",
+        "struct_declaration", "interface_declaration", "enum_declaration",
+        "impl_item", "object_declaration", "trait_item", "record_declaration",
+    }
+    GENERIC_IDENTIFIER_TYPES = {
+        "identifier", "type_identifier", "property_identifier",
+        "field_identifier", "constant", "scoped_identifier",
+        "qualified_identifier", "simple_identifier", "name",
+    }
+    GENERIC_SKIP_TYPES = {
+        "comment", "line_comment", "block_comment", "string", "string_literal",
+        "raw_string_literal", "template_string", "char_literal",
+        "character_literal",
+    }
 
     def __init__(self, project_root: str | None = None):
         self.project_root = Path(project_root).resolve() if project_root else None
         self.parsers: dict[str, Any] = {}
-        self._init_tree_sitter()
+        self.language_scanner = MultiLanguageScanner() if MultiLanguageScanner else None
+        if self.language_scanner:
+            self.parsers.update(self.language_scanner.parsers)
+        else:
+            self._init_tree_sitter()
 
     def _init_tree_sitter(self) -> None:
         try:
@@ -142,10 +174,20 @@ class TreeSitterParser:
         if language == "python":
             return self._parse_python_ast(path, source)
 
-        if language in {"javascript", "typescript"} and "javascript" in self.parsers:
-            return self._parse_javascript_tree_sitter(path, source, language)
+        if language in self.parsers:
+            return self._parse_generic_tree_sitter(path, source, language)
 
-        return []
+        return self._parse_lexical_nodes(path, source, language)
+
+    def adapter_summary(self) -> dict[str, str]:
+        return {
+            "python": "Python AST adapter with calls, classes, defaults, decorators, and return-value data flow.",
+            "rust": "Rust Tree-sitter/generic adapter plus lexical fallback for fn/struct/enum/trait/impl, calls, macros, use statements, and let-chain data flow.",
+            "go": "Go Tree-sitter/generic adapter plus lexical fallback for funcs, methods, structs/interfaces, selector calls, imports, and := data flow.",
+            "javascript": "JavaScript Tree-sitter/generic adapter plus lexical fallback for functions, classes, arrow functions, imports, member calls, and const/let data flow.",
+            "typescript": "TypeScript adapter shares JavaScript behavior and handles TS/TSX extensions.",
+            "java": "Java Tree-sitter/generic adapter plus lexical fallback for classes, methods, imports, member calls, and typed local data flow.",
+        }
 
     def get_function_source(self, file_path: str, start_line: int, end_line: int) -> str:
         try:
@@ -155,6 +197,9 @@ class TreeSitterParser:
         return "\n".join(lines[start_line - 1:end_line])
 
     def detect_language(self, file_path: str) -> str | None:
+        if self.language_scanner:
+            return self.language_scanner.detect_language(file_path)
+
         suffix = Path(file_path).suffix.lower()
         if suffix == ".py":
             return "python"
@@ -294,6 +339,547 @@ class TreeSitterParser:
             defines_symbols=sorted(analyzer.defines_symbols),
         )
 
+    def _parse_generic_tree_sitter(self, path: Path, source: str, language: str) -> list[GraphNode]:
+        parser = self.parsers.get(language)
+        if not parser:
+            return self._parse_lexical_nodes(path, source, language)
+
+        try:
+            tree = parser.parse(source.encode("utf-8"))
+        except Exception as exc:
+            logger.debug("Could not tree-sitter parse %s: %s", path, exc)
+            return self._parse_lexical_nodes(path, source, language)
+
+        file_id = self._display_path(path)
+        lines = source.splitlines()
+        nodes: list[GraphNode] = []
+        used_ids: set[str] = set()
+
+        def add_node(ts_node: Any, context_type: str, name: str, parent: str | None = None) -> None:
+            start = _point_row(ts_node.start_point) + 1
+            end = _point_row(ts_node.end_point) + 1
+            calls, references = self._generic_symbols_and_calls(ts_node, source)
+            lexical_calls, lexical_references, return_usage = self._lexical_block_analysis(
+                _source_range(lines, start, end),
+                language,
+            )
+            for call in lexical_calls:
+                if call not in calls:
+                    calls.append(call)
+            references.update(lexical_references)
+            calls = [
+                call for call in calls
+                if call not in {name, f"{parent}.{name}" if parent else name}
+            ]
+            defines = {name}
+            if parent:
+                defines.add(f"{parent}.{name}")
+
+            qualified_name = f"{parent}.{name}" if parent else name
+            node_id = self._unique_node_id(f"{file_id}::{qualified_name}", used_ids, start)
+            nodes.append(GraphNode(
+                id=node_id,
+                location=CodeLocation(
+                    file=file_id,
+                    start_line=start,
+                    end_line=end,
+                    source=_source_range(lines, start, end),
+                    context_type=context_type,
+                    name=name,
+                    parent=parent,
+                ),
+                calls=calls,
+                references_symbols=sorted(references),
+                call_return_usage=_sorted_usage(return_usage),
+                defines_symbols=sorted(defines),
+            ))
+
+        def walk(ts_node: Any, parent: str | None = None) -> None:
+            if self._is_generic_class(ts_node):
+                name = self._generic_node_name(ts_node, source)
+                if name:
+                    add_node(ts_node, "class", name)
+                    for child in getattr(ts_node, "children", []):
+                        walk(child, name)
+                    return
+
+            if self._is_generic_function(ts_node):
+                name = self._generic_node_name(ts_node, source)
+                if name:
+                    add_node(ts_node, "method" if parent else "function", name, parent)
+
+            for child in getattr(ts_node, "children", []):
+                walk(child, parent)
+
+        walk(tree.root_node)
+
+        module_children = [
+            child for child in getattr(tree.root_node, "named_children", tree.root_node.children)
+            if not self._is_generic_function(child) and not self._is_generic_class(child)
+        ]
+        if module_children:
+            start = min(_point_row(child.start_point) + 1 for child in module_children)
+            end = max(_point_row(child.end_point) + 1 for child in module_children)
+            calls: list[str] = []
+            references: set[str] = set()
+            for child in module_children:
+                child_calls, child_refs = self._generic_symbols_and_calls(child, source)
+                for call in child_calls:
+                    if call not in calls:
+                        calls.append(call)
+                references.update(child_refs)
+            lexical_calls, lexical_references, return_usage = self._lexical_block_analysis(
+                _source_range(lines, start, end),
+                language,
+            )
+            for call in lexical_calls:
+                if call not in calls:
+                    calls.append(call)
+            references.update(lexical_references)
+
+            node_id = self._unique_node_id(f"{file_id}::module_level::{start}-{end}", used_ids, start)
+            nodes.append(GraphNode(
+                id=node_id,
+                location=CodeLocation(
+                    file=file_id,
+                    start_line=start,
+                    end_line=end,
+                    source=_source_range(lines, start, end),
+                    context_type="module_level",
+                    name=None,
+                    parent=None,
+                ),
+                calls=calls,
+                references_symbols=sorted(references),
+                call_return_usage=_sorted_usage(return_usage),
+                defines_symbols=[],
+            ))
+
+        if not nodes:
+            return self._parse_lexical_nodes(path, source, language)
+
+        return nodes
+
+    def _parse_lexical_nodes(self, path: Path, source: str, language: str | None) -> list[GraphNode]:
+        file_id = self._display_path(path)
+        lines = source.splitlines()
+        if not lines:
+            return []
+
+        nodes: list[GraphNode] = []
+        used_ids: set[str] = set()
+        definitions = self._lexical_definitions(source, language)
+        covered_lines: set[int] = set()
+
+        for definition in definitions:
+            start_line, end_line, name, context_type = definition
+            node_source = _source_range(lines, start_line, end_line)
+            calls, references, return_usage = self._lexical_block_analysis(node_source, language)
+            calls = [call for call in calls if call != name]
+            node_id = self._unique_node_id(f"{file_id}::{name}", used_ids, start_line)
+            nodes.append(GraphNode(
+                id=node_id,
+                location=CodeLocation(
+                    file=file_id,
+                    start_line=start_line,
+                    end_line=end_line,
+                    source=node_source,
+                    context_type=context_type,
+                    name=name,
+                    parent=None,
+                ),
+                calls=calls,
+                references_symbols=sorted(references),
+                call_return_usage=_sorted_usage(return_usage),
+                defines_symbols=[name],
+            ))
+            covered_lines.update(range(start_line, end_line + 1))
+
+        module_lines = [
+            (line_no, line)
+            for line_no, line in enumerate(lines, start=1)
+            if line_no not in covered_lines and line.strip()
+        ]
+        if module_lines:
+            start_line = module_lines[0][0]
+            end_line = module_lines[-1][0]
+            module_source = _source_range(lines, start_line, end_line)
+            calls, references, return_usage = self._lexical_block_analysis(module_source, language)
+            nodes.append(GraphNode(
+                id=self._unique_node_id(f"{file_id}::module_level::{start_line}-{end_line}", used_ids, start_line),
+                location=CodeLocation(
+                    file=file_id,
+                    start_line=start_line,
+                    end_line=end_line,
+                    source=module_source,
+                    context_type="module_level",
+                    name=None,
+                    parent=None,
+                ),
+                calls=calls,
+                references_symbols=sorted(references),
+                call_return_usage=_sorted_usage(return_usage),
+                defines_symbols=[],
+            ))
+
+        if nodes:
+            return nodes
+
+        calls, references, return_usage = self._lexical_block_analysis(source, language)
+        return [GraphNode(
+            id=f"{file_id}::module_level::1-{len(lines)}",
+            location=CodeLocation(
+                file=file_id,
+                start_line=1,
+                end_line=len(lines),
+                source=source,
+                context_type="module_level",
+                name=None,
+                parent=None,
+            ),
+            calls=calls,
+            references_symbols=sorted(references),
+            call_return_usage=_sorted_usage(return_usage),
+            defines_symbols=[],
+        )]
+
+    def _is_generic_function(self, ts_node: Any) -> bool:
+        node_type = getattr(ts_node, "type", "")
+        return node_type in self.GENERIC_FUNCTION_TYPES or (
+            "function" in node_type and "type" not in node_type
+        )
+
+    def _is_generic_class(self, ts_node: Any) -> bool:
+        node_type = getattr(ts_node, "type", "")
+        return node_type in self.GENERIC_CLASS_TYPES or (
+            any(token in node_type for token in ("class", "struct", "interface", "enum", "trait"))
+            and "body" not in node_type
+        )
+
+    def _generic_node_name(self, ts_node: Any, source: str) -> str | None:
+        for field in ("name", "declarator", "type"):
+            child = ts_node.child_by_field_name(field)
+            if child:
+                name = self._first_identifier_text(child, source)
+                if name:
+                    return name
+        return self._first_identifier_text(ts_node, source)
+
+    def _generic_symbols_and_calls(self, ts_node: Any, source: str) -> tuple[list[str], set[str]]:
+        calls: list[str] = []
+        references: set[str] = set()
+
+        def walk(node: Any) -> None:
+            node_type = getattr(node, "type", "")
+            if node_type in self.GENERIC_SKIP_TYPES or "comment" in node_type:
+                return
+
+            if self._is_generic_call(node):
+                call_name = self._generic_call_name(node, source)
+                if call_name:
+                    if call_name not in calls:
+                        calls.append(call_name)
+                    references.add(call_name)
+                    references.add(call_name.split(".")[-1].split("::")[-1])
+
+            if node_type in self.GENERIC_IDENTIFIER_TYPES:
+                symbol = self._clean_symbol(self._node_text(node, source))
+                if symbol:
+                    references.add(symbol)
+
+            for child in getattr(node, "children", []):
+                walk(child)
+
+        walk(ts_node)
+        return calls, references
+
+    def _is_generic_call(self, ts_node: Any) -> bool:
+        node_type = getattr(ts_node, "type", "")
+        return (
+            node_type in {"call_expression", "call", "method_invocation", "macro_invocation", "invocation_expression"}
+            or "call_expression" in node_type
+            or "invocation" in node_type
+        )
+
+    def _generic_call_name(self, ts_node: Any, source: str) -> str | None:
+        target = (
+            ts_node.child_by_field_name("function")
+            or ts_node.child_by_field_name("name")
+            or ts_node.child_by_field_name("method")
+        )
+        if not target:
+            for child in getattr(ts_node, "children", []):
+                if child.type not in {"arguments", "argument_list", "parameters"}:
+                    target = child
+                    break
+        if not target:
+            return None
+
+        raw = self._node_text(target, source)
+        raw = re.sub(r"\s+", "", raw)
+        raw = raw.split("(", 1)[0]
+        raw = raw.replace("::", ".")
+        if len(raw) > 120 or not raw:
+            return self._first_identifier_text(target, source)
+        return raw
+
+    def _first_identifier_text(self, ts_node: Any, source: str) -> str | None:
+        if getattr(ts_node, "type", "") in self.GENERIC_IDENTIFIER_TYPES:
+            return self._clean_symbol(self._node_text(ts_node, source))
+        for child in getattr(ts_node, "children", []):
+            name = self._first_identifier_text(child, source)
+            if name:
+                return name
+        return None
+
+    def _clean_symbol(self, value: str) -> str | None:
+        value = value.strip()
+        if not value or len(value) > 120:
+            return None
+        if not re.search(r"[A-Za-z_$]", value):
+            return None
+        return value
+
+    def _node_text(self, ts_node: Any, source: str) -> str:
+        return source[ts_node.start_byte:ts_node.end_byte]
+
+    def _lexical_definitions(self, source: str, language: str | None) -> list[tuple[int, int, str, str]]:
+        patterns = self._lexical_definition_patterns(language)
+        if not patterns:
+            return []
+
+        definitions: list[tuple[int, int, str, str]] = []
+        seen: set[tuple[int, int, str, str]] = set()
+        scan_source = self._strip_comments_and_strings(source)
+
+        for pattern, context_type in patterns:
+            for match in re.finditer(pattern, scan_source, re.MULTILINE):
+                name = match.group("name")
+                brace_index = scan_source.find("{", match.end() - 1)
+                start_line = source.count("\n", 0, match.start()) + 1
+                if brace_index >= 0 and brace_index < match.end() + 500:
+                    end_line = self._matching_brace_end_line(scan_source, brace_index)
+                else:
+                    end_line = start_line
+
+                key = (start_line, end_line, name, context_type)
+                if key in seen:
+                    continue
+                seen.add(key)
+                definitions.append((start_line, end_line, name, context_type))
+
+        return sorted(definitions, key=lambda item: (item[0], item[1], item[2]))
+
+    def _lexical_definition_patterns(self, language: str | None) -> list[tuple[str, str]]:
+        common_function = r"^\s*(?:export\s+)?(?:async\s+)?function\s+(?P<name>[A-Za-z_$][\w$]*)\b[^{;]*\{"
+        patterns_by_language = {
+            "rust": [
+                (r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]+\"\s+)?fn\s+(?P<name>[A-Za-z_]\w*)\b[^{;]*\{", "function"),
+                (r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|impl)\s+(?P<name>[A-Za-z_]\w*)\b[^{;]*\{", "class"),
+            ],
+            "go": [
+                (r"^\s*func\s+(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_]\w*)\b[^{;]*\{", "function"),
+                (r"^\s*type\s+(?P<name>[A-Za-z_]\w*)\s+(?:struct|interface)\b[^{;]*\{", "class"),
+            ],
+            "javascript": [
+                (common_function, "function"),
+                (r"^\s*(?:export\s+)?class\s+(?P<name>[A-Za-z_$][\w$]*)\b[^{;]*\{", "class"),
+                (r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{", "function"),
+            ],
+            "typescript": [
+                (common_function, "function"),
+                (r"^\s*(?:export\s+)?class\s+(?P<name>[A-Za-z_$][\w$]*)\b[^{;]*\{", "class"),
+                (r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{", "function"),
+            ],
+            "tsx": [
+                (common_function, "function"),
+                (r"^\s*(?:export\s+)?class\s+(?P<name>[A-Za-z_$][\w$]*)\b[^{;]*\{", "class"),
+                (r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{", "function"),
+            ],
+            "java": [
+                (r"^\s*(?:public|private|protected|static|final|abstract|synchronized|\s)+[\w<>\[\], ?]+\s+(?P<name>[A-Za-z_]\w*)\s*\([^)]*\)\s*(?:throws\s+[^{]+)?\{", "function"),
+                (r"^\s*(?:public|private|protected|abstract|final|\s)*(?:class|interface|enum|record)\s+(?P<name>[A-Za-z_]\w*)\b[^{;]*\{", "class"),
+            ],
+            "c": [
+                (r"^\s*(?:static\s+|inline\s+|extern\s+)?[A-Za-z_][\w\s*]+\s+(?P<name>[A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{", "function"),
+            ],
+            "cpp": [
+                (r"^\s*(?:template\s*<[^>]+>\s*)?(?:static\s+|inline\s+|virtual\s+|constexpr\s+)?[A-Za-z_:~][\w:\s*&<>~]+\s+(?P<name>[A-Za-z_:~]\w*)\s*\([^;{}]*\)\s*(?:const\s*)?\{", "function"),
+                (r"^\s*(?:class|struct|enum)\s+(?P<name>[A-Za-z_]\w*)\b[^{;]*\{", "class"),
+            ],
+            "c_sharp": [
+                (r"^\s*(?:public|private|protected|internal|static|async|virtual|override|sealed|partial|\s)+[\w<>\[\], ?]+\s+(?P<name>[A-Za-z_]\w*)\s*\([^)]*\)\s*\{", "function"),
+                (r"^\s*(?:public|private|protected|internal|abstract|sealed|partial|\s)*(?:class|interface|enum|struct|record)\s+(?P<name>[A-Za-z_]\w*)\b[^{;]*\{", "class"),
+            ],
+        }
+        return patterns_by_language.get(language or "", [])
+
+    def _matching_brace_end_line(self, source: str, open_brace_index: int) -> int:
+        depth = 0
+        for index in range(open_brace_index, len(source)):
+            char = source[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return source.count("\n", 0, index) + 1
+        return source.count("\n") + 1
+
+    def _strip_comments_and_strings(self, source: str) -> str:
+        patterns = [
+            r"//[^\n]*",
+            r"/\*.*?\*/",
+            r"#(?!\[)[^\n]*",
+            r'"(?:\\.|[^"\\])*"',
+            r"'(?:\\.|[^'\\])*'",
+            r"`(?:\\.|[^`\\])*`",
+        ]
+
+        def blank(match: re.Match) -> str:
+            return re.sub(r"[^\n]", " ", match.group(0))
+
+        stripped = source
+        for pattern in patterns:
+            stripped = re.sub(pattern, blank, stripped, flags=re.DOTALL)
+        return stripped
+
+    def _lexical_block_analysis(
+        self,
+        source: str,
+        language: str | None,
+    ) -> tuple[list[str], set[str], dict[str, list[str]]]:
+        calls, references = self._lexical_symbols_and_calls(source)
+        scan_source = self._strip_comments_and_strings(source)
+        variable_origin: dict[str, str] = {}
+        call_return_usage: dict[str, list[str]] = defaultdict(list)
+
+        def remember_call(call_name: str | None) -> None:
+            if not call_name:
+                return
+            references.add(call_name)
+            references.add(call_name.split(".")[-1])
+            if call_name not in calls:
+                calls.append(call_name)
+
+        for variable, expression in self._lexical_assignments(scan_source, language):
+            origin = self._origin_from_lexical_expression(expression, variable_origin)
+            if origin:
+                variable_origin[variable] = origin
+                remember_call(origin)
+            elif expression.strip() in variable_origin:
+                variable_origin[variable] = variable_origin[expression.strip()]
+
+        ignored_attrs = {
+            "await", "unwrap", "expect", "ok", "err", "as_ref", "as_mut",
+            "clone", "into", "iter", "next",
+        }
+
+        for variable, origin in variable_origin.items():
+            escaped = re.escape(variable)
+
+            for match in re.finditer(rf"\b{escaped}\s*\.\s*([A-Za-z_$][\w$]*)\s*\(", scan_source):
+                attr = match.group(1)
+                suffix = f".{attr}()"
+                self._add_lexical_return_usage(call_return_usage, origin, suffix)
+                remember_call(f"{variable}.{attr}")
+
+            for match in re.finditer(rf"\b{escaped}\s*\.\s*([A-Za-z_$][\w$]*)\b", scan_source):
+                attr = match.group(1)
+                after = scan_source[match.end():match.end() + 1]
+                if after == "(" or attr in ignored_attrs:
+                    continue
+                self._add_lexical_return_usage(call_return_usage, origin, f".{attr}")
+
+            for match in re.finditer(rf"\b{escaped}\s*\[\s*([^\]]+)\s*\]", scan_source):
+                key = match.group(1).strip()
+                if len(key) <= 80:
+                    self._add_lexical_return_usage(call_return_usage, origin, f"[{key}]")
+
+        return calls, references, call_return_usage
+
+    def _lexical_assignments(self, source: str, language: str | None) -> list[tuple[str, str]]:
+        patterns = [
+            r"\b(?:let|const|var|final|val|auto|mut)\s+(?:mut\s+)?(?P<var>[A-Za-z_$][\w$]*)\s*(?::[^=;]+)?=\s*(?P<expr>[^;\n]+)",
+            r"\b(?P<var>[A-Za-z_$][\w$]*)\s*:=\s*(?P<expr>[^\n;]+)",
+            r"\b(?P<var>[A-Za-z_$][\w$]*)\s*=\s*(?P<expr>[^;\n]+)",
+        ]
+
+        if language in {"java", "c_sharp", "go", "c", "cpp"}:
+            patterns.insert(
+                0,
+                r"\b[A-Za-z_$][\w$<>\[\]., ?]*\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*(?P<expr>[^;\n]+)",
+            )
+
+        assignments: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for pattern in patterns:
+            for match in re.finditer(pattern, source):
+                variable = match.group("var")
+                expression = match.group("expr").strip()
+                if variable in {"if", "for", "while", "return", "match", "switch"}:
+                    continue
+                key = (variable, expression)
+                if key not in seen:
+                    seen.add(key)
+                    assignments.append(key)
+        return assignments
+
+    def _origin_from_lexical_expression(
+        self,
+        expression: str,
+        variable_origin: dict[str, str],
+    ) -> str | None:
+        expression = expression.strip()
+        if expression in variable_origin:
+            return variable_origin[expression]
+
+        call_matches = list(re.finditer(
+            r"\b([A-Za-z_$][\w$]*(?:(?:::|\.)[A-Za-z_$][\w$]*)*)\s*[(!]",
+            expression,
+        ))
+        if not call_matches:
+            return None
+
+        origin = call_matches[-1].group(1).replace("::", ".")
+        if origin in {"if", "for", "while", "match", "switch", "return"}:
+            return None
+        return origin
+
+    def _add_lexical_return_usage(
+        self,
+        usage: dict[str, list[str]],
+        origin: str,
+        suffix: str,
+    ) -> None:
+        keys = {origin, origin.split(".")[-1]}
+        for key in keys:
+            if suffix not in usage[key]:
+                usage[key].append(suffix)
+
+    def _lexical_symbols_and_calls(self, source: str) -> tuple[list[str], set[str]]:
+        scan_source = self._strip_comments_and_strings(source)
+        references = set(re.findall(r"\b[A-Za-z_$][\w$]*(?:::[A-Za-z_$][\w$]*|\.[A-Za-z_$][\w$]*)*\b", scan_source))
+        calls: list[str] = []
+        for match in re.finditer(r"\b([A-Za-z_$][\w$]*(?:::[A-Za-z_$][\w$]*|\.[A-Za-z_$][\w$]*)*)\s*[(!]", scan_source):
+            call = match.group(1).replace("::", ".")
+            if call in {"if", "for", "while", "match", "switch", "return", "fn", "func", "function"}:
+                continue
+            if call not in calls:
+                calls.append(call)
+        return calls, references
+
+    def _unique_node_id(self, base_id: str, used_ids: set[str], start_line: int) -> str:
+        node_id = base_id
+        if node_id in used_ids:
+            node_id = f"{base_id}@{start_line}"
+        counter = 2
+        while node_id in used_ids:
+            node_id = f"{base_id}@{start_line}-{counter}"
+            counter += 1
+        used_ids.add(node_id)
+        return node_id
+
     def _parse_javascript_tree_sitter(self, path: Path, source: str, language: str) -> list[GraphNode]:
         parser = self.parsers.get("javascript")
         if not parser:
@@ -343,9 +929,11 @@ class TreeSitterParser:
 
 
 class ImpactGraphBuilder:
+    CACHE_VERSION = 4
     IGNORE_DIRS = {
-        "venv", ".venv", "node_modules", "__pycache__",
+        "venv", ".venv", "env", "node_modules", "__pycache__",
         ".git", "dist", "build", ".pytest_cache", ".depguard_cache",
+        "target", ".next", ".turbo", "coverage",
     }
 
     def __init__(self, project_root: str):
@@ -357,8 +945,10 @@ class ImpactGraphBuilder:
     def build(self, force_rebuild: bool = False) -> ImpactGraph:
         files = self._supported_files()
         cache = self._load_cache() if not force_rebuild else {"files": {}}
+        if cache.get("version") != self.CACHE_VERSION:
+            cache = {"version": self.CACHE_VERSION, "files": {}}
         cached_files = cache.get("files", {})
-        next_cache: dict[str, Any] = {"files": {}}
+        next_cache: dict[str, Any] = {"version": self.CACHE_VERSION, "files": {}}
         all_nodes: dict[str, GraphNode] = {}
 
         for path in files:
@@ -395,7 +985,7 @@ class ImpactGraphBuilder:
         try:
             return json.loads(self.cache_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"files": {}}
+            return {"version": self.CACHE_VERSION, "files": {}}
 
     def _save_cache(self, cache: dict[str, Any]) -> None:
         try:
@@ -799,6 +1389,10 @@ def _graph_node_from_dict(data: dict[str, Any]) -> GraphNode:
 
 def _source_range(lines: list[str], start_line: int, end_line: int) -> str:
     return "\n".join(lines[start_line - 1:end_line])
+
+
+def _point_row(point: Any) -> int:
+    return getattr(point, "row", point[0])
 
 
 def _decorated_start_line(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> int:
