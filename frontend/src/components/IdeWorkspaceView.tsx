@@ -26,7 +26,11 @@ import {
   type ProjectFile,
 } from "@/hooks/useDepGuard";
 import { cn } from "@/lib/utils";
-import { DiffReviewPanel } from "@/components/DiffReviewPanel";
+import {
+  DiffReviewActivityPanel,
+  DiffReviewPanel,
+  type DiffReviewActivityState,
+} from "@/components/DiffReviewPanel";
 
 interface IdeWorkspaceViewProps {
   folderPath: string;
@@ -63,6 +67,8 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => new Set([""]));
   const [previewData, setPreviewData] = useState<PreviewResponse | null>(null);
   const [previewPackageName, setPreviewPackageName] = useState("");
+  const [reviewActivity, setReviewActivity] = useState<DiffReviewActivityState | null>(null);
+  const [rightPanelMode, setRightPanelMode] = useState<"dependencies" | "progress">("dependencies");
 
   const visiblePackages = packages.slice(0, 12);
 
@@ -141,6 +147,8 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
 
   const handleUpdate = async (pkg: PackageData) => {
     setUpdatingPackage(pkg.name);
+    setRightPanelMode("progress");
+    setReviewActivity(null);
     onLog(`Preparing IDE preview for ${pkg.name}.`, "info");
     try {
       const result = await previewUpdate(folderPath, pkg);
@@ -149,6 +157,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
       } else {
         setPreviewData(result);
         setPreviewPackageName(pkg.name);
+        setRightPanelMode("progress");
         onLog(`Preview ready for ${pkg.name}: ${result.summary.total_files_changed} file(s) changed.`, "info");
       }
       void loadFiles();
@@ -161,8 +170,17 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
 
   const handlePreviewApplied = (result: ApplyResponse) => {
     onLog(`Applied ${previewPackageName}: ${result.files_accepted.length} file(s) accepted.`, "success");
+    if (result.verification?.status === "passed") {
+      onLog(`Checker passed for ${previewPackageName}.`, "success");
+    } else if (result.repair?.status === "success") {
+      onLog(`Repair Agent fixed ${previewPackageName} after checker feedback.`, "success");
+    } else if (result.verification?.status === "failed") {
+      onLog(`Checker still reports errors for ${previewPackageName}. Review the pipeline output.`, "error");
+    }
     setPreviewData(null);
     setPreviewPackageName("");
+    setReviewActivity(null);
+    setRightPanelMode("dependencies");
     void loadFiles();
     if (selectedFile) {
       void loadContent(selectedFile);
@@ -173,6 +191,8 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
     onLog(`Discarded preview for ${previewPackageName}.`, "info");
     setPreviewData(null);
     setPreviewPackageName("");
+    setReviewActivity(null);
+    setRightPanelMode("dependencies");
   };
 
   const openChangedFile = (file: ChangedFile) => {
@@ -194,14 +214,6 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
 
   return (
     <main className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
-      {previewData && (
-        <DiffReviewPanel
-          preview={previewData}
-          onApplied={handlePreviewApplied}
-          onDiscarded={handlePreviewDiscarded}
-          onError={(message) => onLog(message, "error")}
-        />
-      )}
       <div className="flex h-11 shrink-0 items-center justify-between border-b bg-card px-3">
         <button
           onClick={onBack}
@@ -272,22 +284,35 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
               <GitCompareArrows className="h-4 w-4 shrink-0" />
               <div className="min-w-0">
                 <h2 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                  {currentChangedFile ? "Diff Viewer" : "Editor"}
+                  {previewData ? "Review Changes" : currentChangedFile ? "Diff Viewer" : "Editor"}
                 </h2>
-                <p className="truncate text-xs text-muted-foreground">{selectedFile || "Select a file"}</p>
+                <p className="truncate text-xs text-muted-foreground">
+                  {previewData ? `${previewData.package} ${previewData.from_version} -> ${previewData.to_version}` : selectedFile || "Select a file"}
+                </p>
               </div>
             </div>
-            <button
-              onClick={() => selectedFile && loadContent(selectedFile)}
-              disabled={!selectedFile || isLoadingContent}
-              className="inline-flex h-7 items-center gap-2 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-50"
-            >
-              {isLoadingContent ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-              Reload
-            </button>
+            {!previewData && (
+              <button
+                onClick={() => selectedFile && loadContent(selectedFile)}
+                disabled={!selectedFile || isLoadingContent}
+                className="inline-flex h-7 items-center gap-2 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-50"
+              >
+                {isLoadingContent ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                Reload
+              </button>
+            )}
           </div>
 
-          {isLoadingFiles && !selectedFile ? (
+          {previewData ? (
+            <DiffReviewPanel
+              preview={previewData}
+              layout="embedded"
+              onActivityChange={setReviewActivity}
+              onApplied={handlePreviewApplied}
+              onDiscarded={handlePreviewDiscarded}
+              onError={(message) => onLog(message, "error")}
+            />
+          ) : isLoadingFiles && !selectedFile ? (
             <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               Loading project workspace
@@ -316,39 +341,101 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
         <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-card/70">
           <div className="flex h-10 shrink-0 items-center gap-2 border-b px-3">
             <PackageOpen className="h-4 w-4" />
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Dependencies</h2>
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Right Panel</h2>
+            <div className="ml-auto flex rounded-md border bg-background p-0.5">
+              <button
+                onClick={() => setRightPanelMode("dependencies")}
+                className={cn(
+                  "rounded px-2 py-1 text-[11px] font-semibold transition",
+                  rightPanelMode === "dependencies" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted"
+                )}
+              >
+                Dependencies
+              </button>
+              <button
+                onClick={() => setRightPanelMode("progress")}
+                className={cn(
+                  "rounded px-2 py-1 text-[11px] font-semibold transition",
+                  rightPanelMode === "progress" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted"
+                )}
+              >
+                Progress
+              </button>
+            </div>
           </div>
-          <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
-            {visiblePackages.length === 0 ? (
-              <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-                Run a scan from the dashboard to populate dependency actions.
-              </div>
+          {rightPanelMode === "progress" ? (
+            updatingPackage && !previewData ? (
+              <PreparingPreviewPanel packageName={updatingPackage} />
             ) : (
-              visiblePackages.map((pkg) => (
-                <div key={`${pkg.ecosystem}-${pkg.name}`} className="rounded-lg border bg-background p-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-semibold">{pkg.name}</div>
-                    <div className="mt-1 text-xs text-muted-foreground">
-                      {pkg.current_version} → {pkg.latest_version}
-                    </div>
-                  </div>
-                  <div className="mt-3 flex items-center justify-between gap-2">
-                    <span className="rounded-md border px-2 py-1 text-xs text-muted-foreground">{pkg.severity}</span>
-                    <button
-                      onClick={() => void handleUpdate(pkg)}
-                      disabled={Boolean(updatingPackage)}
-                      className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition hover:bg-primary/90 disabled:opacity-60"
-                    >
-                      {updatingPackage === pkg.name ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Update"}
-                    </button>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
+              <DiffReviewActivityPanel activity={reviewActivity} />
+            )
+          ) : (
+            <DependenciesPanel
+              packages={visiblePackages}
+              updatingPackage={updatingPackage}
+              onUpdate={(pkg) => void handleUpdate(pkg)}
+            />
+          )}
         </aside>
       </div>
     </main>
+  );
+}
+
+function PreparingPreviewPanel({ packageName }: { packageName: string }) {
+  return (
+    <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
+      <div className="rounded-lg border bg-background p-4">
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Preparing preview
+        </div>
+        <p className="mt-2 text-xs leading-5 text-muted-foreground">
+          DepGuard is finding related files, asking the LLM for changes, and building the review diff for {packageName}.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function DependenciesPanel({
+  packages,
+  updatingPackage,
+  onUpdate,
+}: {
+  packages: PackageData[];
+  updatingPackage: string;
+  onUpdate: (pkg: PackageData) => void;
+}) {
+  return (
+    <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
+      {packages.length === 0 ? (
+        <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+          Run a scan from the dashboard to populate dependency actions.
+        </div>
+      ) : (
+        packages.map((pkg) => (
+          <div key={`${pkg.ecosystem}-${pkg.name}`} className="rounded-lg border bg-background p-3">
+            <div className="min-w-0">
+              <div className="truncate text-sm font-semibold">{pkg.name}</div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                {pkg.current_version} → {pkg.latest_version}
+              </div>
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-2">
+              <span className="rounded-md border px-2 py-1 text-xs text-muted-foreground">{pkg.severity}</span>
+              <button
+                onClick={() => onUpdate(pkg)}
+                disabled={Boolean(updatingPackage)}
+                className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition hover:bg-primary/90 disabled:opacity-60"
+              >
+                {updatingPackage === pkg.name ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Update"}
+              </button>
+            </div>
+          </div>
+        ))
+      )}
+    </div>
   );
 }
 

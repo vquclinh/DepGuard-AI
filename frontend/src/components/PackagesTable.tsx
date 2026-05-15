@@ -118,6 +118,13 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
     if (previewPackageName) {
       setStatuses(prev => ({ ...prev, [previewPackageName]: { type: "success" } }));
       onLog(`Applied ${previewPackageName}: ${result.files_accepted.length} file(s) accepted.`, "success");
+      if (result.verification?.status === "passed") {
+        onLog(`Checker passed for ${previewPackageName}.`, "success");
+      } else if (result.repair?.status === "success") {
+        onLog(`Repair Agent fixed ${previewPackageName} after checker feedback.`, "success");
+      } else if (result.verification?.status === "failed") {
+        onLog(`Checker still reports errors for ${previewPackageName}. Review the pipeline output.`, "error");
+      }
     }
     setPreviewData(null);
     setPreviewPackageName("");

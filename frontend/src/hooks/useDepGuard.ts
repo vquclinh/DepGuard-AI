@@ -114,11 +114,42 @@ export interface PreviewResponse {
   files: PreviewFile[];
 }
 
+export interface VerificationCommandResult {
+  name: string;
+  command: string;
+  status: "passed" | "failed" | "skipped";
+  stdout?: string;
+  stderr?: string;
+  exit_code?: number | null;
+}
+
+export interface VerificationReport {
+  status: "passed" | "failed" | "skipped";
+  message: string;
+  commands: VerificationCommandResult[];
+}
+
+export interface RepairAttempt {
+  attempt: number;
+  status: "success" | "failed" | "skipped";
+  files_repaired?: string[];
+  error?: string | null;
+  final_verification?: VerificationReport | null;
+}
+
+export interface RepairReport {
+  status: "success" | "failed" | "skipped";
+  attempts: RepairAttempt[];
+  final_verification?: VerificationReport | null;
+}
+
 export interface ApplyResponse {
   status: string;
   files_accepted: string[];
   files_rejected: string[];
   dependency_file_updated: string;
+  verification?: VerificationReport | null;
+  repair?: RepairReport | null;
 }
 
 export async function previewUpdate(folderPath: string, packageInfo: object): Promise<PreviewResponse> {
