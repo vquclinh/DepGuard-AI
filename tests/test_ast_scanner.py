@@ -63,6 +63,33 @@ def test_find_api_usages_resolves_aliases_across_languages(tmp_path: Path):
     assert "react.createElement" in scanner.find_api_usages(str(tmp_path), "react")
 
 
+def test_find_api_usages_expands_nested_rust_use_trees(tmp_path: Path):
+    (tmp_path / "main.rs").write_text(
+        "\n".join([
+            "use rspotify::{",
+            "  client::Spotify,",
+            "  oauth2::{SpotifyOAuth, TokenInfo},",
+            "  util::{process_token, request_token},",
+            "};",
+            "",
+            "fn main() {",
+            "    let mut oauth = SpotifyOAuth::default();",
+            "    request_token(&mut oauth);",
+            "}",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "rspotify")
+
+    assert "rspotify.client.Spotify" in usages
+    assert "rspotify.oauth2.SpotifyOAuth" in usages
+    assert "rspotify.oauth2.TokenInfo" in usages
+    assert "rspotify.util.process_token" in usages
+    assert "rspotify.util.request_token" in usages
+
+
 def test_tree_sitter_ignores_python_comments_and_strings(tmp_path: Path):
     scanner = ASTScanner()
     if "python" not in scanner.parsers:

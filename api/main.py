@@ -166,6 +166,82 @@ def _dependency_preview_content(dep_file_path: str, package: str, from_v: str, t
     )
     return original, patched
 
+def _migration_review_breaking_changes(package: str, from_v: str, to_v: str, api_usages: list[str], limit: int = 80) -> list[dict]:
+    """Build low-confidence API review targets when Scout cannot extract exact changes.
+
+    The patch agent still has to produce a real diff for a file to appear in the
+    review UI, so this broad fallback remains review-first rather than direct
+    write behavior.
+    """
+    concrete_usages = [
+        usage for usage in sorted(set(api_usages), key=lambda item: (-item.count("."), -len(item), item))
+        if usage and usage != package and (usage.startswith(f"{package}.") or usage.startswith(f"{package}/"))
+    ]
+    if not concrete_usages:
+        concrete_usages = [
+            usage for usage in sorted(set(api_usages))
+            if usage and usage != package
+        ]
+
+    return [
+        {
+            "type": "migration_review",
+            "old_api": usage,
+            "new_api": "",
+            "description": (
+                f"Review this {package} API usage while migrating {package} "
+                f"from {from_v} to {to_v}. Apply a code change only if the new version requires it."
+            ),
+        }
+        for usage in concrete_usages[:limit]
+    ]
+
+def _scan_breaking_changes_with_review_fallback(
+    ast_scanner,
+    folder_path: Path,
+    scout_output: dict,
+    package: str,
+    from_v: str,
+    to_v: str,
+    api_usages: list[str],
+) -> tuple[dict, dict]:
+    """Return scanner output, using broad API usages for preview when Scout is silent.
+
+    Changelog extraction can be sparse for non-Python ecosystems or for packages
+    with incomplete release notes. The review UI is the right place to surface
+    candidate code edits because the user can reject any hunk before writing.
+    """
+    breaking_changes = scout_output.get("breaking_changes", []) or []
+    ast_output = {"matches_by_file": {}, "total_matches": 0, "total_files_scanned": 0}
+
+    if breaking_changes:
+        ast_output = ast_scanner.scan(str(folder_path), breaking_changes)
+
+    if ast_output.get("total_matches", 0) > 0:
+        return scout_output, ast_output
+
+    fallback_changes = _migration_review_breaking_changes(package, from_v, to_v, api_usages)
+    if not fallback_changes:
+        return scout_output, ast_output
+
+    fallback_ast_output = ast_scanner.scan(str(folder_path), fallback_changes)
+    if fallback_ast_output.get("total_matches", 0) <= 0:
+        return scout_output, ast_output
+
+    fallback_scout_output = {
+        **scout_output,
+        "breaking_changes": fallback_changes,
+        "migration_review_fallback": True,
+        "confidence_score": min(float(scout_output.get("confidence_score", 0.0) or 0.0), 0.35),
+    }
+    logger.info(
+        "Using migration review fallback for %s: %s API target(s), %s code file(s)",
+        package,
+        len(fallback_changes),
+        len(fallback_ast_output.get("matches_by_file", {})),
+    )
+    return fallback_scout_output, fallback_ast_output
+
 def _build_hunks(original: str, patched: str) -> tuple[list[dict], int, int]:
     original_lines = original.splitlines()
     patched_lines = patched.splitlines()
@@ -435,7 +511,15 @@ def preview_update(req: UpdateRequest):
         api_usages = ast_scanner.find_api_usages(str(folder_path), package)
         scout = ScoutAgent()
         scout_output = scout.run_sync(pkg_info_dict, api_usages)
-        breaking_changes = scout_output.get("breaking_changes", [])
+        scout_output, ast_output = _scan_breaking_changes_with_review_fallback(
+            ast_scanner,
+            folder_path,
+            scout_output,
+            package,
+            from_v,
+            to_v,
+            api_usages,
+        )
 
         dep_relative = _relative_path(folder_path, pkg.file_path)
         dep_original, dep_patched = _dependency_preview_content(pkg.file_path, package, from_v, to_v)
@@ -443,8 +527,7 @@ def preview_update(req: UpdateRequest):
             files_original[dep_relative] = dep_original
             files_patched[dep_relative] = dep_patched
 
-        if breaking_changes:
-            ast_output = ast_scanner.scan(str(folder_path), breaking_changes)
+        if ast_output.get("matches_by_file"):
             patch_agent = PatchAgent(project_root=str(folder_path))
             preview_report = patch_agent.preview_sync(scout_output, ast_output)
             for file_preview in preview_report.get("files", []):

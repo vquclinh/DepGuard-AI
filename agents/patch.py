@@ -169,6 +169,7 @@ class PatchAgent:
             "You are an expert code migration assistant.\n"
             "Fix ONLY the deprecated API usages listed.\n"
             "Do NOT change any other code, logic, or formatting.\n"
+            "If the listed usages do not require code changes, return the original file unchanged.\n"
             "Return ONLY the complete fixed file content, no explanation."
         )
 
@@ -357,6 +358,8 @@ class PatchAgent:
                 "original": original_content,
                 "patched": patched_content if success else original_content,
             })
+            if not success and "All configured LLM providers failed" in error_msg:
+                break
 
         return report
 

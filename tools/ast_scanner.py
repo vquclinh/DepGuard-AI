@@ -475,6 +475,8 @@ class ASTScanner:
         for full, name in re.findall(r"use\s+([A-Za-z_][\w:]+)::([A-Za-z_]\w*)\s*;", content):
             aliases[name] = f"{full}::{name}"
 
+        aliases.update(self._extract_rust_use_tree_aliases(content))
+
         for alias, module in re.findall(r"^\s*(?:import\s+)?([A-Za-z_]\w*)\s+['\"]([^'\"]+)['\"]", content, re.MULTILINE):
             aliases[alias] = module
 
@@ -488,6 +490,106 @@ class ASTScanner:
             aliases[imported.split("\\")[-1]] = imported.replace("\\", ".")
 
         return aliases
+
+    def _extract_rust_use_tree_aliases(self, content: str) -> dict[str, str]:
+        aliases: dict[str, str] = {}
+        for use_body in self._rust_use_statements(content):
+            self._walk_rust_use_tree(use_body.strip(), [], aliases)
+        return aliases
+
+    def _rust_use_statements(self, content: str) -> list[str]:
+        statements: list[str] = []
+        index = 0
+        while True:
+            match = re.search(r"\buse\s+", content[index:])
+            if not match:
+                break
+            start = index + match.end()
+            cursor = start
+            depth = 0
+            while cursor < len(content):
+                char = content[cursor]
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                elif char == ";" and depth == 0:
+                    statements.append(content[start:cursor])
+                    cursor += 1
+                    break
+                cursor += 1
+            index = cursor
+        return statements
+
+    def _walk_rust_use_tree(self, text: str, prefix: list[str], aliases: dict[str, str]) -> None:
+        text = text.strip()
+        if not text:
+            return
+
+        brace_index = self._top_level_char(text, "{")
+        if brace_index >= 0:
+            base = text[:brace_index].strip().rstrip(":")
+            inner_end = text.rfind("}")
+            inner = text[brace_index + 1:inner_end if inner_end >= 0 else len(text)]
+            next_prefix = prefix + self._rust_path_parts(base)
+            for item in self._split_rust_use_items(inner):
+                self._walk_rust_use_tree(item, next_prefix, aliases)
+            return
+
+        for item in self._split_rust_use_items(text):
+            item = item.strip()
+            if not item:
+                continue
+            alias_match = re.match(r"(.+?)\s+as\s+([A-Za-z_]\w*)$", item)
+            if alias_match:
+                path_text = alias_match.group(1).strip()
+                local_name = alias_match.group(2)
+            else:
+                path_text = item
+                local_name = path_text.split("::")[-1].strip()
+
+            if local_name in {"self", "super", "crate", "*"}:
+                continue
+            full_parts = prefix + self._rust_path_parts(path_text)
+            if full_parts:
+                aliases[local_name] = ".".join(full_parts)
+
+    def _rust_path_parts(self, path_text: str) -> list[str]:
+        return [
+            part.strip()
+            for part in path_text.strip().strip(":").split("::")
+            if part.strip() and part.strip() not in {"self", "*"}
+        ]
+
+    def _split_rust_use_items(self, text: str) -> list[str]:
+        items: list[str] = []
+        start = 0
+        depth = 0
+        for index, char in enumerate(text):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                item = text[start:index].strip()
+                if item:
+                    items.append(item)
+                start = index + 1
+        tail = text[start:].strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    def _top_level_char(self, text: str, needle: str) -> int:
+        depth = 0
+        for index, char in enumerate(text):
+            if char == needle and depth == 0:
+                return index
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+        return -1
 
     def _api_variants(self, old_api: str, aliases: dict[str, str]) -> set[str]:
         variants = {old_api, old_api.replace(".", "::")}

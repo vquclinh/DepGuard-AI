@@ -91,7 +91,11 @@ class ScoutAgent:
     async def _analyze_changelog_with_llm(
         self, package: str, from_v: str, to_v: str, changelog: str, api_usages: Optional[list[str]] = None
     ) -> dict:
-        system_prompt = "You are a senior dependency management AI. Extract ONLY breaking changes from changelogs relevant to code usage. Format strictly as JSON."
+        system_prompt = (
+            "You are a senior dependency management AI for Python, Rust, Go, JavaScript, TypeScript, Java, "
+            "and other ecosystems. Extract ONLY breaking changes from changelogs relevant to code usage. "
+            "Format strictly as JSON."
+        )
         
         usage_constraint = ""
         if api_usages:
@@ -99,7 +103,8 @@ class ScoutAgent:
             usage_constraint = f"\nCRITICAL: You MUST ONLY extract breaking changes that affect these specific APIs used in the project: [{usages_str}]. Ignore all other breaking changes."
 
         prompt = f"""
-            Analyze the changelog for '{package}' from version {from_v} to {to_v} and extract ONLY breaking changes relevant to Python/the ecosystem API usage:{usage_constraint}
+            Analyze the changelog for '{package}' from version {from_v} to {to_v} and extract ONLY breaking changes relevant to the package's ecosystem and API usage:{usage_constraint}
+            Prefer old_api values that match the exact APIs used by the project when possible.
             Return a JSON object with this exact structure:
             {{
             "breaking_changes": [

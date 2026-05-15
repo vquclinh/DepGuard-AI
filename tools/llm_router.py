@@ -43,16 +43,26 @@ class LLMRouter:
     def __init__(self):
         self.claude_api_key = os.getenv("ANTHROPIC_API_KEY")
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
-        self.qwen_base_url = os.getenv("QWEN_BASE_URL")
+        self.qwen_base_url = self._normalize_base_url(os.getenv("QWEN_BASE_URL"))
         self.qwen_model = os.getenv("QWEN_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
         self.claude_model = "claude-sonnet-4-20250514"
         self.gemini_model = "gemini-2.0-flash"
+        self.provider_order = self._parse_provider_order(os.getenv("LLM_PROVIDER_ORDER"))
+        self.qwen_timeout = httpx.Timeout(
+            connect=self._env_float("QWEN_CONNECT_TIMEOUT", 5.0),
+            read=self._env_float("QWEN_READ_TIMEOUT", 60.0),
+            write=self._env_float("QWEN_WRITE_TIMEOUT", 10.0),
+            pool=self._env_float("QWEN_POOL_TIMEOUT", 5.0),
+        )
 
         self.skip_claude = False
+        self.skip_gemini = self._env_bool("DISABLE_GEMINI") or self._env_bool("LLM_DISABLE_GEMINI")
+        self.skip_qwen = False
         self.qwen_status = "not_configured"
+        self.qwen_headers = {"ngrok-skip-browser-warning": "true"}
 
         # Create Client For Each Models
-        if self.gemini_api_key:
+        if self.gemini_api_key and not self.skip_gemini:
             self.gemini_client = genai.Client(api_key=self.gemini_api_key)
         else:
             self.gemini_client = None
@@ -66,22 +76,59 @@ class LLMRouter:
         if self.qwen_base_url:
             self.qwen_client = AsyncOpenAI(
                 base_url=f"{self.qwen_base_url}/v1",
-                api_key="not-needed"
+                api_key="not-needed",
+                default_headers=self.qwen_headers,
+                max_retries=0,
+                timeout=self.qwen_timeout,
             )
         else:
             self.qwen_client = None
 
         # Determine Qwen status on init if possible 
         if self.qwen_base_url:
+            self.qwen_status = "available"
             try:
                 # Fast timeout sync check
-                resp = httpx.get(f"{self.qwen_base_url}/v1/models", timeout=2.0)
-                if resp.status_code == 200:
+                resp = httpx.get(
+                    f"{self.qwen_base_url}/v1/models",
+                    headers=self.qwen_headers,
+                    timeout=3.0,
+                    follow_redirects=True,
+                )
+                if resp.status_code < 500:
                     self.qwen_status = "available"
                 else:
                     self.qwen_status = "offline"
             except Exception:
                 self.qwen_status = "offline"
+
+    def _normalize_base_url(self, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        base_url = value.strip().rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3].rstrip("/")
+        return base_url or None
+
+    def _env_bool(self, name: str) -> bool:
+        return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _env_float(self, name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)))
+        except ValueError:
+            return default
+
+    def _parse_provider_order(self, value: Optional[str]) -> list[str] | None:
+        if not value:
+            return None
+        allowed = {"claude", "gemini", "qwen"}
+        order = []
+        for item in value.split(","):
+            provider = item.strip().lower()
+            if provider in allowed and provider not in order:
+                order.append(provider)
+        return order or None
 
     def _get_cache_key(self, system_prompt: str, user_prompt: str) -> str:
         combined = f"{system_prompt}|||{user_prompt}"
@@ -119,6 +166,8 @@ class LLMRouter:
 
     # Call Gemini
     async def _call_gemini(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+        if self.skip_gemini:
+            raise Exception("Gemini disabled")
         if not self.gemini_api_key or not self.gemini_client:
             raise Exception("Gemini API key not configured")
 
@@ -128,14 +177,15 @@ class LLMRouter:
             assert client is not None
 
             def _sync_call():
+                config = genai_types.GenerateContentConfig.model_validate({
+                    "system_instruction": system_prompt,
+                    "max_output_tokens": max_tokens,
+                    "temperature": 0.1,
+                })
                 response = client.models.generate_content(
                     model=self.gemini_model,
                     contents=user_prompt,
-                    config=genai_types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        max_output_tokens=max_tokens,
-                        temperature=0.1
-                    )
+                    config=config
                 )
                 return response.text
 
@@ -144,10 +194,15 @@ class LLMRouter:
                 return text
             raise Exception("Gemini returned empty response")
         except Exception as e:
+            message = str(e).lower()
+            if "quota" in message or "rate limit" in message or "429" in message:
+                self.skip_gemini = True
             raise e
 
     # Call Qwen
     async def _call_qwen(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+        if self.skip_qwen:
+            raise Exception("Qwen skipped after a previous timeout")
         if self.qwen_status in ["offline", "not_configured"] or not self.qwen_client:
             raise Exception(f"Qwen skipped: status is {self.qwen_status}")
 
@@ -163,10 +218,18 @@ class LLMRouter:
             )
             return response.choices[0].message.content or ""
         except Exception as e:
+            if "timed out" in str(e).lower() or e.__class__.__name__ == "APITimeoutError":
+                self.skip_qwen = True
             raise e
 
     # Choose the order of models
     def _get_routing_order(self, task_type: str) -> List[str]:
+        if self.provider_order:
+            return self.provider_order
+
+        if self.qwen_base_url:
+            return ["qwen", "claude", "gemini"]
+
         if task_type == "patch_simple":
             return ["qwen", "gemini", "claude"]
         else: # "changelog", "patch_complex", "general"
@@ -210,6 +273,8 @@ class LLMRouter:
                     content = await self._call_gemini(system_prompt, user_prompt, max_tokens)
                     model_used = self.gemini_model
                 elif provider == "qwen":
+                    if self.skip_qwen:
+                        raise Exception("Qwen skipped after a previous timeout")
                     content = await self._call_qwen(system_prompt, user_prompt, max_tokens)
                     model_used = self.qwen_model
                     
@@ -234,6 +299,10 @@ class LLMRouter:
         raise FallbackExhaustedError(f"All configured LLM providers failed. Details: {', '.join(errors)}")
 
     def get_providers_status(self) -> List[dict]:
+        priority = {
+            provider: index + 1
+            for index, provider in enumerate(self._get_routing_order("general"))
+        }
         providers = []
         
         # Claude
@@ -243,27 +312,31 @@ class LLMRouter:
             "status": claude_status,
             "model": self.claude_model,
             "host": "anthropic",
-            "priority": 1
+            "priority": priority.get("claude", 99)
         })
         
         # Gemini
-        gemini_status = "available" if self.gemini_api_key else "not_configured"
+        if self.skip_gemini:
+            gemini_status = "disabled"
+        else:
+            gemini_status = "available" if self.gemini_api_key else "not_configured"
         providers.append({
             "name": "gemini",
             "status": gemini_status,
             "model": self.gemini_model,
             "host": "google",
-            "priority": 2
+            "priority": priority.get("gemini", 99)
         })
         
         # Qwen
+        qwen_status = "temporarily_unavailable" if self.skip_qwen else self.qwen_status
         providers.append({
             "name": "qwen",
-            "status": self.qwen_status,
+            "status": qwen_status,
             "model": self.qwen_model,
-            "host": "kaggle",
-            "priority": 3,
-            "note": "Hosted on Kaggle GPU via ngrok"
+            "host": "ngrok",
+            "priority": priority.get("qwen", 99),
+            "note": "Hosted via OpenAI-compatible Qwen endpoint"
         })
         
-        return providers
+        return sorted(providers, key=lambda provider: provider["priority"])
