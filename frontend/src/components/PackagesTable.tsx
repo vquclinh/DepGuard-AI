@@ -1,7 +1,8 @@
 import React, { useState, useMemo } from "react";
 import { cn } from "@/lib/utils";
-import { updatePackage, rollbackPackage } from "@/hooks/useDepGuard";
+import { previewUpdate, rollbackPackage, type ApplyResponse, type PreviewResponse } from "@/hooks/useDepGuard";
 import { AlertCircle, CheckCircle2, RotateCcw, ChevronRight, ChevronDown, MoreHorizontal, ExternalLink } from "lucide-react";
+import { DiffReviewPanel } from "@/components/DiffReviewPanel";
 
 const getRegistryUrl = (ecosystem: string, packageName: string) => {
   const name = encodeURIComponent(packageName);
@@ -47,6 +48,8 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
   const [statuses, setStatuses] = useState<Record<string, { type: "success" | "error", error?: string, checkpoint?: string, provider?: string }>>({});
   const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
   const [activePopup, setActivePopup] = useState<string | null>(null);
+  const [previewData, setPreviewData] = useState<PreviewResponse | null>(null);
+  const [previewPackageName, setPreviewPackageName] = useState("");
 
   // Filtering & Sorting State
   const [filterEcosystem, setFilterEcosystem] = useState<string>("All");
@@ -91,23 +94,41 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
 
   const handleUpdate = async (pkg: PackageData) => {
     setUpdating(prev => ({ ...prev, [pkg.name]: true }));
-    onLog(`Starting update for ${pkg.name} (${pkg.current_version} -> ${pkg.latest_version})...`, "info");
+    onLog(`Preparing preview for ${pkg.name} (${pkg.current_version} -> ${pkg.latest_version})...`, "info");
     
     try {
-      const result = await updatePackage(folderPath, pkg);
-      if (result.status === "success" || result.status === "updated_version_only") {
-        setStatuses(prev => ({ ...prev, [pkg.name]: { type: "success", provider: result.llm_provider } }));
-        onLog(`Successfully updated ${pkg.name}.`, "success");
+      const result = await previewUpdate(folderPath, pkg);
+      if (result.files.length === 0) {
+        setStatuses(prev => ({ ...prev, [pkg.name]: { type: "success" } }));
+        onLog(`No file changes needed for ${pkg.name}.`, "success");
       } else {
-        setStatuses(prev => ({ ...prev, [pkg.name]: { type: "error", error: "Failed", checkpoint: result.checkpoint_id } }));
-        onLog(`Update failed for ${pkg.name}.`, "error");
+        setPreviewData(result);
+        setPreviewPackageName(pkg.name);
+        onLog(`Preview ready for ${pkg.name}: ${result.summary.total_files_changed} file(s) changed.`, "info");
       }
     } catch (e: any) {
       setStatuses(prev => ({ ...prev, [pkg.name]: { type: "error", error: e.message } }));
-      onLog(`Error updating ${pkg.name}: ${e.message}`, "error");
+      onLog(`Error previewing ${pkg.name}: ${e.message}`, "error");
     } finally {
       setUpdating(prev => ({ ...prev, [pkg.name]: false }));
     }
+  };
+
+  const handlePreviewApplied = (result: ApplyResponse) => {
+    if (previewPackageName) {
+      setStatuses(prev => ({ ...prev, [previewPackageName]: { type: "success" } }));
+      onLog(`Applied ${previewPackageName}: ${result.files_accepted.length} file(s) accepted.`, "success");
+    }
+    setPreviewData(null);
+    setPreviewPackageName("");
+  };
+
+  const handlePreviewDiscarded = () => {
+    if (previewPackageName) {
+      onLog(`Discarded preview for ${previewPackageName}.`, "info");
+    }
+    setPreviewData(null);
+    setPreviewPackageName("");
   };
 
   const handleRollback = async (pkgName: string, checkpointId?: string) => {
@@ -132,6 +153,14 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
 
   return (
     <div className="space-y-4">
+      {previewData && (
+        <DiffReviewPanel
+          preview={previewData}
+          onApplied={handlePreviewApplied}
+          onDiscarded={handlePreviewDiscarded}
+          onError={(message) => onLog(message, "error")}
+        />
+      )}
       {/* Controls Bar */}
       <div className="flex flex-wrap gap-4 items-center justify-between bg-card p-4 rounded-xl border">
         <div className="flex flex-wrap gap-3 items-center">

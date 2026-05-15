@@ -74,6 +74,89 @@ export async function updatePackage(folderPath: string, packageInfo: object): Pr
   return response.json();
 }
 
+export type DiffChangeType = "context" | "deletion" | "addition";
+
+export interface PreviewChange {
+  type: DiffChangeType;
+  line_number_old: number | null;
+  line_number_new: number | null;
+  content: string;
+}
+
+export interface PreviewHunk {
+  hunk_id: string;
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  changes: PreviewChange[];
+}
+
+export interface PreviewFile {
+  file_path: string;
+  relative_path: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  hunks: PreviewHunk[];
+}
+
+export interface PreviewResponse {
+  session_id: string;
+  package: string;
+  from_version: string;
+  to_version: string;
+  summary: {
+    total_files_changed: number;
+    total_additions: number;
+    total_deletions: number;
+  };
+  files: PreviewFile[];
+}
+
+export interface ApplyResponse {
+  status: string;
+  files_accepted: string[];
+  files_rejected: string[];
+  dependency_file_updated: string;
+}
+
+export async function previewUpdate(folderPath: string, packageInfo: object): Promise<PreviewResponse> {
+  const response = await fetch('/api/preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder_path: folderPath, package_info: packageInfo })
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to preview update');
+  }
+  return response.json();
+}
+
+export async function applyPreview(sessionId: string, decisions: object): Promise<ApplyResponse> {
+  const response = await fetch('/api/apply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, decisions })
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to apply preview');
+  }
+  return response.json();
+}
+
+export async function discardPreview(sessionId: string): Promise<void> {
+  const response = await fetch(`/api/preview/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE'
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to discard preview');
+  }
+}
+
 export async function rollbackPackage(checkpointId: string, folderPath: string) {
   const response = await fetch('/api/rollback', {
     method: 'POST',

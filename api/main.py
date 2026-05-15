@@ -4,6 +4,9 @@ import logging
 import subprocess
 import re
 import asyncio
+import difflib
+import time
+import uuid
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,6 +76,13 @@ class FileContentRequest(BaseModel):
     folder_path: str
     file_path: str
 
+class ApplyPreviewRequest(BaseModel):
+    session_id: str
+    decisions: dict
+
+PREVIEW_SESSIONS: dict[str, dict] = {}
+PREVIEW_SESSION_TTL_SECONDS = 30 * 60
+
 FILE_EXPLORER_IGNORE_DIRS = {
     "venv", ".venv", "env", "node_modules", "__pycache__",
     ".git", "dist", "build", ".pytest_cache", ".depguard_cache",
@@ -132,6 +142,160 @@ def _capture_files(folder_path: Path, file_paths: list[str]) -> dict[str, str]:
                 relative = str(resolved)
             captured[relative] = _read_text_if_exists(resolved)
     return captured
+
+def _cleanup_preview_sessions():
+    now = time.time()
+    expired = [
+        session_id for session_id, session in PREVIEW_SESSIONS.items()
+        if now - session.get("created_at", 0) > PREVIEW_SESSION_TTL_SECONDS
+    ]
+    for session_id in expired:
+        PREVIEW_SESSIONS.pop(session_id, None)
+
+def _relative_path(folder_path: Path, file_path: str) -> str:
+    resolved = _safe_project_path(folder_path, file_path)
+    return resolved.relative_to(folder_path.resolve()).as_posix()
+
+def _dependency_preview_content(dep_file_path: str, package: str, from_v: str, to_v: str) -> tuple[str, str]:
+    original = _read_text_if_exists(Path(dep_file_path))
+    patched = re.sub(
+        rf'({re.escape(package)}[^\d\n]*){re.escape(from_v)}',
+        rf'\g<1>{to_v}',
+        original,
+        flags=re.IGNORECASE
+    )
+    return original, patched
+
+def _build_hunks(original: str, patched: str) -> tuple[list[dict], int, int]:
+    original_lines = original.splitlines()
+    patched_lines = patched.splitlines()
+    matcher = difflib.SequenceMatcher(None, original_lines, patched_lines)
+    hunks = []
+    additions = 0
+    deletions = 0
+
+    for hunk_index, group in enumerate(matcher.get_grouped_opcodes(3), start=1):
+        old_start = group[0][1] + 1
+        old_end = group[-1][2]
+        new_start = group[0][3] + 1
+        new_end = group[-1][4]
+        changes = []
+
+        for tag, i1, i2, j1, j2 in group:
+            if tag == "equal":
+                for offset, line in enumerate(original_lines[i1:i2]):
+                    changes.append({
+                        "type": "context",
+                        "line_number_old": i1 + offset + 1,
+                        "line_number_new": j1 + offset + 1,
+                        "content": line,
+                    })
+            elif tag in {"replace", "delete"}:
+                for offset, line in enumerate(original_lines[i1:i2]):
+                    deletions += 1
+                    changes.append({
+                        "type": "deletion",
+                        "line_number_old": i1 + offset + 1,
+                        "line_number_new": None,
+                        "content": line,
+                    })
+                if tag == "replace":
+                    for offset, line in enumerate(patched_lines[j1:j2]):
+                        additions += 1
+                        changes.append({
+                            "type": "addition",
+                            "line_number_old": None,
+                            "line_number_new": j1 + offset + 1,
+                            "content": line,
+                        })
+            elif tag == "insert":
+                for offset, line in enumerate(patched_lines[j1:j2]):
+                    additions += 1
+                    changes.append({
+                        "type": "addition",
+                        "line_number_old": None,
+                        "line_number_new": j1 + offset + 1,
+                        "content": line,
+                    })
+
+        hunks.append({
+            "hunk_id": f"hunk_{hunk_index:03d}",
+            "old_start": old_start,
+            "old_lines": max(0, old_end - (old_start - 1)),
+            "new_start": new_start,
+            "new_lines": max(0, new_end - (new_start - 1)),
+            "changes": changes,
+        })
+
+    return hunks, additions, deletions
+
+def _preview_response(session: dict) -> dict:
+    files = []
+    total_additions = 0
+    total_deletions = 0
+    folder_path = Path(session["folder_path"])
+
+    for relative_path, original in session["files_original"].items():
+        patched = session["files_patched"].get(relative_path, original)
+        if original == patched:
+            continue
+        hunks, additions, deletions = _build_hunks(original, patched)
+        total_additions += additions
+        total_deletions += deletions
+        files.append({
+            "file_path": relative_path,
+            "relative_path": relative_path,
+            "status": "modified",
+            "additions": additions,
+            "deletions": deletions,
+            "hunks": hunks,
+        })
+
+    package_info = session["package_info"]
+    return {
+        "session_id": session["session_id"],
+        "package": package_info.get("name", ""),
+        "from_version": package_info.get("current_version", ""),
+        "to_version": package_info.get("latest_version", ""),
+        "summary": {
+            "total_files_changed": len(files),
+            "total_additions": total_additions,
+            "total_deletions": total_deletions,
+        },
+        "files": files,
+    }
+
+def _apply_partial_hunks(original: str, patched: str, accepted_hunk_ids: set[str]) -> str:
+    hunks, _additions, _deletions = _build_hunks(original, patched)
+    original_lines = original.splitlines()
+    merged_lines = []
+    cursor = 1
+
+    for hunk in hunks:
+        old_start = hunk["old_start"]
+        old_end = old_start + hunk["old_lines"] - 1
+        while cursor < old_start and cursor <= len(original_lines):
+            merged_lines.append(original_lines[cursor - 1])
+            cursor += 1
+
+        if hunk["hunk_id"] in accepted_hunk_ids:
+            for change in hunk["changes"]:
+                if change["type"] in {"context", "addition"}:
+                    merged_lines.append(change["content"])
+        else:
+            while cursor <= old_end and cursor <= len(original_lines):
+                merged_lines.append(original_lines[cursor - 1])
+                cursor += 1
+            continue
+
+        cursor = old_end + 1
+
+    while cursor <= len(original_lines):
+        merged_lines.append(original_lines[cursor - 1])
+        cursor += 1
+
+    trailing_newline = "\n" if original.endswith("\n") or patched.endswith("\n") else ""
+    return "\n".join(merged_lines) + trailing_newline
 
 # ------------------------------ Health Check Endpoint ---------------------------------
 @app.get("/health")
@@ -248,6 +412,126 @@ def get_file_content(req: FileContentRequest):
     except Exception as e:
         logger.error(f"Error reading file content: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to read file: {e}")
+
+# ------------------------------ Preview and Review --------------------------------------
+@app.post("/preview")
+def preview_update(req: UpdateRequest):
+    _cleanup_preview_sessions()
+    folder_path = Path(req.folder_path)
+    if not folder_path.exists() or not folder_path.is_dir():
+        raise HTTPException(status_code=400, detail="Folder path does not exist or is not a directory")
+
+    try:
+        pkg_info_dict = req.package_info.dict()
+        pkg = req.package_info
+        package = pkg.name
+        from_v = pkg.current_version
+        to_v = pkg.latest_version
+
+        files_original: dict[str, str] = {}
+        files_patched: dict[str, str] = {}
+
+        ast_scanner = ASTScanner()
+        api_usages = ast_scanner.find_api_usages(str(folder_path), package)
+        scout = ScoutAgent()
+        scout_output = scout.run_sync(pkg_info_dict, api_usages)
+        breaking_changes = scout_output.get("breaking_changes", [])
+
+        dep_relative = _relative_path(folder_path, pkg.file_path)
+        dep_original, dep_patched = _dependency_preview_content(pkg.file_path, package, from_v, to_v)
+        if dep_original != dep_patched:
+            files_original[dep_relative] = dep_original
+            files_patched[dep_relative] = dep_patched
+
+        if breaking_changes:
+            ast_output = ast_scanner.scan(str(folder_path), breaking_changes)
+            patch_agent = PatchAgent(project_root=str(folder_path))
+            preview_report = patch_agent.preview_sync(scout_output, ast_output)
+            for file_preview in preview_report.get("files", []):
+                if file_preview.get("status") != "success":
+                    continue
+                relative = _relative_path(folder_path, file_preview.get("file", ""))
+                original = file_preview.get("original", "")
+                patched = file_preview.get("patched", original)
+                if original != patched:
+                    files_original[relative] = original
+                    files_patched[relative] = patched
+
+        session_id = f"preview_{uuid.uuid4().hex[:10]}"
+        session = {
+            "session_id": session_id,
+            "folder_path": str(folder_path.resolve()),
+            "package_info": pkg_info_dict,
+            "files_original": files_original,
+            "files_patched": files_patched,
+            "created_at": time.time(),
+        }
+        PREVIEW_SESSIONS[session_id] = session
+        return _preview_response(session)
+    except Exception as e:
+        logger.error(f"Error creating preview: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create preview: {e}")
+
+@app.post("/apply")
+def apply_preview(req: ApplyPreviewRequest):
+    _cleanup_preview_sessions()
+    session = PREVIEW_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Preview session not found or expired")
+
+    folder_path = Path(session["folder_path"])
+    files_accepted = []
+    files_rejected = []
+    dependency_file_updated = ""
+
+    try:
+        for relative_path, original in session["files_original"].items():
+            patched = session["files_patched"].get(relative_path, original)
+            file_decision = req.decisions.get(relative_path, {})
+            decision = file_decision.get("file_decision", "reject")
+
+            if decision == "accept":
+                final_content = patched
+                files_accepted.append(relative_path)
+            elif decision == "partial":
+                accepted_hunks = {
+                    hunk_id for hunk_id, hunk_decision in file_decision.get("hunks", {}).items()
+                    if hunk_decision == "accept"
+                }
+                if not accepted_hunks:
+                    files_rejected.append(relative_path)
+                    continue
+                final_content = _apply_partial_hunks(original, patched, accepted_hunks)
+                files_accepted.append(relative_path)
+            else:
+                files_rejected.append(relative_path)
+                continue
+
+            target = _safe_project_path(folder_path, relative_path)
+            target.write_text(final_content, encoding="utf-8")
+            package_info = session["package_info"]
+            try:
+                dep_relative = _relative_path(folder_path, package_info.get("file_path", ""))
+                if relative_path == dep_relative:
+                    dependency_file_updated = Path(relative_path).name
+            except Exception:
+                pass
+
+        PREVIEW_SESSIONS.pop(req.session_id, None)
+        return {
+            "status": "success",
+            "files_accepted": files_accepted,
+            "files_rejected": files_rejected,
+            "dependency_file_updated": dependency_file_updated,
+        }
+    except Exception as e:
+        logger.error(f"Error applying preview: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to apply preview: {e}")
+
+@app.delete("/preview/{session_id}")
+def discard_preview(session_id: str):
+    PREVIEW_SESSIONS.pop(session_id, None)
+    return {"status": "discarded"}
 
 # ------------------------------ Browse Directory --------------------------------------
 def _open_native_dialog():

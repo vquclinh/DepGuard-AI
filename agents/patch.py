@@ -97,15 +97,13 @@ class PatchAgent:
             return match.group(1)
         return response_text.strip()
 
-
-    async def _patch_file(self, filepath: str, matches: list, scout_context: dict, task_type: str) -> tuple[bool, str, dict]:
+    async def _generate_patched_content(self, filepath: str, matches: list, scout_context: dict, task_type: str) -> tuple[bool, str, dict, str, str]:
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 original_content = f.read()
         except Exception as e:
-                return False, f"Could not read file: {e}", {}
+                return False, f"Could not read file: {e}", {}, "", ""
 
-        # Create prompt for LLM
         system_prompt = (
             "You are an expert code migration assistant.\n"
             "Fix ONLY the deprecated API usages listed.\n"
@@ -147,16 +145,26 @@ class PatchAgent:
                 ast.parse(patched_content, filename=filepath)
             except SyntaxError as e:
                 logger.error(f"Validation failed for {filepath}: {e}")
-                return False, f"Syntax error in LLM output: {e}", llm_info
+                return False, f"Syntax error in LLM output: {e}", llm_info, original_content, patched_content
 
-            # Write file
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(patched_content)
-
-            return True, "", llm_info
+            return True, "", llm_info, original_content, patched_content
         except Exception as e:
             logger.error(f"Error patching {filepath}: {e}")
-            return False, str(e), {}
+            return False, str(e), {}, original_content, ""
+
+
+    async def _patch_file(self, filepath: str, matches: list, scout_context: dict, task_type: str) -> tuple[bool, str, dict]:
+        success, error_msg, llm_info, _original_content, patched_content = await self._generate_patched_content(filepath, matches, scout_context, task_type)
+        if not success:
+            return False, error_msg, llm_info
+
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(patched_content)
+            return True, "", llm_info
+        except Exception as e:
+            logger.error(f"Error writing patched file {filepath}: {e}")
+            return False, str(e), llm_info
 
     # Update dependencies version
     def _update_dependency_file(self, dep_file_path: str, package: str, from_v: str, to_v: str):
@@ -250,3 +258,47 @@ class PatchAgent:
 
     def run_sync(self, scout_output: dict, ast_scanner_output: dict, dep_file_path: str) -> dict:
         return asyncio.run(self.run(scout_output, ast_scanner_output, dep_file_path))
+
+    async def preview(self, scout_output: dict, ast_scanner_output: dict) -> dict:
+        package = scout_output.get("package", "unknown")
+        from_v = scout_output.get("from_version", "")
+        to_v = scout_output.get("to_version", "")
+
+        matches_by_file = ast_scanner_output.get("matches_by_file", {})
+        if "matches_by_file" not in ast_scanner_output:
+            if isinstance(ast_scanner_output, dict) and not "total_files_scanned" in ast_scanner_output:
+                matches_by_file = ast_scanner_output
+
+        breaking_changes = scout_output.get("breaking_changes", [])
+        if breaking_changes and all(c.get("type") == "renamed" for c in breaking_changes):
+            task_type = "patch_simple"
+        else:
+            task_type = "patch_complex"
+
+        report = {
+            "package": package,
+            "from_version": from_v,
+            "to_version": to_v,
+            "files": [],
+            "llm_provider": "none",
+            "fallback_used": False,
+        }
+
+        for filepath, matches in matches_by_file.items():
+            success, error_msg, llm_info, original_content, patched_content = await self._generate_patched_content(filepath, matches, scout_output, task_type)
+            if llm_info:
+                report["llm_provider"] = llm_info.get("provider", report["llm_provider"])
+                report["fallback_used"] = report["fallback_used"] or llm_info.get("fallback_used", False)
+
+            report["files"].append({
+                "file": filepath,
+                "status": "success" if success else "failed",
+                "error": error_msg,
+                "original": original_content,
+                "patched": patched_content if success else original_content,
+            })
+
+        return report
+
+    def preview_sync(self, scout_output: dict, ast_scanner_output: dict) -> dict:
+        return asyncio.run(self.preview(scout_output, ast_scanner_output))

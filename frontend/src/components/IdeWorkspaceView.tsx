@@ -19,11 +19,14 @@ import { type PackageData } from "@/components/PackagesTable";
 import {
   getFileContent,
   getProjectFiles,
-  updatePackage,
+  previewUpdate,
+  type ApplyResponse,
   type ChangedFile,
+  type PreviewResponse,
   type ProjectFile,
 } from "@/hooks/useDepGuard";
 import { cn } from "@/lib/utils";
+import { DiffReviewPanel } from "@/components/DiffReviewPanel";
 
 interface IdeWorkspaceViewProps {
   folderPath: string;
@@ -58,6 +61,8 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
   const [changedFiles, setChangedFiles] = useState<ChangedFile[]>([]);
   const [activeChangedFile, setActiveChangedFile] = useState("");
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => new Set([""]));
+  const [previewData, setPreviewData] = useState<PreviewResponse | null>(null);
+  const [previewPackageName, setPreviewPackageName] = useState("");
 
   const visiblePackages = packages.slice(0, 12);
 
@@ -136,27 +141,38 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
 
   const handleUpdate = async (pkg: PackageData) => {
     setUpdatingPackage(pkg.name);
-    onLog(`IDE workspace update started for ${pkg.name}.`, "info");
+    onLog(`Preparing IDE preview for ${pkg.name}.`, "info");
     try {
-      const result = await updatePackage(folderPath, pkg);
-      const filesChanged = result.changed_files ?? [];
-      setChangedFiles(filesChanged);
-      if (filesChanged.length > 0) {
-        setActiveChangedFile(filesChanged[0].file);
-        setSelectedFile(filesChanged[0].file);
-      }
-
-      if (result.status === "success" || result.status === "updated_version_only") {
-        onLog(`Successfully updated ${pkg.name}.`, "success");
+      const result = await previewUpdate(folderPath, pkg);
+      if (result.files.length === 0) {
+        onLog(`No file changes needed for ${pkg.name}.`, "success");
       } else {
-        onLog(`Update failed for ${pkg.name}.`, "error");
+        setPreviewData(result);
+        setPreviewPackageName(pkg.name);
+        onLog(`Preview ready for ${pkg.name}: ${result.summary.total_files_changed} file(s) changed.`, "info");
       }
       void loadFiles();
     } catch (error) {
-      onLog(`Error updating ${pkg.name}: ${error instanceof Error ? error.message : "Unknown error"}`, "error");
+      onLog(`Error previewing ${pkg.name}: ${error instanceof Error ? error.message : "Unknown error"}`, "error");
     } finally {
       setUpdatingPackage("");
     }
+  };
+
+  const handlePreviewApplied = (result: ApplyResponse) => {
+    onLog(`Applied ${previewPackageName}: ${result.files_accepted.length} file(s) accepted.`, "success");
+    setPreviewData(null);
+    setPreviewPackageName("");
+    void loadFiles();
+    if (selectedFile) {
+      void loadContent(selectedFile);
+    }
+  };
+
+  const handlePreviewDiscarded = () => {
+    onLog(`Discarded preview for ${previewPackageName}.`, "info");
+    setPreviewData(null);
+    setPreviewPackageName("");
   };
 
   const openChangedFile = (file: ChangedFile) => {
@@ -178,6 +194,14 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
 
   return (
     <main className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
+      {previewData && (
+        <DiffReviewPanel
+          preview={previewData}
+          onApplied={handlePreviewApplied}
+          onDiscarded={handlePreviewDiscarded}
+          onError={(message) => onLog(message, "error")}
+        />
+      )}
       <div className="flex h-11 shrink-0 items-center justify-between border-b bg-card px-3">
         <button
           onClick={onBack}
