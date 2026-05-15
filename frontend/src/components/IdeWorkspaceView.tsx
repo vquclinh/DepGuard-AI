@@ -279,19 +279,17 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
         </aside>
 
         <section className="relative flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-[#101010] lg:border-b-0 lg:border-r">
-          <div className="flex h-10 shrink-0 items-center justify-between border-b bg-card px-3">
-            <div className="flex min-w-0 items-center gap-2">
-              <GitCompareArrows className="h-4 w-4 shrink-0" />
-              <div className="min-w-0">
-                <h2 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                  {previewData ? "Review Changes" : currentChangedFile ? "Diff Viewer" : "Editor"}
-                </h2>
-                <p className="truncate text-xs text-muted-foreground">
-                  {previewData ? `${previewData.package} ${previewData.from_version} -> ${previewData.to_version}` : selectedFile || "Select a file"}
-                </p>
+          {!previewData && (
+            <div className="flex h-10 shrink-0 items-center justify-between border-b bg-card px-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <GitCompareArrows className="h-4 w-4 shrink-0" />
+                <div className="min-w-0">
+                  <h2 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    {currentChangedFile ? "Diff Viewer" : "Editor"}
+                  </h2>
+                  <p className="truncate text-xs text-muted-foreground">{selectedFile || "Select a file"}</p>
+                </div>
               </div>
-            </div>
-            {!previewData && (
               <button
                 onClick={() => selectedFile && loadContent(selectedFile)}
                 disabled={!selectedFile || isLoadingContent}
@@ -300,8 +298,8 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
                 {isLoadingContent ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
                 Reload
               </button>
-            )}
-          </div>
+            </div>
+          )}
 
           {previewData ? (
             <DiffReviewPanel
