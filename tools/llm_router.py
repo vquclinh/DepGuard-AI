@@ -40,6 +40,8 @@ _RESPONSE_CACHE: Dict[str, Tuple[LLMResponse, float]] = {}
 CACHE_TTL_SECONDS = 3600  # 1 hour
 
 class LLMRouter:
+    DEFAULT_PROVIDER_ORDER = ["claude", "gemini", "qwen"]
+
     def __init__(self):
         self.claude_api_key = os.getenv("ANTHROPIC_API_KEY")
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
@@ -48,6 +50,9 @@ class LLMRouter:
         self.claude_model = "claude-sonnet-4-20250514"
         self.gemini_model = "gemini-2.0-flash"
         self.provider_order = self._parse_provider_order(os.getenv("LLM_PROVIDER_ORDER"))
+        self.enable_claude = self._env_bool("ENABLE_CLAUDE", True)
+        self.enable_gemini = self._env_bool("ENABLE_GEMINI", True)
+        self.enable_qwen = self._env_bool("ENABLE_QWEN", True)
         self.qwen_timeout = httpx.Timeout(
             connect=self._env_float("QWEN_CONNECT_TIMEOUT", 5.0),
             read=self._env_float("QWEN_READ_TIMEOUT", 60.0),
@@ -56,7 +61,11 @@ class LLMRouter:
         )
 
         self.skip_claude = False
-        self.skip_gemini = self._env_bool("DISABLE_GEMINI") or self._env_bool("LLM_DISABLE_GEMINI")
+        self.skip_gemini = (
+            not self.enable_gemini
+            or self._env_bool("DISABLE_GEMINI", False)
+            or self._env_bool("LLM_DISABLE_GEMINI", False)
+        )
         self.skip_qwen = False
         self.qwen_status = "not_configured"
         self.qwen_headers = {"ngrok-skip-browser-warning": "true"}
@@ -67,13 +76,13 @@ class LLMRouter:
         else:
             self.gemini_client = None
 
-        if self.claude_api_key:
+        if self.claude_api_key and self.enable_claude:
             self.anthropic_client = AsyncAnthropic(api_key=self.claude_api_key)
         else:
             self.anthropic_client = None
             self.skip_claude = True
 
-        if self.qwen_base_url:
+        if self.qwen_base_url and self.enable_qwen:
             self.qwen_client = AsyncOpenAI(
                 base_url=f"{self.qwen_base_url}/v1",
                 api_key="not-needed",
@@ -85,7 +94,7 @@ class LLMRouter:
             self.qwen_client = None
 
         # Determine Qwen status on init if possible 
-        if self.qwen_base_url:
+        if self.qwen_base_url and self.enable_qwen:
             self.qwen_status = "available"
             try:
                 # Fast timeout sync check
@@ -110,8 +119,11 @@ class LLMRouter:
             base_url = base_url[:-3].rstrip("/")
         return base_url or None
 
-    def _env_bool(self, name: str) -> bool:
-        return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    def _env_bool(self, name: str, default: bool = False) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
 
     def _env_float(self, name: str, default: float) -> float:
         try:
@@ -129,6 +141,16 @@ class LLMRouter:
             if provider in allowed and provider not in order:
                 order.append(provider)
         return order or None
+
+    def _enabled_providers(self) -> set[str]:
+        providers = set()
+        if self.enable_claude:
+            providers.add("claude")
+        if self.enable_gemini:
+            providers.add("gemini")
+        if self.enable_qwen:
+            providers.add("qwen")
+        return providers
 
     def _get_cache_key(self, system_prompt: str, user_prompt: str) -> str:
         combined = f"{system_prompt}|||{user_prompt}"
@@ -224,16 +246,9 @@ class LLMRouter:
 
     # Choose the order of models
     def _get_routing_order(self, task_type: str) -> List[str]:
-        if self.provider_order:
-            return self.provider_order
-
-        if self.qwen_base_url:
-            return ["qwen", "claude", "gemini"]
-
-        if task_type == "patch_simple":
-            return ["qwen", "gemini", "claude"]
-        else: # "changelog", "patch_complex", "general"
-            return ["claude", "gemini", "qwen"]
+        order = self.provider_order or self.DEFAULT_PROVIDER_ORDER
+        enabled = self._enabled_providers()
+        return [provider for provider in order if provider in enabled]
 
     async def complete(
         self,
@@ -306,7 +321,10 @@ class LLMRouter:
         providers = []
         
         # Claude
-        claude_status = "available" if self.claude_api_key and not self.skip_claude else "not_configured"
+        if not self.enable_claude:
+            claude_status = "disabled"
+        else:
+            claude_status = "available" if self.claude_api_key and not self.skip_claude else "not_configured"
         providers.append({
             "name": "claude",
             "status": claude_status,
@@ -316,7 +334,7 @@ class LLMRouter:
         })
         
         # Gemini
-        if self.skip_gemini:
+        if not self.enable_gemini or self.skip_gemini:
             gemini_status = "disabled"
         else:
             gemini_status = "available" if self.gemini_api_key else "not_configured"
@@ -329,7 +347,10 @@ class LLMRouter:
         })
         
         # Qwen
-        qwen_status = "temporarily_unavailable" if self.skip_qwen else self.qwen_status
+        if not self.enable_qwen:
+            qwen_status = "disabled"
+        else:
+            qwen_status = "temporarily_unavailable" if self.skip_qwen else self.qwen_status
         providers.append({
             "name": "qwen",
             "status": qwen_status,

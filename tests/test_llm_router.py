@@ -13,6 +13,11 @@ def mock_env(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-claude")
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
     monkeypatch.setenv("QWEN_BASE_URL", "http://test-qwen")
+    monkeypatch.setenv("ENABLE_CLAUDE", "true")
+    monkeypatch.setenv("ENABLE_GEMINI", "true")
+    monkeypatch.setenv("ENABLE_QWEN", "true")
+    monkeypatch.delenv("DISABLE_GEMINI", raising=False)
+    monkeypatch.delenv("LLM_DISABLE_GEMINI", raising=False)
 
 @pytest.fixture
 def router_setup(mock_env):
@@ -105,6 +110,7 @@ async def test_cache_hit(router_setup):
 @pytest.mark.asyncio
 async def test_task_type_patch_simple_qwen_first(router_setup):
     router = router_setup
+    router.provider_order = ["qwen", "gemini", "claude"]
     router._call_claude = AsyncMock()
     router._call_gemini = AsyncMock()
     router._call_qwen = AsyncMock(return_value="Qwen easy patch")
@@ -133,26 +139,48 @@ async def test_task_type_patch_complex_claude_first(router_setup):
     router._call_qwen.assert_not_called()
 
 @pytest.mark.asyncio
-async def test_qwen_is_first_when_configured_by_default(router_setup):
+async def test_quality_order_is_default_even_when_qwen_is_configured(router_setup):
     router = router_setup
+    router._call_claude = AsyncMock(return_value="Claude default")
     router._call_qwen = AsyncMock(return_value="Qwen default")
-    router._call_claude = AsyncMock()
     router._call_gemini = AsyncMock()
 
     resp = await router.complete("sys", "user")
 
-    assert resp.provider == "qwen"
+    assert resp.provider == "claude"
     assert resp.fallback_used is False
-    router._call_qwen.assert_called_once()
-    router._call_claude.assert_not_called()
+    router._call_claude.assert_called_once()
+    router._call_qwen.assert_not_called()
     router._call_gemini.assert_not_called()
 
 
 def test_provider_status_order_matches_routing(router_setup):
     providers = router_setup.get_providers_status()
 
-    assert [provider["name"] for provider in providers] == ["qwen", "claude", "gemini"]
+    assert [provider["name"] for provider in providers] == ["claude", "gemini", "qwen"]
     assert providers[0]["priority"] == 1
+
+
+def test_env_switches_can_make_qwen_the_only_provider(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-claude")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
+    monkeypatch.setenv("QWEN_BASE_URL", "http://test-qwen")
+    monkeypatch.setenv("ENABLE_CLAUDE", "false")
+    monkeypatch.setenv("ENABLE_GEMINI", "false")
+    monkeypatch.setenv("ENABLE_QWEN", "true")
+    monkeypatch.setenv("LLM_PROVIDER_ORDER", "claude,gemini,qwen")
+
+    with patch("httpx.get") as mock_get:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_get.return_value = mock_response
+        router = LLMRouter()
+
+    assert router._get_routing_order("patch_complex") == ["qwen"]
+    providers = {provider["name"]: provider for provider in router.get_providers_status()}
+    assert providers["claude"]["status"] == "disabled"
+    assert providers["gemini"]["status"] == "disabled"
+    assert providers["qwen"]["status"] == "available"
 
 @pytest.mark.asyncio
 async def test_qwen_skipped_gracefully_when_no_url(monkeypatch):
