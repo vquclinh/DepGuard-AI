@@ -1,6 +1,7 @@
 import logging
 import re
 from collections import defaultdict
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
@@ -236,6 +237,7 @@ class ASTScanner:
     def find_api_usages(self, root_folder: str, package_name: str) -> list[str]:
         root = Path(root_folder)
         all_used_apis = set()
+        package_roots = self._package_import_roots(package_name)
 
         if not root.exists() or not root.is_dir():
             logger.error("Invalid directory: %s", root_folder)
@@ -251,7 +253,7 @@ class ASTScanner:
             language = self.detect_language(str(filepath))
             ignored_ranges = self._ignored_ranges(language, content)
             aliases = self._extract_aliases(content)
-            all_used_apis.update(self._find_package_usages(content, package_name, aliases, ignored_ranges))
+            all_used_apis.update(self._find_package_usages(content, package_name, package_roots, aliases, ignored_ranges))
 
         return sorted(all_used_apis)
 
@@ -487,6 +489,7 @@ class ASTScanner:
         self,
         content: str,
         package_name: str,
+        package_roots: set[str],
         aliases: dict[str, str],
         ignored_ranges: list[tuple[int, int]],
     ) -> set[str]:
@@ -494,27 +497,99 @@ class ASTScanner:
             return set()
 
         usages = set()
-        escaped = re.escape(package_name)
-        for match in re.finditer(rf"(?<![\w$]){escaped}(?:[.:/][A-Za-z_$][\w$-]*)*", content):
-            if self._is_ignored_offset(match.start(), ignored_ranges):
-                continue
-            usages.add(match.group(0))
+        for package_root in package_roots:
+            escaped = re.escape(package_root)
+            for match in re.finditer(rf"(?<![\w$]){escaped}(?:[.:/][A-Za-z_$][\w$-]*)*", content):
+                if self._is_ignored_offset(match.start(), ignored_ranges):
+                    continue
+                usages.add(match.group(0))
 
         for alias, real_name in aliases.items():
-            if real_name == package_name or real_name.startswith(f"{package_name}.") or real_name.startswith(f"{package_name}/"):
+            if self._real_name_matches_package(real_name, package_name, package_roots):
                 usages.add(real_name)
                 for match in re.finditer(rf"(?<![\w$]){re.escape(alias)}((?:\.[A-Za-z_$][\w$]*)+)", content):
                     if self._is_ignored_offset(match.start(), ignored_ranges):
                         continue
                     usages.add(f"{real_name}{match.group(1)}")
 
-        usages.update(self._find_alias_dataflow_usages(content, package_name, aliases, ignored_ranges))
+        usages.update(self._find_alias_dataflow_usages(content, package_name, package_roots, aliases, ignored_ranges))
         return usages
+
+    def _package_import_roots(self, package_name: str) -> set[str]:
+        roots = {
+            package_name,
+            package_name.replace("-", "_"),
+            package_name.replace("_", "-"),
+        }
+        roots.update(self._distribution_import_roots(package_name))
+        return {root for root in roots if root}
+
+    def _distribution_import_roots(self, package_name: str) -> set[str]:
+        """Read generic distribution -> import root metadata when available.
+
+        Python distribution names and import package names do not always match.
+        Wheels commonly expose that mapping through top_level.txt, so using it
+        lets DepGuard resolve packages like any other Python tool would without
+        carrying package-specific aliases.
+        """
+        roots: set[str] = set()
+        try:
+            distribution = importlib_metadata.distribution(package_name)
+        except importlib_metadata.PackageNotFoundError:
+            return roots
+        except Exception as exc:
+            logger.debug("Could not inspect distribution metadata for %s: %s", package_name, exc)
+            return roots
+
+        try:
+            top_level = distribution.read_text("top_level.txt") or ""
+        except Exception as exc:
+            logger.debug("Could not read top_level.txt for %s: %s", package_name, exc)
+            top_level = ""
+
+        for line in top_level.splitlines():
+            root = line.strip()
+            if re.match(r"^[A-Za-z_][\w$-]*$", root):
+                roots.add(root)
+        return roots
+
+    def _real_name_matches_package(
+        self,
+        real_name: str,
+        package_name: str,
+        package_roots: set[str],
+    ) -> bool:
+        real_root = re.split(r"[./:]+", real_name, maxsplit=1)[0]
+        if self._real_name_has_known_root(real_name, package_roots):
+            return True
+
+        root_norm = self._normalize_package_token(real_root)
+        package_norm = self._normalize_package_token(package_name)
+        if len(root_norm) < 3 or not package_norm:
+            return False
+        return (
+            package_norm.startswith(root_norm)
+            or package_norm.endswith(root_norm)
+            or root_norm in package_norm
+        )
+
+    def _real_name_has_known_root(self, real_name: str, package_roots: set[str]) -> bool:
+        return any(
+            real_name == root
+            or real_name.startswith(f"{root}.")
+            or real_name.startswith(f"{root}/")
+            or real_name.startswith(f"{root}::")
+            for root in package_roots
+        )
+
+    def _normalize_package_token(self, value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
 
     def _find_alias_dataflow_usages(
         self,
         content: str,
         package_name: str,
+        package_roots: set[str],
         aliases: dict[str, str],
         ignored_ranges: list[tuple[int, int]],
     ) -> set[str]:
@@ -533,21 +608,33 @@ class ASTScanner:
         straightforward constructor assignments and reassignment chains without
         pretending to be a full type checker.
         """
-        package_aliases = {
-            package_name: package_name,
-        }
+        package_aliases = {root: root for root in package_roots}
         for alias, real_name in aliases.items():
-            if real_name == package_name or real_name.startswith(f"{package_name}.") or real_name.startswith(f"{package_name}/"):
+            if self._real_name_matches_package(real_name, package_name, package_roots):
                 package_aliases[alias] = real_name
 
         usages: set[str] = set()
-        variable_types = self._infer_package_variable_types(
+        class_bases = self._infer_package_class_bases(
             content,
-            package_name,
             package_aliases,
             ignored_ranges,
         )
+        usages.update(class_bases.values())
+
+        variable_types = self._infer_package_variable_types(
+            content,
+            package_roots,
+            package_aliases,
+            class_bases,
+            ignored_ranges,
+        )
         usages.update(variable_types.values())
+
+        for class_name, resolved_base in class_bases.items():
+            for match in re.finditer(rf"(?<![\w$]){re.escape(class_name)}\.([A-Za-z_$][\w$]*)\s*\(", content):
+                if self._is_ignored_offset(match.start(), ignored_ranges):
+                    continue
+                usages.add(f"{resolved_base}.{match.group(1)}")
 
         for variable, resolved_type in variable_types.items():
             for match in re.finditer(rf"(?<![\w$]){re.escape(variable)}\.([A-Za-z_$][\w$]*)\s*\(", content):
@@ -568,11 +655,71 @@ class ASTScanner:
 
         return usages
 
+    def _infer_package_class_bases(
+        self,
+        content: str,
+        package_aliases: dict[str, str],
+        ignored_ranges: list[tuple[int, int]],
+    ) -> dict[str, str]:
+        class_bases: dict[str, str] = {}
+        class_pattern = re.compile(
+            r"(?m)^\s*class\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*:"
+        )
+
+        for match in class_pattern.finditer(content):
+            if self._is_ignored_offset(match.start(), ignored_ranges):
+                continue
+            class_name = match.group(1)
+            bases = self._split_top_level_commas(match.group(2))
+            for base in bases:
+                resolved = self._resolve_package_expression(base.strip(), package_aliases, class_bases)
+                if resolved:
+                    class_bases[class_name] = resolved
+                    break
+
+        for _ in range(3):
+            changed = False
+            for class_name, resolved_base in list(class_bases.items()):
+                chained = class_bases.get(resolved_base)
+                if chained and chained != resolved_base:
+                    class_bases[class_name] = chained
+                    changed = True
+            if not changed:
+                break
+
+        return class_bases
+
+    def _resolve_package_expression(
+        self,
+        expression: str,
+        package_aliases: dict[str, str],
+        class_bases: dict[str, str] | None = None,
+    ) -> str:
+        expression = expression.strip()
+        expression = re.sub(r"\[.*\]$", "", expression).strip()
+        expression = expression.split("(", 1)[0].strip()
+        if not expression:
+            return ""
+
+        class_bases = class_bases or {}
+        if expression in class_bases:
+            return class_bases[expression]
+        if expression in package_aliases:
+            return package_aliases[expression]
+
+        for alias, real_name in package_aliases.items():
+            if expression.startswith(f"{alias}."):
+                return f"{real_name}{expression[len(alias):]}"
+            if expression.startswith(f"{alias}::"):
+                return f"{real_name}{expression[len(alias):]}"
+        return ""
+
     def _infer_package_variable_types(
         self,
         content: str,
-        package_name: str,
+        package_roots: set[str],
         package_aliases: dict[str, str],
+        class_bases: dict[str, str],
         ignored_ranges: list[tuple[int, int]],
     ) -> dict[str, str]:
         variable_types: dict[str, str] = {}
@@ -584,11 +731,21 @@ class ASTScanner:
                 rf"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*{alias_pattern}\.([A-Za-z_$][\w$]*)\s*\(",
                 f"{real_name}.{{constructor}}",
             ))
-            if real_name.startswith(f"{package_name}."):
+            if self._real_name_has_known_root(real_name, package_roots):
                 assignment_patterns.append((
                     rf"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*{alias_pattern}\s*\(",
                     real_name,
                 ))
+        for class_name, resolved_base in class_bases.items():
+            class_pattern = re.escape(class_name)
+            assignment_patterns.append((
+                rf"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*{class_pattern}\s*\(",
+                resolved_base,
+            ))
+            assignment_patterns.append((
+                rf"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*{class_pattern}\.[A-Za-z_$][\w$]*\s*\(",
+                resolved_base,
+            ))
 
         for pattern, type_template in assignment_patterns:
             for match in re.finditer(pattern, content):
@@ -642,8 +799,9 @@ class ASTScanner:
         package_name, package_aliases = self._package_aliases_for_old_api(old_api, aliases)
         variable_types = self._infer_package_variable_types(
             content,
-            package_name,
+            {package_name},
             package_aliases,
+            self._infer_package_class_bases(content, package_aliases, ignored_ranges),
             ignored_ranges,
         )
 
@@ -652,6 +810,13 @@ class ASTScanner:
             if resolved_type != type_path:
                 continue
             pattern = rf"(?<![\w$]){re.escape(variable)}\.{re.escape(method_name)}\s*\("
+            matches.extend(re.finditer(pattern, content))
+
+        class_bases = self._infer_package_class_bases(content, package_aliases, ignored_ranges)
+        for class_name, resolved_base in class_bases.items():
+            if resolved_base != type_path:
+                continue
+            pattern = rf"(?<![\w$]){re.escape(class_name)}\.{re.escape(method_name)}\s*\("
             matches.extend(re.finditer(pattern, content))
 
         constructor = parts[-2]
@@ -799,6 +964,30 @@ class ASTScanner:
                 depth += 1
             elif char == "}":
                 depth -= 1
+            elif char == "," and depth == 0:
+                item = text[start:index].strip()
+                if item:
+                    items.append(item)
+                start = index + 1
+        tail = text[start:].strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    def _split_top_level_commas(self, text: str) -> list[str]:
+        items: list[str] = []
+        start = 0
+        depth = 0
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        closing = {")": "(", "]": "[", "}": "{"}
+        stack: list[str] = []
+        for index, char in enumerate(text):
+            if char in pairs:
+                stack.append(char)
+                depth += 1
+            elif char in closing and stack and stack[-1] == closing[char]:
+                stack.pop()
+                depth = max(0, depth - 1)
             elif char == "," and depth == 0:
                 item = text[start:index].strip()
                 if item:

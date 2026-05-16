@@ -81,6 +81,8 @@ class ScoutAgent:
         self.evidence_max_chunks = self._env_int("SCOUT_EVIDENCE_MAX_CHUNKS", 14)
         self.docs_url_fetch_limit = self._env_int("SCOUT_DOCS_URL_FETCH_LIMIT", 10)
         self.github_tree_doc_limit = self._env_int("SCOUT_GITHUB_TREE_DOC_LIMIT", 12)
+        self.old_api_doc_fetch_limit = self._env_int("SCOUT_OLD_API_DOC_FETCH_LIMIT", 18)
+        self.old_api_doc_max_chars = self._env_int("SCOUT_OLD_API_DOC_MAX_CHARS", 6000)
 
     def _env_int(self, name: str, default: int) -> int:
         try:
@@ -153,6 +155,14 @@ class ScoutAgent:
 
         if host in {"github.com", "www.github.com"} or host.endswith("@github.com"):
             parts = path.split("/")
+            if parts and parts[0].lower() in {
+                "about", "apps", "collections", "contact", "customer-stories",
+                "enterprise", "events", "explore", "features", "login",
+                "marketplace", "new", "notifications", "orgs", "pricing",
+                "pulls", "search", "security", "settings", "sponsors",
+                "topics", "trending",
+            }:
+                return ""
             if len(parts) >= 2:
                 repo = parts[1].removesuffix(".git")
                 return f"https://github.com/{parts[0]}/{repo}"
@@ -304,7 +314,7 @@ class ScoutAgent:
 
     async def _fetch_text_url(self, client: httpx.AsyncClient, url: str, max_chars: int) -> str:
         try:
-            response = await client.get(url, timeout=10.0)
+            response = await client.get(url, timeout=10.0, follow_redirects=True)
             if response.status_code != 200:
                 return ""
             text = response.text or ""
@@ -476,6 +486,18 @@ class ScoutAgent:
             "docs/source/release/{version}.rst",
             "doc/release/{version}-notes.rst",
             "docs/release/{version}-notes.rst",
+            "doc/releasenotes/{version}.rst",
+            "docs/releasenotes/{version}.rst",
+            "doc/release-notes/{version}.rst",
+            "docs/release-notes/{version}.rst",
+            "doc/release_notes/{version}.rst",
+            "docs/release_notes/{version}.rst",
+            "doc/releasenotes/{version}.md",
+            "docs/releasenotes/{version}.md",
+            "doc/release-notes/{version}.md",
+            "docs/release-notes/{version}.md",
+            "doc/release_notes/{version}.md",
+            "docs/release_notes/{version}.md",
             "docs/releases/{version}.md",
             "release/{version}.md",
             "releases/{version}.md",
@@ -487,7 +509,7 @@ class ScoutAgent:
         api_usages: Optional[list[str]],
         api_contexts: Optional[list[dict]] = None,
     ) -> list[str]:
-        symbols = self._api_symbols(api_usages, api_contexts)
+        symbols = self._api_symbols(api_usages, None)
         templates = [
             "docs/api/{slug}.md",
             "docs/api/{slug}.rst",
@@ -510,6 +532,120 @@ class ScoutAgent:
                     api=api,
                 ))
         return self._dedupe_paths(candidates)
+
+    def _api_doc_url_candidates(
+        self,
+        references: list[dict],
+        package: str,
+        ecosystem: str,
+        current_version: str,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> list[tuple[str, str, str]]:
+        version = self._clean_version(current_version)
+        if not version:
+            return []
+
+        docs_bases = set()
+        for reference in references:
+            url = (reference.get("url") or "").strip()
+            if self._is_docs_like_url(url):
+                base = self._docs_base_url(url) or url.rstrip("/")
+                if base:
+                    docs_bases.add(base.rstrip("/"))
+
+        candidates: list[tuple[str, str, str]] = []
+        ecosystem_key = (ecosystem or "").lower()
+        symbols = self._api_symbols(api_usages, None)
+
+        if ecosystem_key == "cargo":
+            for symbol in symbols:
+                slug = self._slugify_symbol(symbol)
+                candidates.extend([
+                    (symbol, f"docs.rs {symbol} {version}", f"https://docs.rs/{package}/{version}/{slug}.html"),
+                    (symbol, f"docs.rs {symbol} {version}", f"https://docs.rs/{package}/{version}/{symbol.replace('::', '/').replace('.', '/')}.html"),
+                ])
+        elif ecosystem_key == "go":
+            for symbol in symbols:
+                parts = [part for part in re.split(r"[.:/]+", symbol) if part]
+                anchor = parts[-1] if parts else ""
+                if anchor:
+                    candidates.append((symbol, f"pkg.go.dev {symbol} {version}", f"https://pkg.go.dev/{package}@{version}#{anchor}"))
+        elif ecosystem_key == "maven" and ":" in package:
+            group, artifact = package.split(":", 1)
+            for symbol in symbols:
+                api_path = symbol.replace(".", "/")
+                candidates.append((symbol, f"javadoc {symbol} {version}", f"https://javadoc.io/doc/{group}/{artifact}/{version}/{api_path}.html"))
+
+        for base in sorted(docs_bases):
+            for symbol in symbols:
+                api = symbol.replace("/", ".").replace("::", ".")
+                slug = self._slugify_symbol(symbol)
+                api_path = api.replace(".", "/")
+                for suffix in [
+                    f"{version}/reference/api/{api}.html",
+                    f"v{version}/reference/api/{api}.html",
+                    f"version/{version}/reference/api/{api}.html",
+                    f"{version}/reference/generated/{api}.html",
+                    f"v{version}/reference/generated/{api}.html",
+                    f"reference/api/{api}.html",
+                    f"reference/generated/{api}.html",
+                    f"{version}/api/{slug}/",
+                    f"v{version}/api/{slug}/",
+                    f"{version}/reference/{slug}/",
+                    f"v{version}/reference/{slug}/",
+                    f"{version}/{api_path}.html",
+                    f"v{version}/{api_path}.html",
+                    f"api/{slug}/",
+                    f"reference/{slug}/",
+                    f"{slug}/",
+                ]:
+                    candidates.append((symbol, f"Old docs for {symbol}", f"{base}/{suffix.lstrip('/')}"))
+
+        seen = set()
+        deduped = []
+        for api, title, url in candidates:
+            normalized = url.rstrip("/")
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append((api, title, normalized))
+        return deduped[: self.old_api_doc_fetch_limit]
+
+    async def _fetch_old_api_doc_references(
+        self,
+        client: httpx.AsyncClient,
+        references: list[dict],
+        package: str,
+        ecosystem: str,
+        current_version: str,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> list[dict]:
+        fetched = []
+        for api, title, url in self._api_doc_url_candidates(
+            references,
+            package,
+            ecosystem,
+            current_version,
+            api_usages,
+            api_contexts,
+        ):
+            content = await self._fetch_text_url(client, url, self.old_api_doc_max_chars)
+            if not content.strip():
+                continue
+            fetched.append({
+                "source": "docs",
+                "title": title,
+                "url": url,
+                "content": content,
+                "document_kind": "api_docs",
+                "api": api,
+                "version": self._clean_version(current_version),
+                "role": "old_api_docs",
+                "discovery": "old_api_semantics",
+            })
+        return fetched
 
     def _api_symbols(
         self,
@@ -552,6 +688,223 @@ class ScoutAgent:
         value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
         value = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower()
         return value or "api"
+
+    def _semantic_terms_from_text(self, text: str, limit: int = 20) -> list[str]:
+        normalized = self._normalized_evidence_text(text)
+        stopwords = {
+            "about", "above", "after", "again", "against", "all", "also", "and", "any",
+            "are", "because", "been", "being", "between", "both", "but", "can", "class",
+            "code", "data", "def", "does", "each", "from", "function", "have", "import", "into",
+            "its", "may", "method", "must", "not", "object", "only", "other", "over",
+            "package", "parameter", "parameters", "return", "returns", "same", "self",
+            "should", "that", "the", "their", "then", "this", "through", "type", "use",
+            "used", "using", "value", "values", "when", "where", "which", "with", "without",
+            "typing", "none", "true", "false",
+        }
+        tokens = [
+            token
+            for token in re.findall(r"[a-z][a-z0-9_]{2,}", normalized)
+            if token not in stopwords and not token.isdigit()
+        ]
+        weighted: dict[str, int] = {}
+        for token in tokens:
+            weighted[token] = weighted.get(token, 0) + 1
+        phrases: dict[str, int] = {}
+        for size in (2, 3):
+            for index in range(0, max(0, len(tokens) - size + 1)):
+                phrase = " ".join(tokens[index:index + size])
+                if len(phrase) > 8:
+                    phrases[phrase] = phrases.get(phrase, 0) + size
+        ranked = sorted(
+            {**weighted, **phrases}.items(),
+            key=lambda item: (item[1], len(item[0])),
+            reverse=True,
+        )
+        return [term for term, _score in ranked[:limit]]
+
+    def _extract_doc_section(self, text: str, heading_pattern: str, max_chars: int = 1200) -> str:
+        lines = text.splitlines()
+        start_index = -1
+        heading_re = re.compile(heading_pattern, re.IGNORECASE)
+        for index, line in enumerate(lines):
+            if heading_re.search(line.strip()):
+                start_index = index + 1
+                break
+        if start_index < 0:
+            return ""
+        collected = []
+        for line in lines[start_index:]:
+            stripped = line.strip()
+            if collected and re.match(r"^(#{1,6}\s+|[A-Z][A-Za-z ]{2,}:?$)", stripped):
+                break
+            if re.match(r"^-{3,}$|^~{3,}$|^\^{3,}$", stripped):
+                continue
+            collected.append(line)
+            if len("\n".join(collected)) >= max_chars:
+                break
+        return "\n".join(collected).strip()[:max_chars]
+
+    def _purpose_from_old_doc(self, api: str, content: str) -> str:
+        if not content.strip():
+            return ""
+        focused = self._semantic_focus_text(content, [api, *self._api_symbols([api])], window=1200)
+        text = focused or content[:1800]
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not re.match(r"^[#=`~*\- ]+$", line.strip())
+        ]
+        joined = " ".join(lines)
+        sentences = re.split(r"(?<=[.!?])\s+", joined)
+        purpose = " ".join(sentence for sentence in sentences[:3] if sentence).strip()
+        return purpose[:900]
+
+    def _semantic_focus_text(self, content: str, terms: list[str], window: int = 900) -> str:
+        lowered = content.lower()
+        windows = []
+        for term in terms:
+            term_lower = (term or "").lower()
+            if not term_lower:
+                continue
+            index = lowered.find(term_lower)
+            if index >= 0:
+                windows.append((max(0, index - window), min(len(content), index + len(term) + window)))
+        if not windows:
+            return ""
+        start = min(item[0] for item in windows)
+        end = max(item[1] for item in windows)
+        return content[start:end].strip()
+
+    def _api_semantics_from_references(
+        self,
+        api_usages: Optional[list[str]],
+        old_doc_references: list[dict],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> list[dict]:
+        semantics = []
+        docs_by_api: dict[str, list[dict]] = {}
+        for reference in old_doc_references:
+            api = str(reference.get("api", "") or "").strip()
+            if api:
+                docs_by_api.setdefault(api, []).append(reference)
+
+        for usage in api_usages or []:
+            usage = (usage or "").strip()
+            if not usage:
+                continue
+            docs = docs_by_api.get(usage, [])
+            if not docs:
+                docs = [
+                    reference for reference in old_doc_references
+                    if usage.lower() in self._normalized_evidence_text(
+                        " ".join([
+                            str(reference.get("title", "")),
+                            str(reference.get("url", "")),
+                            str(reference.get("content", ""))[:1000],
+                        ])
+                    )
+                ]
+
+            if docs:
+                reference = docs[0]
+                content = str(reference.get("content", "") or "")
+                purpose = self._purpose_from_old_doc(usage, content)
+                parameters = self._extract_doc_section(content, r"^(parameters?|arguments?|args?)\b")
+                returns = self._extract_doc_section(content, r"^(returns?|return value|result)\b")
+                behavior = "\n".join(filter(None, [purpose, parameters[:400], returns[:300]])).strip()
+                terms = self._semantic_terms_from_text(behavior or purpose)
+                semantics.append({
+                    "api": usage,
+                    "source": "old_version_docs",
+                    "confidence": "high" if purpose else "medium",
+                    "purpose": purpose,
+                    "behavior": behavior,
+                    "parameters": parameters,
+                    "returns": returns,
+                    "search_terms": terms,
+                    "docs": [{
+                        "title": reference.get("title", ""),
+                        "url": reference.get("url", ""),
+                    }],
+                })
+                continue
+
+            fallback = self._api_semantics_from_code_context(usage, api_contexts)
+            if fallback:
+                semantics.append(fallback)
+
+        return semantics
+
+    def _api_semantics_from_code_context(
+        self,
+        api: str,
+        api_contexts: Optional[list[dict]],
+    ) -> dict | None:
+        matched_contexts = []
+        api_last = self._slugify_symbol(api)
+        for context in api_contexts or []:
+            if not isinstance(context, dict):
+                continue
+            context_api = str(context.get("api", "") or context.get("old_api", "") or "")
+            text = "\n".join([
+                str(context.get("code_snippet", "") or ""),
+                str(context.get("context", "") or ""),
+                str(context.get("matched_text", "") or ""),
+            ])
+            if context_api == api or api_last in self._normalized_evidence_text(text):
+                matched_contexts.append(context)
+        if not matched_contexts:
+            return None
+        snippets = "\n".join(
+            str(context.get("context") or context.get("code_snippet") or "")
+            for context in matched_contexts[:3]
+        )
+        meaningful_lines = [
+            line.strip()
+            for line in snippets.splitlines()
+            if line.strip()
+            and not line.strip().startswith(("import ", "from "))
+            and not line.strip().startswith("#")
+        ]
+        meaningful_text = "\n".join(meaningful_lines)
+        call_names = re.findall(r"\.([A-Za-z_]\w*)\s*\(", meaningful_text)
+        keyword_args = re.findall(r"\b([A-Za-z_]\w*)\s*=", snippets)
+        parts = [part for part in re.split(r"[.:/]+", api) if part]
+        method = parts[-1] if parts else api_last
+        owner = parts[-2] if len(parts) >= 2 else ""
+        subclass_names = re.findall(r"\bclass\s+([A-Za-z_]\w*)\s*\([^)]*\b" + re.escape(method) + r"\b[^)]*\)", snippets)
+        fields = [
+            name
+            for name in re.findall(r"^\s*([A-Za-z_]\w*)\s*:\s*[^=\n]+", meaningful_text, re.MULTILINE)
+            if name not in {"self", "cls"}
+        ]
+        functions = re.findall(r"\bdef\s+([A-Za-z_]\w*)\s*\(", meaningful_text)
+        purpose = " ".join(filter(None, [
+            f"Project code uses {method}",
+            f"on {owner}" if owner else "",
+            f"through subclasses {', '.join(sorted(set(subclass_names)))}" if subclass_names else "",
+            f"inside functions {', '.join(sorted(set(functions)))}" if functions else "",
+            f"with fields {', '.join(sorted(set(fields)))}" if fields else "",
+            f"with keyword arguments {', '.join(sorted(set(keyword_args)))}" if keyword_args else "",
+        ])).strip()
+        terms = self._semantic_terms_from_text(" ".join([
+            purpose,
+            meaningful_text,
+            " ".join(call_names),
+            " ".join(keyword_args),
+            " ".join(fields),
+        ]))
+        return {
+            "api": api,
+            "source": "code_context",
+            "confidence": "low",
+            "purpose": purpose,
+            "behavior": meaningful_text[:1000],
+            "parameters": ", ".join(sorted(set(keyword_args))),
+            "returns": "",
+            "search_terms": terms,
+            "docs": [],
+        }
 
     async def _fetch_github_tree_docs(
         self,
@@ -633,6 +986,8 @@ class ScoutAgent:
             score += 10
         if lowered.startswith(("docs/", "doc/")):
             score += 5
+        if self._versions_from_text(path):
+            score += 20
 
         for version in self._candidate_version_strings(current_version, latest_version):
             if version and version in lowered:
@@ -674,6 +1029,9 @@ class ScoutAgent:
             if low[0] == high[0] and 0 <= high[1] - low[1] <= 12:
                 for minor in range(low[1], high[1] + 1):
                     raw_versions.append(f"{low[0]}.{minor}.0")
+            elif 0 < high[0] - low[0] <= 12:
+                for major in range(low[0] + 1, high[0] + 1):
+                    raw_versions.append(f"{major}.0.0")
 
         versions = []
         seen = set()
@@ -855,10 +1213,43 @@ class ScoutAgent:
                 break
         return "\n\n".join(sections)[:max_chars]
 
+    def _format_api_semantics(self, api_semantics: list[dict], max_chars: int = 12000) -> str:
+        if not api_semantics:
+            return "No old-version API semantics were retrieved."
+        sections = []
+        for index, item in enumerate(api_semantics[:16], start=1):
+            if not isinstance(item, dict):
+                continue
+            docs = []
+            for doc in item.get("docs", [])[:2]:
+                if isinstance(doc, dict):
+                    docs.append(" | ".join(filter(None, [
+                        str(doc.get("title", "") or ""),
+                        str(doc.get("url", "") or ""),
+                    ])))
+            block = [
+                f"[{index}] api: {item.get('api', '')}",
+                f"source: {item.get('source', '')}",
+                f"confidence: {item.get('confidence', '')}",
+                f"purpose: {item.get('purpose', '')}",
+                f"behavior: {str(item.get('behavior', '') or '')[:1200]}",
+                f"parameters: {str(item.get('parameters', '') or '')[:700]}",
+                f"returns: {str(item.get('returns', '') or '')[:500]}",
+                f"semantic_search_terms: {', '.join(str(term) for term in (item.get('search_terms', []) or [])[:12])}",
+            ]
+            if docs:
+                block.extend(["docs:", "\n".join(docs)])
+            sections.append("\n".join(block))
+            if len("\n\n".join(sections)) > max_chars:
+                sections.append("... API semantics truncated ...")
+                break
+        return "\n\n".join(sections)[:max_chars]
+
     def _api_search_terms(
         self,
         api_usages: Optional[list[str]],
         api_contexts: Optional[list[dict]] = None,
+        api_semantics: Optional[list[dict]] = None,
     ) -> list[str]:
         terms: set[str] = set()
         for usage in api_usages or []:
@@ -884,6 +1275,16 @@ class ScoutAgent:
             for method in re.findall(r"\.([A-Za-z_]\w*)\s*\(", snippet):
                 if len(method) > 2:
                     terms.add(method)
+        for semantic in api_semantics or []:
+            if not isinstance(semantic, dict):
+                continue
+            for term in semantic.get("search_terms", []) or []:
+                value = str(term or "").strip()
+                if value:
+                    terms.add(value)
+            for key in ("purpose", "behavior", "parameters", "returns"):
+                for term in self._semantic_terms_from_text(str(semantic.get(key, "") or "")):
+                    terms.add(term)
         return sorted(terms, key=lambda item: (-len(item), item))
 
     def _root_package_terms(self, api_usages: Optional[list[str]]) -> set[str]:
@@ -915,7 +1316,8 @@ class ScoutAgent:
             "removed", "remove", "deprecated", "deprecation", "renamed",
             "replaced", "replacement", "instead", "use ", "no longer",
             "breaking", "backwards incompatible", "migration", "upgrade",
-            "changed signature", "signature", "requires", "must",
+            "changed signature", "signature", "requires", "must", "now named",
+            "renamed to", "has been renamed", "has moved", "moved to",
         ])
 
     def _normalized_evidence_text(self, text: str) -> str:
@@ -965,6 +1367,27 @@ class ScoutAgent:
             if min_distance <= 120:
                 score += 35
                 matches.append(f"{profile['owner']}~{profile['method']}")
+        return score, matches
+
+    def _semantic_evidence_score(self, text: str, api_semantics: Optional[list[dict]]) -> tuple[int, list[str]]:
+        normalized = self._normalized_evidence_text(text)
+        score = 0
+        matches = []
+        for semantic in api_semantics or []:
+            if not isinstance(semantic, dict):
+                continue
+            seen_for_api = set()
+            for term in semantic.get("search_terms", []) or []:
+                term = str(term or "").strip()
+                if not term:
+                    continue
+                term_lower = self._normalized_evidence_text(term)
+                if not term_lower or term_lower in seen_for_api:
+                    continue
+                seen_for_api.add(term_lower)
+                if len(term_lower) > 4 and term_lower in normalized:
+                    score += 18 if " " in term_lower else 7
+                    matches.append(term)
         return score, matches
 
     def _split_reference_chunks(self, reference: dict) -> list[dict]:
@@ -1020,6 +1443,7 @@ class ScoutAgent:
         chunk: dict,
         terms: list[str],
         api_usages: Optional[list[str]] = None,
+        api_semantics: Optional[list[dict]] = None,
         current_version: str = "",
         latest_version: str = "",
     ) -> tuple[int, list[str]]:
@@ -1050,6 +1474,9 @@ class ScoutAgent:
         method_score, method_matches = self._method_evidence_score(text, api_usages)
         score += method_score
         matched_terms.extend(method_matches)
+        semantic_score, semantic_matches = self._semantic_evidence_score(text, api_semantics)
+        score += semantic_score
+        matched_terms.extend(semantic_matches)
 
         for version in [self._clean_version(current_version), self._clean_version(latest_version)]:
             if version and version.lower() in lowered:
@@ -1070,16 +1497,19 @@ class ScoutAgent:
         references: list[dict],
         api_usages: Optional[list[str]],
         api_contexts: Optional[list[dict]] = None,
+        api_semantics: Optional[list[dict]] = None,
         current_version: str = "",
         latest_version: str = "",
     ) -> list[dict]:
-        terms = self._api_search_terms(api_usages, api_contexts)
+        terms = self._api_search_terms(api_usages, api_contexts, api_semantics)
         if not terms:
             return []
         root_terms = self._root_package_terms(api_usages)
 
         ranked: list[tuple[int, int, dict]] = []
         for reference_index, reference in enumerate(self._dedupe_references(references), start=1):
+            if reference.get("role") == "old_api_docs":
+                continue
             reference_locator = " ".join([
                 str(reference.get("title", "")),
                 str(reference.get("url", "")),
@@ -1091,6 +1521,7 @@ class ScoutAgent:
                     chunk,
                     terms,
                     api_usages,
+                    api_semantics,
                     current_version,
                     latest_version,
                 )
@@ -1099,13 +1530,30 @@ class ScoutAgent:
                     for term in matched_terms
                     if term.lower() not in root_terms and len(term.strip()) > 2
                 ]
-                if not strong_terms:
-                    if chunk.get("document_kind") == "registry":
+                if chunk.get("document_kind") == "registry":
+                    semantic_score, _semantic_matches = self._semantic_evidence_score(
+                        str(chunk.get("content", "")),
+                        api_semantics,
+                    )
+                    method_score, _method_matches = self._method_evidence_score(
+                        str(chunk.get("content", "")),
+                        api_usages,
+                    )
+                    if method_score < 80 and semantic_score < 36:
                         continue
-                    if not self._has_migration_language(str(chunk.get("content", ""))):
-                        continue
+                if not strong_terms and not self._has_migration_language(str(chunk.get("content", ""))):
+                    continue
                 if score < 10 or not matched_terms:
                     continue
+                semantic_score, semantic_matches = self._semantic_evidence_score(
+                    str(chunk.get("content", "")),
+                    api_semantics,
+                )
+                method_score, method_matches = self._method_evidence_score(
+                    str(chunk.get("content", "")),
+                    api_usages,
+                )
+                confidence = "high" if method_score >= 80 else "medium" if semantic_score >= 18 or method_score >= 35 else "low"
                 ranked.append((score, -reference_index, {
                     "source": chunk.get("source", ""),
                     "title": chunk.get("title") or chunk.get("source") or "Reference",
@@ -1117,6 +1565,8 @@ class ScoutAgent:
                     "matched_terms": sorted(set(matched_terms), key=lambda item: (-len(item), item))[:8],
                     "strong_terms": sorted(set(strong_terms), key=lambda item: (-len(item), item))[:8],
                     "score": score,
+                    "semantic_score": semantic_score,
+                    "evidence_confidence": confidence,
                     "reference_index": reference_index,
                     "chunk_index": chunk_index,
                 }))
@@ -1139,6 +1589,7 @@ class ScoutAgent:
         references: list[dict],
         api_usages: Optional[list[str]],
         api_contexts: Optional[list[dict]] = None,
+        api_semantics: Optional[list[dict]] = None,
         current_version: str = "",
         latest_version: str = "",
     ) -> list[dict]:
@@ -1146,6 +1597,7 @@ class ScoutAgent:
             references,
             api_usages,
             api_contexts,
+            api_semantics,
             current_version,
             latest_version,
         )
@@ -1160,19 +1612,27 @@ class ScoutAgent:
                     "matched_terms": chunk.get("matched_terms", []),
                     "strong_terms": chunk.get("strong_terms", []),
                     "score": chunk.get("score", 0),
+                    "semantic_score": chunk.get("semantic_score", 0),
+                    "evidence_confidence": chunk.get("evidence_confidence", "medium"),
                     "line_start": chunk.get("line_start"),
                     "line_end": chunk.get("line_end"),
                 }
                 for chunk in ranked_chunks
             ]
 
-        terms = self._api_search_terms(api_usages, api_contexts)
+        fallback = self._fallback_breaking_change_evidence(references, current_version, latest_version)
+        if fallback:
+            return fallback
+
+        terms = self._api_search_terms(api_usages, api_contexts, api_semantics)
         if not terms:
             return []
         root_terms = self._root_package_terms(api_usages)
 
         focused = []
         for reference in self._dedupe_references(references):
+            if reference.get("role") == "old_api_docs":
+                continue
             content = (reference.get("content") or "").strip()
             if not content:
                 continue
@@ -1227,9 +1687,61 @@ class ScoutAgent:
                     "document_kind": self._document_kind(reference),
                     "matched_terms": sorted(matched_terms, key=lambda item: (-len(item), item))[:8],
                     "strong_terms": sorted(strong_terms, key=lambda item: (-len(item), item))[:8],
+                    "evidence_confidence": "low",
                 })
 
         return focused
+
+    def _fallback_breaking_change_evidence(
+        self,
+        references: list[dict],
+        current_version: str = "",
+        latest_version: str = "",
+    ) -> list[dict]:
+        fallback: list[tuple[int, dict]] = []
+        for reference in self._dedupe_references(references):
+            if reference.get("role") == "old_api_docs":
+                continue
+            reference_locator = " ".join([
+                str(reference.get("title", "")),
+                str(reference.get("url", "")),
+            ])
+            if not self._path_versions_are_relevant(reference_locator, current_version, latest_version):
+                continue
+            kind = self._document_kind(reference)
+            if kind not in {"release_notes", "migration_guide"}:
+                continue
+            for chunk in self._split_reference_chunks(reference):
+                content = str(chunk.get("content", "") or "")
+                lowered = content.lower()
+                if not self._has_migration_language(content):
+                    continue
+                score = 0
+                if any(term in lowered for term in ["breaking", "backwards incompatible", "migration", "upgrade"]):
+                    score += 20
+                if any(term in lowered for term in ["removed", "deprecated", "renamed", "replacement", "no longer"]):
+                    score += 10
+                heading = content.splitlines()[0].lower() if content.splitlines() else ""
+                if any(term in heading for term in ["breaking", "migration", "upgrade", "removed", "deprecated"]):
+                    score += 15
+                if score <= 0:
+                    continue
+                fallback.append((score, {
+                    "source": chunk.get("source", ""),
+                    "title": f"{chunk.get('title') or chunk.get('source')} (low-confidence breaking-change fallback)",
+                    "url": chunk.get("url", ""),
+                    "content": content,
+                    "document_kind": kind,
+                    "matched_terms": ["breaking-change-section"],
+                    "strong_terms": [],
+                    "score": score,
+                    "semantic_score": 0,
+                    "evidence_confidence": "low",
+                    "line_start": chunk.get("line_start"),
+                    "line_end": chunk.get("line_end"),
+                }))
+        fallback.sort(key=lambda item: item[0], reverse=True)
+        return [item for _score, item in fallback[: min(4, self.evidence_max_chunks)]]
 
     async def _collect_references(
         self,
@@ -1254,6 +1766,16 @@ class ScoutAgent:
             current_version,
             latest_version,
         ))
+        old_api_doc_references = await self._fetch_old_api_doc_references(
+            client,
+            references,
+            package,
+            ecosystem,
+            current_version,
+            api_usages,
+            api_contexts,
+        )
+        references.extend(old_api_doc_references)
 
         if repo_url:
             references.append({
@@ -1408,6 +1930,10 @@ class ScoutAgent:
             base_parts.append(parts[0])
         elif len(parts) >= 2 and re.match(r"v?\d+(?:\.\d+)*", parts[0]):
             base_parts.append(parts[0])
+        elif parts and parts[0] in {"docs", "doc", "documentation", "api", "reference"}:
+            base_parts.append(parts[0])
+        elif len(parts) == 1:
+            base_parts.append(parts[0])
         return f"{parsed.scheme}://{parsed.netloc}/{'/'.join(base_parts)}".rstrip("/")
 
     def _docs_suffix_candidates(
@@ -1453,6 +1979,7 @@ class ScoutAgent:
         references: list[dict],
         api_usages: Optional[list[str]] = None,
         api_contexts: Optional[list[dict]] = None,
+        api_semantics: Optional[list[dict]] = None,
         current_version: str = "",
         latest_version: str = "",
     ) -> str:
@@ -1460,6 +1987,7 @@ class ScoutAgent:
             references,
             api_usages,
             api_contexts,
+            api_semantics,
             current_version,
             latest_version,
         )
@@ -1477,6 +2005,7 @@ class ScoutAgent:
                     f"document_kind: {reference.get('document_kind', '')}",
                     f"matched_terms: {', '.join(reference.get('matched_terms', []))}",
                     f"strong_terms: {', '.join(reference.get('strong_terms', []))}",
+                    f"evidence_confidence: {reference.get('evidence_confidence', '')}",
                     content,
                 ])
             )
@@ -1492,18 +2021,39 @@ class ScoutAgent:
         references: list[dict],
         api_contexts: Optional[list[dict]] = None,
     ) -> dict:
+        old_doc_references = [
+            reference for reference in references
+            if reference.get("role") == "old_api_docs"
+        ]
+        api_semantics = self._api_semantics_from_references(
+            api_usages,
+            old_doc_references,
+            api_contexts,
+        )
+        result["api_semantics"] = api_semantics
         evidence_references = self._focused_reference_snippets(
             references,
             api_usages,
             api_contexts,
+            api_semantics,
             from_v,
             to_v,
         )
         result["evidence_references"] = evidence_references
+        result["evidence_confidence"] = (
+            "high"
+            if any(item.get("evidence_confidence") == "high" for item in evidence_references)
+            else "medium"
+            if any(item.get("evidence_confidence") == "medium" for item in evidence_references)
+            else "low"
+            if evidence_references
+            else "none"
+        )
         changelog_text = self._references_changelog_text(
             references,
             api_usages,
             api_contexts,
+            api_semantics,
             from_v,
             to_v,
         )
@@ -1515,6 +2065,7 @@ class ScoutAgent:
                 changelog_text,
                 api_usages,
                 evidence_references or references,
+                api_semantics,
             )
             result["breaking_changes"] = llm_result.get("breaking_changes", [])
             result["api_evidence"] = llm_result.get("api_evidence", [])
@@ -1534,6 +2085,7 @@ class ScoutAgent:
         changelog: str,
         api_usages: Optional[list[str]] = None,
         references: Optional[list[dict]] = None,
+        api_semantics: Optional[list[dict]] = None,
     ) -> dict:
         system_prompt = (
             "You are a senior dependency management AI for Python, Rust, Go, JavaScript, TypeScript, Java, "
@@ -1584,6 +2136,9 @@ class ScoutAgent:
             }}
             Compact evidence chunks gathered by DepGuard:
             {self._format_references_for_llm(references or [])}
+
+            Old API semantic map gathered from old-version docs or code context:
+            {self._format_api_semantics(api_semantics or [])}
 
             Evidence dossier:
             {changelog[:self.analysis_max_chars]}
@@ -1652,6 +2207,8 @@ class ScoutAgent:
             "references": [],
             "evidence_references": [],
             "api_evidence": [],
+            "api_semantics": [],
+            "evidence_confidence": "none",
         }
         try:
             async with httpx.AsyncClient() as client:

@@ -546,7 +546,7 @@ def preview_update(req: UpdateRequest):
         files_patched: dict[str, str] = {}
 
         ast_scanner = ASTScanner()
-        api_usages = ast_scanner.find_api_usages(str(folder_path), package)
+        api_usages = _prefer_specific_api_usages(ast_scanner.find_api_usages(str(folder_path), package))
         api_contexts = ast_scanner.find_api_usage_contexts(str(folder_path), package)
         scout = ScoutAgent()
         scout_output = scout.run_sync(pkg_info_dict, api_usages, api_contexts)
@@ -824,7 +824,7 @@ def update_package(req: UpdateRequest):
         ast_scanner = ASTScanner()
         
         # Step 1: Find API usages in codebase first
-        api_usages = ast_scanner.find_api_usages(str(folder_path), pkg_info_dict.get("name", ""))
+        api_usages = _prefer_specific_api_usages(ast_scanner.find_api_usages(str(folder_path), pkg_info_dict.get("name", "")))
         api_contexts = ast_scanner.find_api_usage_contexts(str(folder_path), pkg_info_dict.get("name", ""))
         
         # Step 2: Run targeted Scout

@@ -189,6 +189,135 @@ def test_find_api_usages_uses_aliases_declared_in_code(tmp_path: Path):
     assert "examplepkg.Widget.merge" in usages
 
 
+def test_find_api_usages_uses_distribution_import_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "from importroot import Image",
+            "",
+            "def resize(path):",
+            "    img = Image.open(path)",
+            "    return img.resize((100, 100), Image.OLD_CONSTANT)",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    scanner = ASTScanner()
+    monkeypatch.setattr(scanner, "_distribution_import_roots", lambda package_name: {"importroot"})
+
+    usages = scanner.find_api_usages(str(tmp_path), "example-dist")
+
+    assert "importroot.Image" in usages
+    assert "importroot.Image.open" in usages
+    assert "importroot.Image.OLD_CONSTANT" in usages
+
+
+def test_find_api_usages_can_match_clear_import_root_prefix(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "from sam import Tool",
+            "",
+            "result = Tool.OLD_CONSTANT",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "sampledist")
+
+    assert "sam.Tool.OLD_CONSTANT" in usages
+
+
+def test_scan_matches_imported_constant_attribute_target(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "from importroot import Image",
+            "",
+            "def resize(img):",
+            "    return img.resize((100, 100), Image.OLD_CONSTANT)",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(
+        str(tmp_path),
+        [{"old_api": "importroot.Image.OLD_CONSTANT", "new_api": "importroot.Image.New.OLD_CONSTANT"}],
+    )
+    matches = [
+        match
+        for file_matches in result["matches_by_file"].values()
+        for match in file_matches
+    ]
+
+    assert len(matches) == 1
+    assert matches[0]["old_api"] == "importroot.Image.OLD_CONSTANT"
+    assert matches[0]["matched_text"] == "Image.OLD_CONSTANT"
+
+
+def test_find_api_usages_tracks_subclass_classmethod_and_instance_methods(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "from examplepkg import BaseThing",
+            "from typing import Any",
+            "",
+            "class Payload(BaseThing):",
+            "    user_id: int",
+            "",
+            "def process(raw_data: dict[str, Any]) -> dict:",
+            "    item = Payload.load(raw_data)",
+            "    return item.export(exclude={'secret'})",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "examplepkg")
+
+    assert "examplepkg.BaseThing" in usages
+    assert "examplepkg.BaseThing.load" in usages
+    assert "examplepkg.BaseThing.export" in usages
+
+
+def test_scan_matches_subclass_inherited_method_targets(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "from examplepkg import BaseThing",
+            "",
+            "class Payload(BaseThing):",
+            "    user_id: int",
+            "",
+            "def process(raw_data):",
+            "    item = Payload.load(raw_data)",
+            "    return item.export(exclude={'secret'})",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(
+        str(tmp_path),
+        [
+            {"old_api": "examplepkg.BaseThing.load", "new_api": "examplepkg.BaseThing.validate"},
+            {"old_api": "examplepkg.BaseThing.export", "new_api": "examplepkg.BaseThing.dump"},
+        ],
+    )
+    matches = [
+        match
+        for file_matches in result["matches_by_file"].values()
+        for match in file_matches
+    ]
+
+    assert {match["old_api"] for match in matches} == {
+        "examplepkg.BaseThing.load",
+        "examplepkg.BaseThing.export",
+    }
+    assert {match["matched_text"] for match in matches} == {
+        "Payload.load(",
+        "item.export(",
+    }
+
+
 def test_find_api_usages_handles_unicode_comments_before_method_calls(tmp_path: Path):
     (tmp_path / "app.py").write_text(
         "\n".join([

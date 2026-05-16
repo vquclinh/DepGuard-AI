@@ -292,6 +292,7 @@ class PatchAgent:
         matches_str = json.dumps(compact_matches, separators=(",", ":"))
         bc_str = json.dumps(compact_breaking_changes, separators=(",", ":"))
         api_evidence_str = self._format_api_evidence(scout_context.get("api_evidence", []))
+        api_semantics_str = self._format_api_semantics(scout_context.get("api_semantics", []))
         references_str = self._format_scout_references(
             scout_context.get("evidence_references") or scout_context.get("references", [])
         )
@@ -340,6 +341,9 @@ class PatchAgent:
 
             DepGuard API Evidence:
             {api_evidence_str}
+
+            DepGuard Old API Semantics:
+            {api_semantics_str}
 
             DepGuard Scout References:
             {references_str}
@@ -414,6 +418,38 @@ class PatchAgent:
             blocks.append("\n".join(block))
             if len("\n\n".join(blocks)) > max_chars:
                 blocks.append("... API evidence truncated ...")
+                break
+        return "\n\n".join(blocks)[:max_chars]
+
+    def _format_api_semantics(self, api_semantics: list, max_chars: int = 8000) -> str:
+        if not api_semantics:
+            return "No old-version API semantics were attached by Scout."
+        blocks = []
+        for index, item in enumerate(api_semantics[:12], start=1):
+            if not isinstance(item, dict):
+                continue
+            block = [
+                f"[{index}] api: {item.get('api', '')}",
+                f"source: {item.get('source', '')}",
+                f"confidence: {item.get('confidence', '')}",
+                f"purpose: {item.get('purpose', '')}",
+                f"behavior: {str(item.get('behavior', '') or '')[:900]}",
+                f"parameters: {str(item.get('parameters', '') or '')[:500]}",
+                f"returns: {str(item.get('returns', '') or '')[:400]}",
+                f"semantic_search_terms: {', '.join(str(term) for term in (item.get('search_terms', []) or [])[:10])}",
+            ]
+            docs = []
+            for doc in item.get("docs", [])[:2]:
+                if isinstance(doc, dict):
+                    docs.append(" | ".join(filter(None, [
+                        str(doc.get("title", "") or ""),
+                        str(doc.get("url", "") or ""),
+                    ])))
+            if docs:
+                block.extend(["docs:", "\n".join(docs)])
+            blocks.append("\n".join(block))
+            if len("\n\n".join(blocks)) > max_chars:
+                blocks.append("... API semantics truncated ...")
                 break
         return "\n\n".join(blocks)[:max_chars]
 

@@ -351,6 +351,87 @@ class FakeCargoClient:
         return FakeResponse(404, {})
 
 
+class FakeSemanticRenameRouter:
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1000, task_type: str = "general"):
+        assert "Old API semantic map" in user_prompt
+        assert "Append rows from another table" in user_prompt
+        assert "Row concatenation helpers were removed" in user_prompt
+        return LLMResponse(
+            content=json.dumps({
+                "breaking_changes": [{
+                    "type": "renamed",
+                    "old_api": "tabularlib.Table.append",
+                    "new_api": "tabularlib.merge_tables",
+                    "description": "Table row append behavior moved to merge_tables.",
+                }],
+                "api_evidence": [{
+                    "api": "tabularlib.Table.append",
+                    "change_type": "renamed",
+                    "replacement": "tabularlib.merge_tables",
+                    "confidence": "medium",
+                    "evidence": [{
+                        "source_index": 1,
+                        "source": "release_notes",
+                        "url": "https://github.com/acme/tabularlib/blob/main/CHANGELOG.md",
+                        "quote": "Row concatenation helpers were removed. Use merge_tables.",
+                    }],
+                    "reason": "Old docs describe row append behavior and release notes describe that behavior moving to merge_tables.",
+                }],
+                "confidence_score": 0.82,
+            }),
+            provider="fake",
+            model="test",
+            latency_ms=1,
+            fallback_used=False,
+        )
+
+
+class FakeSemanticRenameClient:
+    def __init__(self):
+        self.requests = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, url: str, *args, **kwargs):
+        self.requests.append(url)
+        if "api.deps.dev" in url:
+            return FakeResponse(200, {"links": [{"url": "https://github.com/acme/tabularlib"}]})
+        if "pypi.org" in url:
+            return FakeResponse(200, {
+                "info": {
+                    "summary": "Tables for examples.",
+                    "package_url": "https://pypi.org/project/tabularlib/",
+                    "project_urls": {
+                        "Documentation": "https://docs.example.test/tabularlib/",
+                        "Source": "https://github.com/acme/tabularlib",
+                    },
+                }
+            })
+        if "docs.example.test/tabularlib/1.0.0/reference/api/tabularlib.Table.append.html" in url:
+            return FakeResponse(
+                200,
+                text="<html><body><h1>Table.append</h1><p>Append rows from another table to the end of this table and return a new table.</p><h2>Parameters</h2><p>other: table-like rows to add. ignore_index: reset row labels.</p><h2>Returns</h2><p>A new combined table.</p></body></html>",
+            )
+        if "api.github.com/repos/acme/tabularlib/releases" in url:
+            return FakeResponse(404, {})
+        if "api.github.com/repos/acme/tabularlib" in url:
+            return FakeResponse(200, {
+                "html_url": "https://github.com/acme/tabularlib",
+                "description": "Table utilities",
+                "default_branch": "main",
+            })
+        if "raw.githubusercontent.com/acme/tabularlib/main/CHANGELOG.md" in url:
+            return FakeResponse(
+                200,
+                text="## 2.0.0 Breaking changes\nRow concatenation helpers were removed. Use merge_tables for combining rows into a new table.",
+            )
+        return FakeResponse(404, {})
+
+
 class FakeResponse:
     def __init__(self, status_code: int, payload=None, text: str = ""):
         self.status_code = status_code
@@ -414,6 +495,33 @@ async def test_scout_collects_crates_docs_and_github_changelog(monkeypatch: pyte
     }]
 
 
+@pytest.mark.asyncio
+async def test_scout_uses_old_api_docs_semantics_to_find_renamed_behavior(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(scout_module.httpx, "AsyncClient", lambda: FakeSemanticRenameClient())
+
+    scout = ScoutAgent()
+    scout.router = FakeSemanticRenameRouter()
+
+    result = await scout.run(
+        {
+            "name": "tabularlib",
+            "current_version": "1.0.0",
+            "latest_version": "2.0.0",
+            "ecosystem": "pip",
+        },
+        ["tabularlib.Table.append"],
+        [{"api": "tabularlib.Table.append", "code_snippet": "result = table.append(other, ignore_index=True)"}],
+    )
+
+    assert result["api_semantics"]
+    assert result["api_semantics"][0]["source"] == "old_version_docs"
+    assert "Append rows from another table" in result["api_semantics"][0]["purpose"]
+    assert result["evidence_references"]
+    assert "Row concatenation helpers were removed" in result["evidence_references"][0]["content"]
+    assert result["evidence_references"][0]["semantic_score"] > 0
+    assert result["breaking_changes"][0]["new_api"] == "tabularlib.merge_tables"
+
+
 def test_scout_normalizes_common_repository_urls():
     scout = ScoutAgent()
 
@@ -421,6 +529,7 @@ def test_scout_normalizes_common_repository_urls():
     assert scout._normalize_repo_url("git@github.com:ramsayleung/rspotify.git") == "https://github.com/ramsayleung/rspotify"
     assert scout._normalize_repo_url("github:expressjs/express") == "https://github.com/expressjs/express"
     assert scout._normalize_repo_url("https://github.com/owner/repo/tree/main") == "https://github.com/owner/repo"
+    assert scout._normalize_repo_url("https://github.com/sponsors/someone") == ""
 
 
 @pytest.mark.asyncio
@@ -544,6 +653,31 @@ def test_scout_resolves_nested_release_index_paths_relative_to_index_file():
     assert "doc/source/release/1.17.0-notes.rst" in candidates
 
 
+def test_scout_considers_intermediate_major_release_note_paths():
+    scout = ScoutAgent()
+
+    versions = scout._candidate_version_strings("9.5.0", "12.2.0")
+    candidates = scout._common_versioned_doc_candidates("9.5.0", "12.2.0")
+
+    assert "10.0.0" in versions
+    assert "11.0.0" in versions
+    assert "12.0.0" in versions
+    assert "docs/releasenotes/10.0.0.rst" in candidates
+    assert scout._score_doc_path(
+        "docs/releasenotes/10.0.0.rst",
+        ["PIL.Image.OLD_CONSTANT"],
+        None,
+        "9.5.0",
+        "12.2.0",
+    ) > scout._score_doc_path(
+        "docs/reference/Image.rst",
+        ["PIL.Image.OLD_CONSTANT"],
+        None,
+        "9.5.0",
+        "12.2.0",
+    )
+
+
 def test_scout_builds_compact_ranked_evidence_chunks():
     scout = ScoutAgent()
     scout.evidence_chunk_chars = 700
@@ -628,6 +762,36 @@ def test_scout_prioritizes_exact_method_evidence_over_generic_dataframe_chunks()
     assert all("v0.11.0" not in reference["url"] for reference in evidence)
 
 
+def test_scout_prioritizes_exact_constant_attribute_evidence():
+    scout = ScoutAgent()
+    references = [
+        {
+            "source": "github",
+            "title": "docs/releasenotes/2.0.0.rst",
+            "url": "https://github.com/acme/examplelib/blob/main/docs/releasenotes/2.0.0.rst",
+            "content": "Backwards incompatible changes\n\n``Image.OLD_CONSTANT`` has been removed. Use ``Image.New.OLD_CONSTANT`` instead.",
+        },
+        {
+            "source": "github",
+            "title": "docs/releasenotes/2.1.0.rst",
+            "url": "https://github.com/acme/examplelib/blob/main/docs/releasenotes/2.1.0.rst",
+            "content": "Image resizing performance improvements and assorted API additions.",
+        },
+    ]
+
+    evidence = scout._focused_reference_snippets(
+        references,
+        ["importroot.Image.OLD_CONSTANT"],
+        current_version="1.0.0",
+        latest_version="2.1.0",
+    )
+
+    assert evidence
+    assert evidence[0]["url"].endswith("2.0.0.rst")
+    assert evidence[0]["evidence_confidence"] == "high"
+    assert "Image.OLD_CONSTANT" in evidence[0]["content"]
+
+
 def test_scout_uses_code_context_terms_for_retrieval():
     scout = ScoutAgent()
     references = [{
@@ -645,3 +809,48 @@ def test_scout_uses_code_context_terms_for_retrieval():
 
     assert evidence
     assert "append" in evidence[0]["matched_terms"]
+
+
+def test_scout_falls_back_to_code_context_semantics_when_old_docs_missing():
+    scout = ScoutAgent()
+
+    semantics = scout._api_semantics_from_references(
+        ["examplepkg.Widget.combine"],
+        [],
+        [{
+            "api": "examplepkg.Widget.combine",
+            "code_snippet": "result = widget.combine(other, ignore_index=True)",
+            "context": "result = widget.combine(other, ignore_index=True)",
+        }],
+    )
+
+    assert semantics
+    assert semantics[0]["source"] == "code_context"
+    assert semantics[0]["confidence"] == "low"
+    assert "ignore_index" in semantics[0]["parameters"]
+    assert "ignore_index" in semantics[0]["search_terms"]
+
+
+def test_scout_uses_low_confidence_breaking_section_when_semantic_search_misses():
+    scout = ScoutAgent()
+    references = [{
+        "source": "github",
+        "title": "CHANGELOG.md",
+        "url": "https://github.com/acme/example/blob/main/CHANGELOG.md",
+        "content": "## 2.0.0 Breaking changes\nRemoved several legacy helpers. See the migration guide before upgrading.",
+    }]
+
+    evidence = scout._focused_reference_snippets(
+        references,
+        ["examplepkg.Widget.combine"],
+        api_semantics=[{
+            "api": "examplepkg.Widget.combine",
+            "search_terms": ["combine widgets", "widget aggregation"],
+        }],
+        current_version="1.0.0",
+        latest_version="2.0.0",
+    )
+
+    assert evidence
+    assert evidence[0]["evidence_confidence"] == "low"
+    assert evidence[0]["matched_terms"] == ["breaking-change-section"]
