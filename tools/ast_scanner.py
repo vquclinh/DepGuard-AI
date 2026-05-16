@@ -151,6 +151,20 @@ class ASTScanner:
         "template_substitution", "char_literal", "character_literal",
     }
 
+    COMMON_PACKAGE_ALIASES = {
+        "cv2": {"cv"},
+        "matplotlib": {"mpl"},
+        "matplotlib.pyplot": {"plt"},
+        "numpy": {"np"},
+        "pandas": {"pd"},
+        "plotly.express": {"px"},
+        "polars": {"pl"},
+        "pyarrow": {"pa"},
+        "seaborn": {"sns"},
+        "tensorflow": {"tf"},
+        "torch": {"th"},
+    }
+
     def __init__(self):
         self.parsers: dict[str, Any] = {}
         self._tree_sitter_language: Any = None
@@ -346,14 +360,18 @@ class ASTScanner:
 
         ignored: list[tuple[int, int]] = []
         try:
-            tree = parser.parse(content.encode("utf-8"))
+            encoded = content.encode("utf-8")
+            tree = parser.parse(encoded)
         except Exception:
             return []
+
+        def byte_to_char(byte_offset: int) -> int:
+            return len(encoded[:byte_offset].decode("utf-8", errors="ignore"))
 
         def walk(node: Any) -> None:
             node_type = getattr(node, "type", "").lower()
             if node_type in self.COMMENT_OR_STRING_TYPES or "comment" in node_type:
-                ignored.append((node.start_byte, node.end_byte))
+                ignored.append((byte_to_char(node.start_byte), byte_to_char(node.end_byte)))
                 return
             for child in getattr(node, "children", []):
                 walk(child)
@@ -378,6 +396,35 @@ class ASTScanner:
             old_api = bc.get("old_api", "")
             if not old_api:
                 continue
+            for match in self._find_dataflow_api_matches(content, old_api, aliases, ignored_ranges):
+                start = match.start()
+                end = match.end()
+                if self._is_ignored_offset(start, ignored_ranges):
+                    continue
+                if any(
+                    seen_old_api == old_api and start < seen_end and end > seen_start
+                    for seen_old_api, seen_start, seen_end in seen_spans
+                ):
+                    continue
+                line, col = self._line_col(content, start)
+                key = (line, col, old_api)
+                if key in seen:
+                    continue
+                seen.add(key)
+                seen_spans.append((old_api, start, end))
+                snippet = lines[line - 1].rstrip() if 0 < line <= len(lines) else ""
+                matches.append({
+                    "file": filepath,
+                    "line": line,
+                    "col": col,
+                    "old_api": old_api,
+                    "new_api": bc.get("new_api", ""),
+                    "description": bc.get("description", ""),
+                    "code_snippet": snippet,
+                    "type": bc.get("type", ""),
+                    "matched_text": match.group(0),
+                })
+
             for variant in sorted(self._api_variants(old_api, aliases), key=len, reverse=True):
                 for match in self._find_variant_matches(content, variant):
                     start = match.start()
@@ -435,7 +482,175 @@ class ASTScanner:
                         continue
                     usages.add(f"{real_name}{match.group(1)}")
 
+        usages.update(self._find_alias_dataflow_usages(content, package_name, aliases, ignored_ranges))
         return usages
+
+    def _find_alias_dataflow_usages(
+        self,
+        content: str,
+        package_name: str,
+        aliases: dict[str, str],
+        ignored_ranges: list[tuple[int, int]],
+    ) -> set[str]:
+        """Infer package type method usages from simple local assignments.
+
+        This keeps migration-review targets specific. For example:
+            import pandas as pd
+            df = pd.DataFrame(...)
+            df.append(...)
+
+        becomes:
+            pandas.DataFrame
+            pandas.DataFrame.append
+
+        The inference is intentionally conservative and lexical: it handles
+        straightforward constructor assignments and reassignment chains without
+        pretending to be a full type checker.
+        """
+        package_aliases = {
+            package_name: package_name,
+        }
+        for alias, real_name in aliases.items():
+            if real_name == package_name or real_name.startswith(f"{package_name}.") or real_name.startswith(f"{package_name}/"):
+                package_aliases[alias] = real_name
+        for alias in self._common_aliases_for_package(package_name):
+            package_aliases.setdefault(alias, package_name)
+
+        usages: set[str] = set()
+        variable_types = self._infer_package_variable_types(
+            content,
+            package_name,
+            package_aliases,
+            ignored_ranges,
+        )
+        usages.update(variable_types.values())
+
+        for variable, resolved_type in variable_types.items():
+            for match in re.finditer(rf"(?<![\w$]){re.escape(variable)}\.([A-Za-z_$][\w$]*)\s*\(", content):
+                if self._is_ignored_offset(match.start(), ignored_ranges):
+                    continue
+                usages.add(f"{resolved_type}.{match.group(1)}")
+
+        for alias, real_name in package_aliases.items():
+            alias_pattern = re.escape(alias)
+            for match in re.finditer(
+                rf"(?<![\w$]){alias_pattern}\.([A-Za-z_$][\w$]*)\s*\([^)]*\)\.([A-Za-z_$][\w$]*)\s*\(",
+                content,
+                re.DOTALL,
+            ):
+                if self._is_ignored_offset(match.start(), ignored_ranges):
+                    continue
+                usages.add(f"{real_name}.{match.group(1)}.{match.group(2)}")
+
+        return usages
+
+    def _infer_package_variable_types(
+        self,
+        content: str,
+        package_name: str,
+        package_aliases: dict[str, str],
+        ignored_ranges: list[tuple[int, int]],
+    ) -> dict[str, str]:
+        variable_types: dict[str, str] = {}
+        assignment_patterns: list[tuple[str, str]] = []
+
+        for alias, real_name in package_aliases.items():
+            alias_pattern = re.escape(alias)
+            assignment_patterns.append((
+                rf"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*{alias_pattern}\.([A-Za-z_$][\w$]*)\s*\(",
+                f"{real_name}.{{constructor}}",
+            ))
+            if real_name.startswith(f"{package_name}."):
+                assignment_patterns.append((
+                    rf"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*{alias_pattern}\s*\(",
+                    real_name,
+                ))
+
+        for pattern, type_template in assignment_patterns:
+            for match in re.finditer(pattern, content):
+                if self._is_ignored_offset(match.start(), ignored_ranges):
+                    continue
+                variable = match.group(1)
+                constructor = match.group(2) if "{constructor}" in type_template else ""
+                variable_types[variable] = type_template.format(constructor=constructor)
+
+        # Follow simple reassignment chains such as result = df.
+        for _ in range(3):
+            changed = False
+            for match in re.finditer(r"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\b(?!\s*[.(])", content):
+                if self._is_ignored_offset(match.start(), ignored_ranges):
+                    continue
+                target, source = match.group(1), match.group(2)
+                if source in variable_types and variable_types.get(target) != variable_types[source]:
+                    variable_types[target] = variable_types[source]
+                    changed = True
+            if not changed:
+                break
+
+        return variable_types
+
+    def _package_aliases_for_old_api(self, old_api: str, aliases: dict[str, str]) -> tuple[str, dict[str, str]]:
+        package_name = re.split(r"[./:]", old_api, maxsplit=1)[0]
+        package_aliases = {package_name: package_name}
+
+        for alias, real_name in aliases.items():
+            if real_name == package_name or real_name.startswith(f"{package_name}.") or real_name.startswith(f"{package_name}/"):
+                package_aliases[alias] = real_name
+
+        for alias in self._common_aliases_for_package(package_name):
+            package_aliases.setdefault(alias, package_name)
+
+        return package_name, package_aliases
+
+    def _find_dataflow_api_matches(
+        self,
+        content: str,
+        old_api: str,
+        aliases: dict[str, str],
+        ignored_ranges: list[tuple[int, int]],
+    ):
+        if "." not in old_api:
+            return []
+
+        parts = old_api.split(".")
+        if len(parts) < 3:
+            return []
+
+        type_path = ".".join(parts[:-1])
+        method_name = parts[-1]
+        package_name, package_aliases = self._package_aliases_for_old_api(old_api, aliases)
+        variable_types = self._infer_package_variable_types(
+            content,
+            package_name,
+            package_aliases,
+            ignored_ranges,
+        )
+
+        matches = []
+        for variable, resolved_type in variable_types.items():
+            if resolved_type != type_path:
+                continue
+            pattern = rf"(?<![\w$]){re.escape(variable)}\.{re.escape(method_name)}\s*\("
+            matches.extend(re.finditer(pattern, content))
+
+        constructor = parts[-2]
+        for alias, real_name in package_aliases.items():
+            if type_path != f"{real_name}.{constructor}":
+                continue
+            pattern = (
+                rf"(?<![\w$]){re.escape(alias)}\.{re.escape(constructor)}"
+                rf"\s*\([^)]*\)\.{re.escape(method_name)}\s*\("
+            )
+            matches.extend(re.finditer(pattern, content, re.DOTALL))
+
+        return matches
+
+    def _common_aliases_for_package(self, package_name: str) -> set[str]:
+        aliases = set(self.COMMON_PACKAGE_ALIASES.get(package_name, set()))
+        for module, module_aliases in self.COMMON_PACKAGE_ALIASES.items():
+            if module.startswith(f"{package_name}."):
+                aliases.update(module_aliases)
+        return aliases
 
     def _extract_aliases(self, content: str) -> dict[str, str]:
         aliases: dict[str, str] = {}
@@ -595,9 +810,6 @@ class ASTScanner:
         variants = {old_api, old_api.replace(".", "::")}
         if "." in old_api:
             variants.add(old_api.replace(".", "/"))
-            final_segment = old_api.split(".")[-1]
-            if len(final_segment) > 2:
-                variants.add(final_segment)
 
         for alias, real_name in aliases.items():
             if old_api == real_name:

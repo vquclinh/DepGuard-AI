@@ -89,6 +89,7 @@ async def test_all_fail_exhausted(router_setup):
 @pytest.mark.asyncio
 async def test_cache_hit(router_setup):
     router = router_setup
+    router.cache_enabled = True
     router.provider_order = ["claude", "gemini", "qwen"]
     router._call_claude = AsyncMock(return_value="First call")
     router._call_qwen = AsyncMock()

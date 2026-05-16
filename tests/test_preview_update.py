@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from api import main as api_main
-from api.main import PackageInfo, UpdateRequest
+from api.main import PackageInfo, UpdateRequest, _migration_review_breaking_changes
 
 
 class EmptyScout:
@@ -38,6 +38,26 @@ class FallbackPatchAgent:
                 "patched": patched,
             })
         return {"files": files, "llm_provider": "fake", "fallback_used": False}
+
+
+def test_migration_review_fallback_prefers_method_level_api_targets():
+    changes = _migration_review_breaking_changes(
+        "pandas",
+        "2.0.0",
+        "3.0.3",
+        [
+            "pandas",
+            "pandas.DataFrame",
+            "pandas.DataFrame.append",
+            "pandas.concat",
+        ],
+    )
+
+    old_apis = [change["old_api"] for change in changes]
+
+    assert "pandas.DataFrame.append" in old_apis
+    assert "pandas.concat" in old_apis
+    assert "pandas.DataFrame" not in old_apis
 
 
 def test_preview_uses_api_usage_fallback_when_scout_finds_no_breaking_changes(

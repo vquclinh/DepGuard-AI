@@ -53,6 +53,7 @@ class LLMRouter:
         self.enable_claude = self._env_bool("ENABLE_CLAUDE", True)
         self.enable_gemini = self._env_bool("ENABLE_GEMINI", True)
         self.enable_qwen = self._env_bool("ENABLE_QWEN", True)
+        self.cache_enabled = self._env_bool("LLM_CACHE_ENABLED", False)
         self.qwen_max_tokens = self._env_int("QWEN_MAX_TOKENS", 8000)
         self.qwen_timeout = httpx.Timeout(
             connect=self._env_float("QWEN_CONNECT_TIMEOUT", 5.0),
@@ -236,7 +237,7 @@ class LLMRouter:
         # Check cache
         cache_key = self._get_cache_key(system_prompt, user_prompt)
         current_time = time.time()
-        if cache_key in _RESPONSE_CACHE:
+        if self.cache_enabled and cache_key in _RESPONSE_CACHE:
             cached_resp, timestamp = _RESPONSE_CACHE[cache_key]
             if current_time - timestamp < CACHE_TTL_SECONDS:
                 logger.info("LLMRouter: Cache hit")
@@ -278,8 +279,8 @@ class LLMRouter:
                     fallback_used=fallback_used
                 )
                 
-                # Cache success
-                _RESPONSE_CACHE[cache_key] = (response, time.time())
+                if self.cache_enabled:
+                    _RESPONSE_CACHE[cache_key] = (response, time.time())
                 return response
                 
             except Exception as e:

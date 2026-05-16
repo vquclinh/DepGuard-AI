@@ -290,6 +290,9 @@ class PatchAgent:
         compact_breaking_changes = scout_context.get("breaking_changes", [])[:16]
         matches_str = json.dumps(compact_matches, separators=(",", ":"))
         bc_str = json.dumps(compact_breaking_changes, separators=(",", ":"))
+        references_str = self._format_scout_references(
+            scout_context.get("evidence_references") or scout_context.get("references", [])
+        )
         blocks_str = json.dumps(
             [
                 {
@@ -317,7 +320,9 @@ class PatchAgent:
         system_prompt = (
             "You are DepGuard's deterministic code migration patch engine.\n"
             "Your job is to produce a machine-parseable patch plan, not a narrative.\n"
-            "Use only documented or explicitly provided migration facts. Do not infer or invent API migrations from version numbers.\n"
+            "Use the package/version migration context, matched API usages, source code, and widely known compatibility rules to decide whether a code edit is needed.\n"
+            "When new_api is empty, analyze the matched code and source carefully; propose a safe migration if the required replacement is clear from the code/API behavior.\n"
+            "Do not make unrelated stylistic rewrites or speculative edits outside the matched migration surface.\n"
             "Patch only exact target ranges supplied by DepGuard. Never return line-level edits inside a larger target block.\n"
             "Preserve unrelated code, behavior, formatting, comments, imports, and indentation unless the migration evidence requires a change.\n"
             "If evidence is insufficient, or no target block needs a change, return status no_change with an empty replacements array.\n"
@@ -330,6 +335,9 @@ class PatchAgent:
             Package Migration Context: {scout_context.get("package")} {scout_context.get("from_version")} -> {scout_context.get("to_version")}
             Breaking Changes:
             {bc_str}
+
+            DepGuard Scout References:
+            {references_str}
 
             File: {filepath}
             Matches to fix:
@@ -361,14 +369,35 @@ class PatchAgent:
             - Keep each replacement as complete code for the exact start_line/end_line range.
             - Valid replacement ranges are: {[(block["start_line"], block["end_line"]) for block in target_blocks]}.
             - Do not return smaller line edits inside a target block.
-            - Do not invent an API migration when new_api is empty or the breaking change is only a migration_review.
+            - If new_api is empty, infer the migration from the matched API usage and target source when the replacement is clear; otherwise return no_change.
             - Include all necessary edits within those ranges if related code in the same block must change.
             - If a target block does not require a code change, omit it from replacements.
-            - If no target block requires a code change, return exactly {{"replacements":[]}}.
+            - If no target block requires a code change, return status no_change with replacements [].
             - Do not return original unchanged blocks.
             - Do not return markdown.
             """
         return system_prompt, prompt, target_blocks
+
+    def _format_scout_references(self, references: list, max_chars: int = 12000) -> str:
+        if not references:
+            return "No external references were attached by Scout."
+        blocks = []
+        for index, reference in enumerate(references[:12], start=1):
+            if not isinstance(reference, dict):
+                continue
+            content = str(reference.get("content", "") or "").strip()
+            block = [
+                f"[{index}] {reference.get('title') or reference.get('source') or 'Reference'}",
+                f"source: {reference.get('source', '')}",
+                f"url: {reference.get('url', '')}",
+            ]
+            if content:
+                block.extend(["excerpt:", content[:2000]])
+            blocks.append("\n".join(block))
+            if len("\n\n".join(blocks)) > max_chars:
+                blocks.append("... references truncated ...")
+                break
+        return "\n\n".join(blocks)[:max_chars]
 
     def _patch_response_schema(self) -> dict:
         return {

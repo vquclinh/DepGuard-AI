@@ -196,6 +196,7 @@ def _migration_review_breaking_changes(package: str, from_v: str, to_v: str, api
             usage for usage in sorted(set(api_usages))
             if usage and usage != package
         ]
+    concrete_usages = _prefer_specific_api_usages(concrete_usages)
 
     return [
         {
@@ -209,6 +210,30 @@ def _migration_review_breaking_changes(package: str, from_v: str, to_v: str, api
         }
         for usage in concrete_usages[:limit]
     ]
+
+def _prefer_specific_api_usages(api_usages: list[str]) -> list[str]:
+    """Drop broad parent APIs when a more precise child usage is present.
+
+    If usage discovery finds both ``pandas.DataFrame`` and
+    ``pandas.DataFrame.append``, the fallback should review the method-level
+    target only. Keeping the parent creates noisy LLM calls around ordinary
+    constructors and can drag unrelated methods in the same function into the
+    review surface.
+    """
+    unique = sorted(set(api_usages), key=lambda item: (-item.count("."), -item.count("/"), -len(item), item))
+    result = []
+    for usage in unique:
+        if any(
+            other != usage and (
+                other.startswith(f"{usage}.")
+                or other.startswith(f"{usage}/")
+                or other.startswith(f"{usage}::")
+            )
+            for other in unique
+        ):
+            continue
+        result.append(usage)
+    return result
 
 def _scan_breaking_changes_with_review_fallback(
     ast_scanner,

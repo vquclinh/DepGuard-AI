@@ -63,6 +63,130 @@ def test_find_api_usages_resolves_aliases_across_languages(tmp_path: Path):
     assert "react.createElement" in scanner.find_api_usages(str(tmp_path), "react")
 
 
+def test_find_api_usages_tracks_python_constructor_method_dataflow(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "import pandas as pd",
+            "",
+            "def dummy_pandas_trap():",
+            "    df1 = pd.DataFrame({'A': [1, 2]})",
+            "    df2 = pd.DataFrame({'A': [3, 4]})",
+            "    result = df1.append(df2, ignore_index=True)",
+            "    return result",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "pandas")
+
+    assert "pandas.DataFrame" in usages
+    assert "pandas.DataFrame.append" in usages
+
+
+def test_scan_matches_python_constructor_method_dataflow_target(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "import pandas as pd",
+            "",
+            "def dummy_pandas_trap():",
+            "    df1 = pd.DataFrame({'A': [1, 2]})",
+            "    df2 = pd.DataFrame({'A': [3, 4]})",
+            "    result = df1.append(df2, ignore_index=True)",
+            "    return result",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(
+        str(tmp_path),
+        [{"old_api": "pandas.DataFrame.append", "new_api": "pandas.concat"}],
+    )
+    matches = next(iter(result["matches_by_file"].values()))
+
+    assert len(matches) == 1
+    assert matches[0]["line"] == 6
+    assert matches[0]["old_api"] == "pandas.DataFrame.append"
+    assert matches[0]["matched_text"] == "df1.append("
+
+
+def test_scan_does_not_match_native_list_append_as_pandas_append(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "import pandas as pd",
+            "",
+            "def sanitize_features(features):",
+            "    clean = []",
+            "    for f in features:",
+            "        clean.append(f)",
+            "    return clean",
+            "",
+            "def dummy_pandas_trap():",
+            "    df1 = pd.DataFrame({'A': [1, 2]})",
+            "    df2 = pd.DataFrame({'A': [3, 4]})",
+            "    result = df1.append(df2, ignore_index=True)",
+            "    return result",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(
+        str(tmp_path),
+        [{"old_api": "pandas.DataFrame.append", "new_api": "pandas.concat"}],
+    )
+    matches = [
+        match
+        for file_matches in result["matches_by_file"].values()
+        for match in file_matches
+    ]
+
+    assert len(matches) == 1
+    assert matches[0]["line"] == 12
+    assert matches[0]["code_snippet"].strip().startswith("result = df1.append")
+
+
+def test_find_api_usages_uses_common_python_aliases_when_import_is_missing(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "def dummy_pandas_trap():",
+            "    df1 = pd.DataFrame({'A': [1, 2]})",
+            "    df2 = pd.DataFrame({'A': [3, 4]})",
+            "    result = df1.append(df2, ignore_index=True)",
+            "    return result",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "pandas")
+
+    assert "pandas.DataFrame" in usages
+    assert "pandas.DataFrame.append" in usages
+
+
+def test_find_api_usages_handles_unicode_comments_before_method_calls(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "import pandas as pd",
+            "",
+            "def dummy_pandas_trap():",
+            "    df1 = pd.DataFrame({'A': [1, 2]})",
+            "    df2 = pd.DataFrame({'A': [3, 4]})",
+            "    # BẪY Ở ĐÂY: Dùng hàm append (đã bị xóa trong Pandas 2.0)",
+            "    result = df1.append(df2, ignore_index=True)",
+            "    return result",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "pandas")
+
+    assert "pandas.DataFrame.append" in usages
+
+
 def test_find_api_usages_expands_nested_rust_use_trees(tmp_path: Path):
     (tmp_path / "main.rs").write_text(
         "\n".join([
