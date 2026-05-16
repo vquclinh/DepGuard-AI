@@ -1,4 +1,5 @@
 import httpx
+import inspect
 from openai import AsyncOpenAI
 
 
@@ -34,6 +35,18 @@ class OpenRouterQwenClient:
     @property
     def status(self) -> str:
         return "available" if self.client else "not_configured"
+
+    async def aclose(self) -> None:
+        if not self.client:
+            return
+        client = self.client
+        self.client = None
+        close = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
     async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
         if not self.client:

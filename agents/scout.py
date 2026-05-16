@@ -1,7 +1,9 @@
 import os
 import re
 import json
+import html
 import asyncio
+import inspect
 import logging
 import argparse
 import sys
@@ -53,6 +55,18 @@ class ScoutAgent:
         "docs/upgrading.md",
         "docs/source/whatsnew/index.rst",
         "doc/source/whatsnew/index.rst",
+        "docs/source/release.rst",
+        "doc/source/release.rst",
+        "docs/source/release/index.rst",
+        "doc/source/release/index.rst",
+        "docs/releases/index.md",
+        "doc/releases/index.md",
+        "docs/migration/index.md",
+        "docs/migration/index.rst",
+        "docs/upgrading/index.md",
+        "docs/upgrade/index.md",
+        "docs/api/index.md",
+        "docs/reference/index.md",
     ]
 
     def __init__(self):
@@ -63,6 +77,10 @@ class ScoutAgent:
         self.analysis_max_chars = self._env_int("SCOUT_ANALYSIS_MAX_CHARS", 30000)
         self.analysis_max_tokens = self._env_int("SCOUT_LLM_MAX_TOKENS", 4000)
         self.evidence_window_chars = self._env_int("SCOUT_EVIDENCE_WINDOW_CHARS", 900)
+        self.evidence_chunk_chars = self._env_int("SCOUT_EVIDENCE_CHUNK_CHARS", 1800)
+        self.evidence_max_chunks = self._env_int("SCOUT_EVIDENCE_MAX_CHUNKS", 14)
+        self.docs_url_fetch_limit = self._env_int("SCOUT_DOCS_URL_FETCH_LIMIT", 10)
+        self.github_tree_doc_limit = self._env_int("SCOUT_GITHUB_TREE_DOC_LIMIT", 12)
 
     def _env_int(self, name: str, default: int) -> int:
         try:
@@ -291,11 +309,22 @@ class ScoutAgent:
                 return ""
             text = response.text or ""
             if "<html" in text[:200].lower():
-                return ""
+                text = self._html_to_text(text)
             return text[:max_chars]
         except Exception as exc:
             logger.debug("Error fetching text reference %s: %s", url, exc)
             return ""
+
+    def _html_to_text(self, text: str) -> str:
+        text = re.sub(r"(?is)<(script|style|noscript|svg).*?</\1>", " ", text)
+        text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+        text = re.sub(r"(?i)</(p|div|section|article|li|h[1-6]|tr)>", "\n", text)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = html.unescape(text)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r"\n\s+", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     def _repo_url_from_npm(self, repository) -> str:
         if isinstance(repository, str):
@@ -377,10 +406,17 @@ class ScoutAgent:
         default_branch: str,
         current_version: str = "",
         latest_version: str = "",
+        api_usages: Optional[list[str]] = None,
+        api_contexts: Optional[list[dict]] = None,
     ) -> list[dict]:
         references = []
         branch = default_branch or "main"
-        for path in self.CHANGELOG_PATHS:
+        paths = self._dedupe_paths([
+            *self.CHANGELOG_PATHS,
+            *self._common_versioned_doc_candidates(current_version, latest_version),
+            *self._api_doc_path_candidates(api_usages, api_contexts),
+        ])
+        for path in paths:
             raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
             try:
                 response = await client.get(raw_url, timeout=10.0)
@@ -407,7 +443,247 @@ class ScoutAgent:
                 ))
             except Exception as exc:
                 logger.debug("Error fetching changelog file %s: %s", raw_url, exc)
+        references.extend(await self._fetch_github_tree_docs(
+            client,
+            owner,
+            repo,
+            branch,
+            current_version,
+            latest_version,
+            api_usages,
+            api_contexts,
+            {reference.get("title", "") for reference in references},
+        ))
         return references
+
+    def _dedupe_paths(self, paths: list[str]) -> list[str]:
+        seen = set()
+        deduped = []
+        for path in paths:
+            normalized = path.strip().lstrip("/")
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    def _common_versioned_doc_candidates(self, current_version: str, latest_version: str) -> list[str]:
+        versions = self._candidate_version_strings(current_version, latest_version)
+        templates = [
+            "doc/source/release/{version}-notes.rst",
+            "docs/source/release/{version}-notes.rst",
+            "doc/source/release/{version}.rst",
+            "docs/source/release/{version}.rst",
+            "doc/release/{version}-notes.rst",
+            "docs/release/{version}-notes.rst",
+            "docs/releases/{version}.md",
+            "release/{version}.md",
+            "releases/{version}.md",
+        ]
+        return [template.format(version=version) for version in versions for template in templates]
+
+    def _api_doc_path_candidates(
+        self,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> list[str]:
+        symbols = self._api_symbols(api_usages, api_contexts)
+        templates = [
+            "docs/api/{slug}.md",
+            "docs/api/{slug}.rst",
+            "docs/reference/{slug}.md",
+            "docs/reference/{slug}.rst",
+            "docs/concepts/{slug}.md",
+            "docs/concepts/{slug_plural}.md",
+            "docs/usage/{slug}.md",
+            "doc/source/reference/generated/{api}.rst",
+            "docs/source/reference/generated/{api}.rst",
+        ]
+        candidates = []
+        for symbol in symbols[:16]:
+            slug = self._slugify_symbol(symbol)
+            api = symbol.replace("/", ".").replace("::", ".")
+            for template in templates:
+                candidates.append(template.format(
+                    slug=slug,
+                    slug_plural=f"{slug}s",
+                    api=api,
+                ))
+        return self._dedupe_paths(candidates)
+
+    def _api_symbols(
+        self,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> list[str]:
+        symbols = []
+        for usage in api_usages or []:
+            usage = (usage or "").strip()
+            if not usage:
+                continue
+            symbols.append(usage)
+            parts = [part for part in re.split(r"[.:/]+", usage) if part]
+            if len(parts) >= 2:
+                symbols.append(parts[-1])
+                symbols.append(".".join(parts[-2:]))
+        for context in api_contexts or []:
+            if not isinstance(context, dict):
+                continue
+            for key in ("api", "matched_text", "old_api"):
+                value = str(context.get(key, "") or "").strip()
+                if value:
+                    symbols.append(value.strip("("))
+            for method in re.findall(r"\.([A-Za-z_]\w*)\s*\(", str(context.get("code_snippet", "") or "")):
+                symbols.append(method)
+
+        seen = set()
+        deduped = []
+        for symbol in symbols:
+            normalized = symbol.strip().strip(".")
+            if not normalized or normalized.lower() in seen:
+                continue
+            seen.add(normalized.lower())
+            deduped.append(normalized)
+        return deduped
+
+    def _slugify_symbol(self, symbol: str) -> str:
+        parts = [part for part in re.split(r"[.:/()]+", symbol) if part]
+        value = parts[-1] if parts else symbol
+        value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+        value = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower()
+        return value or "api"
+
+    async def _fetch_github_tree_docs(
+        self,
+        client: httpx.AsyncClient,
+        owner: str,
+        repo: str,
+        branch: str,
+        current_version: str,
+        latest_version: str,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]],
+        already_fetched_paths: set[str],
+    ) -> list[dict]:
+        try:
+            response = await client.get(
+                f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}",
+                headers=self._github_headers(),
+                params={"recursive": "1"},
+                timeout=15.0,
+            )
+            if response.status_code != 200:
+                return []
+            tree = response.json().get("tree", []) or []
+        except Exception as exc:
+            logger.debug("Error fetching GitHub tree for %s/%s: %s", owner, repo, exc)
+            return []
+
+        scored_paths = []
+        for item in tree:
+            if item.get("type") != "blob":
+                continue
+            path = item.get("path", "")
+            if path in already_fetched_paths:
+                continue
+            score = self._score_doc_path(path, api_usages, api_contexts, current_version, latest_version)
+            if score <= 0:
+                continue
+            scored_paths.append((score, path))
+
+        scored_paths.sort(key=lambda item: item[0], reverse=True)
+        references = []
+        for score, path in scored_paths[:self.github_tree_doc_limit]:
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+            content = await self._fetch_text_url(client, raw_url, self.changelog_file_max_chars)
+            if not content.strip():
+                continue
+            references.append({
+                "source": "github",
+                "title": path,
+                "url": f"https://github.com/{owner}/{repo}/blob/{branch}/{path}",
+                "content": content,
+                "discovery": "github_tree",
+                "path_score": score,
+            })
+        return references
+
+    def _score_doc_path(
+        self,
+        path: str,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]],
+        current_version: str,
+        latest_version: str,
+    ) -> int:
+        lowered = path.lower()
+        if not lowered.endswith((".md", ".rst", ".txt")):
+            return 0
+        if not any(part in lowered for part in ["doc", "docs", "change", "release", "migration", "upgrade", "whatsnew", "api", "reference"]):
+            return 0
+        if not self._path_versions_are_relevant(path, current_version, latest_version):
+            return 0
+
+        score = 0
+        if any(term in lowered for term in ["migration", "migrating", "upgrade", "upgrading"]):
+            score += 35
+        if any(term in lowered for term in ["changelog", "changes", "history", "release", "whatsnew", "what"]):
+            score += 25
+        if any(term in lowered for term in ["api", "reference", "concept", "usage"]):
+            score += 10
+        if lowered.startswith(("docs/", "doc/")):
+            score += 5
+
+        for version in self._candidate_version_strings(current_version, latest_version):
+            if version and version in lowered:
+                score += 18
+
+        for symbol in self._api_symbols(api_usages, api_contexts):
+            slug = self._slugify_symbol(symbol)
+            compact = re.sub(r"[^a-z0-9]+", "", symbol.lower())
+            path_compact = re.sub(r"[^a-z0-9]+", "", lowered)
+            if slug and slug in lowered:
+                score += 22
+            elif compact and compact in path_compact:
+                score += 16
+
+        return score
+
+    def _path_versions_are_relevant(self, path: str, current_version: str, latest_version: str) -> bool:
+        versions = self._versions_from_text(path)
+        if not versions:
+            return True
+        return any(self._version_is_relevant(version, current_version, latest_version) for version in versions)
+
+    def _versions_from_text(self, text: str) -> list[tuple[int, ...]]:
+        versions = []
+        for match in re.finditer(r"(?<!\d)v?(\d+\.\d+(?:\.\d+){0,2})(?!\d)", text or "", re.IGNORECASE):
+            versions.append(self._version_tuple(match.group(1)))
+        return versions
+
+    def _candidate_version_strings(self, current_version: str, latest_version: str) -> list[str]:
+        current = self._version_tuple(self._clean_version(current_version))
+        latest = self._version_tuple(self._clean_version(latest_version))
+        raw_versions = [
+            self._clean_version(current_version),
+            self._clean_version(latest_version),
+        ]
+
+        if len(current) >= 2 and len(latest) >= 2:
+            low, high = sorted([current, latest])
+            if low[0] == high[0] and 0 <= high[1] - low[1] <= 12:
+                for minor in range(low[1], high[1] + 1):
+                    raw_versions.append(f"{low[0]}.{minor}.0")
+
+        versions = []
+        seen = set()
+        for version in raw_versions:
+            version = (version or "").strip().lstrip("v")
+            if not version or version in seen:
+                continue
+            seen.add(version)
+            versions.append(version)
+        return versions[:16]
 
     async def _fetch_linked_changelog_pages(
         self,
@@ -459,7 +735,7 @@ class ScoutAgent:
                 continue
             if "://" in stripped:
                 continue
-            path_part = stripped.split()[0].strip()
+            path_part = stripped.split()[0].strip().strip("`<>")
             if not re.search(r"v?\d+\.\d+", path_part):
                 continue
             path_part = path_part.removesuffix(".rst").removesuffix(".md")
@@ -470,7 +746,9 @@ class ScoutAgent:
             if not self._version_is_relevant(version_tuple, current_version, latest_version):
                 continue
             extension = ".rst" if index_path.endswith(".rst") else ".md"
-            if "/" in path_part:
+            if base_dir and not path_part.startswith(f"{base_dir}/"):
+                candidate = f"{base_dir}/{path_part}{extension}"
+            elif "/" in path_part:
                 candidate = f"{path_part}{extension}"
             elif not base_dir:
                 candidate = f"{path_part}{extension}"
@@ -564,6 +842,10 @@ class ScoutAgent:
                 f"source: {reference.get('source', '')}",
                 f"url: {reference.get('url', '')}",
             ]
+            if reference.get("document_kind"):
+                block.append(f"document_kind: {reference.get('document_kind')}")
+            if reference.get("matched_terms"):
+                block.append(f"matched_terms: {', '.join(reference.get('matched_terms', []))}")
             if content:
                 block.append("excerpt:")
                 block.append(content[:3000])
@@ -573,7 +855,11 @@ class ScoutAgent:
                 break
         return "\n\n".join(sections)[:max_chars]
 
-    def _api_search_terms(self, api_usages: Optional[list[str]]) -> list[str]:
+    def _api_search_terms(
+        self,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> list[str]:
         terms: set[str] = set()
         for usage in api_usages or []:
             if not usage:
@@ -587,16 +873,303 @@ class ScoutAgent:
                     terms.add(parts[-1])
             if len(parts) >= 3:
                 terms.add(".".join(parts[-3:]))
+        for context in api_contexts or []:
+            if not isinstance(context, dict):
+                continue
+            for key in ("api", "old_api", "matched_text"):
+                value = str(context.get(key, "") or "").strip()
+                if value:
+                    terms.add(value)
+            snippet = str(context.get("code_snippet", "") or "")
+            for method in re.findall(r"\.([A-Za-z_]\w*)\s*\(", snippet):
+                if len(method) > 2:
+                    terms.add(method)
         return sorted(terms, key=lambda item: (-len(item), item))
+
+    def _root_package_terms(self, api_usages: Optional[list[str]]) -> set[str]:
+        roots = set()
+        for usage in api_usages or []:
+            parts = [part for part in re.split(r"[.:/]+", usage or "") if part]
+            if parts:
+                roots.add(parts[0].lower())
+        return roots
+
+    def _document_kind(self, reference: dict) -> str:
+        title = (reference.get("title") or "").lower()
+        url = (reference.get("url") or "").lower()
+        source = (reference.get("source") or "").lower()
+        text = " ".join([title, url, source])
+        if any(token in text for token in ["migration", "migrating", "upgrade", "upgrading"]):
+            return "migration_guide"
+        if any(token in text for token in ["changelog", "changes", "history", "release", "whatsnew", "what's new"]):
+            return "release_notes"
+        if any(token in text for token in ["docs.rs", "pkg.go.dev", "javadoc", "api docs", "documentation"]):
+            return "api_docs"
+        if any(token in text for token in ["pypi", "npm", "crates.io", "maven"]):
+            return "registry"
+        return "reference"
+
+    def _has_migration_language(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(term in lowered for term in [
+            "removed", "remove", "deprecated", "deprecation", "renamed",
+            "replaced", "replacement", "instead", "use ", "no longer",
+            "breaking", "backwards incompatible", "migration", "upgrade",
+            "changed signature", "signature", "requires", "must",
+        ])
+
+    def _normalized_evidence_text(self, text: str) -> str:
+        value = (text or "").lower()
+        value = re.sub(r":[a-z_]+:`~?([^`]+)`", r"\1", value)
+        value = value.replace("``", "")
+        value = value.replace("`", "")
+        value = re.sub(r"\s+", " ", value)
+        return value
+
+    def _method_api_profiles(self, api_usages: Optional[list[str]]) -> list[dict]:
+        profiles = []
+        for usage in api_usages or []:
+            parts = [part for part in re.split(r"[.:/]+", usage or "") if part]
+            if len(parts) < 3:
+                continue
+            owner = parts[-2]
+            method = parts[-1]
+            if not owner or not method:
+                continue
+            profiles.append({
+                "api": usage,
+                "owner": owner,
+                "method": method,
+                "exact": f"{owner}.{method}",
+            })
+        return profiles
+
+    def _method_evidence_score(self, text: str, api_usages: Optional[list[str]]) -> tuple[int, list[str]]:
+        normalized = self._normalized_evidence_text(text)
+        score = 0
+        matches = []
+        for profile in self._method_api_profiles(api_usages):
+            owner = profile["owner"].lower()
+            method = profile["method"].lower()
+            exact = profile["exact"].lower()
+            if exact in normalized:
+                score += 90
+                matches.append(profile["exact"])
+                continue
+
+            owner_positions = [match.start() for match in re.finditer(re.escape(owner), normalized)]
+            method_positions = [match.start() for match in re.finditer(re.escape(method), normalized)]
+            if not owner_positions or not method_positions:
+                continue
+            min_distance = min(abs(owner_pos - method_pos) for owner_pos in owner_positions for method_pos in method_positions)
+            if min_distance <= 120:
+                score += 35
+                matches.append(f"{profile['owner']}~{profile['method']}")
+        return score, matches
+
+    def _split_reference_chunks(self, reference: dict) -> list[dict]:
+        content = (reference.get("content") or "").strip()
+        if not content:
+            return []
+
+        paragraphs = re.split(r"\n\s*\n", content)
+        chunks: list[dict] = []
+        current: list[str] = []
+        current_start = 1
+        line_cursor = 1
+
+        def flush(end_line: int) -> None:
+            nonlocal current, current_start
+            text = "\n\n".join(part.strip() for part in current if part.strip()).strip()
+            if text:
+                chunks.append({
+                    **reference,
+                    "content": text[: self.evidence_chunk_chars + 300],
+                    "line_start": current_start,
+                    "line_end": max(current_start, end_line),
+                    "document_kind": self._document_kind(reference),
+                })
+            current = []
+            current_start = line_cursor
+
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                line_cursor += 1
+                continue
+            paragraph_lines = paragraph.count("\n") + 1
+            pending = "\n\n".join(current + [paragraph])
+            if current and len(pending) > self.evidence_chunk_chars:
+                flush(line_cursor - 1)
+            if not current:
+                current_start = line_cursor
+            if len(paragraph) > self.evidence_chunk_chars:
+                for start in range(0, len(paragraph), self.evidence_chunk_chars):
+                    current = [paragraph[start:start + self.evidence_chunk_chars]]
+                    flush(line_cursor + paragraph_lines - 1)
+            else:
+                current.append(paragraph)
+            line_cursor += paragraph_lines + 1
+
+        if current:
+            flush(line_cursor - 1)
+        return chunks
+
+    def _score_evidence_chunk(
+        self,
+        chunk: dict,
+        terms: list[str],
+        api_usages: Optional[list[str]] = None,
+        current_version: str = "",
+        latest_version: str = "",
+    ) -> tuple[int, list[str]]:
+        text = " ".join([
+            str(chunk.get("title", "")),
+            str(chunk.get("url", "")),
+            str(chunk.get("content", "")),
+        ])
+        lowered = text.lower()
+        matched_terms = []
+        score = 0
+
+        for term in terms:
+            term_lower = term.lower()
+            if not term_lower:
+                continue
+            if term_lower in lowered:
+                matched_terms.append(term)
+                score += 10 + min(8, len(term_lower) // 5)
+
+        change_terms = [
+            "removed", "remove", "deprecated", "deprecation", "renamed",
+            "replaced", "replacement", "instead", "use ", "no longer",
+            "breaking", "backwards incompatible", "migration", "upgrade",
+            "changed signature", "signature", "requires", "must",
+        ]
+        score += sum(3 for term in change_terms if term in lowered)
+        method_score, method_matches = self._method_evidence_score(text, api_usages)
+        score += method_score
+        matched_terms.extend(method_matches)
+
+        for version in [self._clean_version(current_version), self._clean_version(latest_version)]:
+            if version and version.lower() in lowered:
+                score += 2
+
+        kind = chunk.get("document_kind")
+        if kind == "migration_guide":
+            score += 8
+        elif kind == "release_notes":
+            score += 6
+        elif kind == "api_docs":
+            score += 3
+
+        return score, matched_terms
+
+    def _ranked_evidence_chunks(
+        self,
+        references: list[dict],
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+        current_version: str = "",
+        latest_version: str = "",
+    ) -> list[dict]:
+        terms = self._api_search_terms(api_usages, api_contexts)
+        if not terms:
+            return []
+        root_terms = self._root_package_terms(api_usages)
+
+        ranked: list[tuple[int, int, dict]] = []
+        for reference_index, reference in enumerate(self._dedupe_references(references), start=1):
+            reference_locator = " ".join([
+                str(reference.get("title", "")),
+                str(reference.get("url", "")),
+            ])
+            if not self._path_versions_are_relevant(reference_locator, current_version, latest_version):
+                continue
+            for chunk_index, chunk in enumerate(self._split_reference_chunks(reference), start=1):
+                score, matched_terms = self._score_evidence_chunk(
+                    chunk,
+                    terms,
+                    api_usages,
+                    current_version,
+                    latest_version,
+                )
+                strong_terms = [
+                    term
+                    for term in matched_terms
+                    if term.lower() not in root_terms and len(term.strip()) > 2
+                ]
+                if not strong_terms:
+                    if chunk.get("document_kind") == "registry":
+                        continue
+                    if not self._has_migration_language(str(chunk.get("content", ""))):
+                        continue
+                if score < 10 or not matched_terms:
+                    continue
+                ranked.append((score, -reference_index, {
+                    "source": chunk.get("source", ""),
+                    "title": chunk.get("title") or chunk.get("source") or "Reference",
+                    "url": chunk.get("url", ""),
+                    "content": chunk.get("content", ""),
+                    "document_kind": chunk.get("document_kind", "reference"),
+                    "line_start": chunk.get("line_start"),
+                    "line_end": chunk.get("line_end"),
+                    "matched_terms": sorted(set(matched_terms), key=lambda item: (-len(item), item))[:8],
+                    "strong_terms": sorted(set(strong_terms), key=lambda item: (-len(item), item))[:8],
+                    "score": score,
+                    "reference_index": reference_index,
+                    "chunk_index": chunk_index,
+                }))
+
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        evidence = []
+        seen = set()
+        for _score, _ref_order, chunk in ranked:
+            key = (chunk["url"], chunk["content"][:160])
+            if key in seen:
+                continue
+            seen.add(key)
+            evidence.append(chunk)
+            if len(evidence) >= self.evidence_max_chunks:
+                break
+        return evidence
 
     def _focused_reference_snippets(
         self,
         references: list[dict],
         api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+        current_version: str = "",
+        latest_version: str = "",
     ) -> list[dict]:
-        terms = self._api_search_terms(api_usages)
+        ranked_chunks = self._ranked_evidence_chunks(
+            references,
+            api_usages,
+            api_contexts,
+            current_version,
+            latest_version,
+        )
+        if ranked_chunks:
+            return [
+                {
+                    "source": chunk.get("source", ""),
+                    "title": f"{chunk.get('title') or chunk.get('source')} (evidence chunk)",
+                    "url": chunk.get("url", ""),
+                    "content": chunk.get("content", ""),
+                    "document_kind": chunk.get("document_kind", "reference"),
+                    "matched_terms": chunk.get("matched_terms", []),
+                    "strong_terms": chunk.get("strong_terms", []),
+                    "score": chunk.get("score", 0),
+                    "line_start": chunk.get("line_start"),
+                    "line_end": chunk.get("line_end"),
+                }
+                for chunk in ranked_chunks
+            ]
+
+        terms = self._api_search_terms(api_usages, api_contexts)
         if not terms:
             return []
+        root_terms = self._root_package_terms(api_usages)
 
         focused = []
         for reference in self._dedupe_references(references):
@@ -606,6 +1179,7 @@ class ScoutAgent:
 
             windows = []
             lowered = content.lower()
+            matched_terms = set()
             for term in terms:
                 term_lower = term.lower()
                 start = 0
@@ -613,6 +1187,7 @@ class ScoutAgent:
                     index = lowered.find(term_lower, start)
                     if index < 0:
                         break
+                    matched_terms.add(term)
                     window_start = max(0, index - self.evidence_window_chars)
                     window_end = min(len(content), index + len(term) + self.evidence_window_chars)
                     windows.append((window_start, window_end))
@@ -620,6 +1195,16 @@ class ScoutAgent:
 
             if not windows:
                 continue
+            strong_terms = [
+                term
+                for term in matched_terms
+                if term.lower() not in root_terms and len(term.strip()) > 2
+            ]
+            if not strong_terms:
+                if self._document_kind(reference) == "registry":
+                    continue
+                if not self._has_migration_language(content):
+                    continue
 
             merged = []
             for start, end in sorted(windows):
@@ -639,6 +1224,9 @@ class ScoutAgent:
                     **reference,
                     "title": f"{reference.get('title') or reference.get('source')} (focused evidence)",
                     "content": "\n\n---\n\n".join(snippets),
+                    "document_kind": self._document_kind(reference),
+                    "matched_terms": sorted(matched_terms, key=lambda item: (-len(item), item))[:8],
+                    "strong_terms": sorted(strong_terms, key=lambda item: (-len(item), item))[:8],
                 })
 
         return focused
@@ -654,6 +1242,8 @@ class ScoutAgent:
         owner: str = "",
         repo: str = "",
         release_notes: str = "",
+        api_usages: Optional[list[str]] = None,
+        api_contexts: Optional[list[dict]] = None,
     ) -> list[dict]:
         references = []
         repo_url = self._normalize_repo_url(repo_url)
@@ -699,6 +1289,8 @@ class ScoutAgent:
                 default_branch,
                 current_version,
                 latest_version,
+                api_usages,
+                api_contexts,
             ))
 
         if release_notes.strip():
@@ -709,22 +1301,185 @@ class ScoutAgent:
                 "content": release_notes,
             })
 
+        references.extend(await self._fetch_docs_url_references(
+            client,
+            references,
+            package,
+            current_version,
+            latest_version,
+            api_usages,
+            api_contexts,
+        ))
         return self._dedupe_references(references)
 
-    def _references_changelog_text(self, references: list[dict], api_usages: Optional[list[str]] = None) -> str:
-        focused = self._focused_reference_snippets(references, api_usages)
-        if api_usages:
-            references = focused
+    async def _fetch_docs_url_references(
+        self,
+        client: httpx.AsyncClient,
+        references: list[dict],
+        package: str,
+        current_version: str,
+        latest_version: str,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]],
+    ) -> list[dict]:
+        candidates = self._docs_url_candidates(
+            references,
+            package,
+            current_version,
+            latest_version,
+            api_usages,
+            api_contexts,
+        )
+        fetched = []
+        for title, url in candidates[:self.docs_url_fetch_limit]:
+            content = await self._fetch_text_url(client, url, self.changelog_file_max_chars)
+            if not content.strip():
+                continue
+            fetched.append({
+                "source": "docs",
+                "title": title,
+                "url": url,
+                "content": content,
+                "discovery": "docs_url",
+            })
+        return fetched
+
+    def _docs_url_candidates(
+        self,
+        references: list[dict],
+        package: str,
+        current_version: str,
+        latest_version: str,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]],
+    ) -> list[tuple[str, str]]:
+        urls = set()
+        for reference in references:
+            url = (reference.get("url") or "").strip()
+            if self._is_docs_like_url(url):
+                urls.add(url)
+            content = reference.get("content") or ""
+            for found in re.findall(r"https?://[^\s)>\"]+", content):
+                found = found.rstrip(".,;")
+                if self._is_docs_like_url(found):
+                    urls.add(found)
+
+        candidates: list[tuple[str, str]] = []
+        for url in sorted(urls):
+            base = self._docs_base_url(url)
+            if not base:
+                continue
+            candidates.append(("Documentation page", url))
+            for suffix in self._docs_suffix_candidates(package, current_version, latest_version, api_usages, api_contexts):
+                candidates.append((suffix.strip("/") or "Documentation", f"{base}/{suffix.lstrip('/')}"))
+
+        seen = set()
+        deduped = []
+        for title, url in candidates:
+            normalized = url.rstrip("/")
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append((title, normalized))
+        return deduped
+
+    def _is_docs_like_url(self, url: str) -> bool:
+        if not url:
+            return False
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        text = f"{host}{path}"
+        if "github.com" in host:
+            return False
+        return any(token in text for token in [
+            "docs", "documentation", "readthedocs", "gitbook", "docusaurus",
+            "mkdocs", "api", "reference", "migration", "upgrade", "changelog",
+        ])
+
+    def _docs_base_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        path = parsed.path.strip("/")
+        parts = [part for part in path.split("/") if part]
+        base_parts = []
+        if parts and parts[0] in {"latest", "stable", "dev", "main"}:
+            base_parts.append(parts[0])
+        elif len(parts) >= 2 and re.match(r"v?\d+(?:\.\d+)*", parts[0]):
+            base_parts.append(parts[0])
+        return f"{parsed.scheme}://{parsed.netloc}/{'/'.join(base_parts)}".rstrip("/")
+
+    def _docs_suffix_candidates(
+        self,
+        package: str,
+        current_version: str,
+        latest_version: str,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]],
+    ) -> list[str]:
+        suffixes = [
+            "llms.txt",
+            "llms-full.txt",
+            "migration/",
+            "migrations/",
+            "upgrade/",
+            "upgrading/",
+            "changelog/",
+            "release-notes/",
+            "releases/",
+            "api/",
+            "reference/",
+        ]
+        for version in self._candidate_version_strings(current_version, latest_version):
+            suffixes.extend([
+                f"{version}/",
+                f"v{version}/",
+                f"{version}/migration/",
+                f"v{version}/migration/",
+            ])
+        for symbol in self._api_symbols(api_usages, api_contexts):
+            slug = self._slugify_symbol(symbol)
+            suffixes.extend([
+                f"api/{slug}/",
+                f"reference/{slug}/",
+                f"concepts/{slug}/",
+                f"usage/{slug}/",
+            ])
+        return self._dedupe_paths(suffixes)
+
+    def _references_changelog_text(
+        self,
+        references: list[dict],
+        api_usages: Optional[list[str]] = None,
+        api_contexts: Optional[list[dict]] = None,
+        current_version: str = "",
+        latest_version: str = "",
+    ) -> str:
+        focused = self._focused_reference_snippets(
+            references,
+            api_usages,
+            api_contexts,
+            current_version,
+            latest_version,
+        )
 
         sections = []
-        for reference in references:
-            title = (reference.get("title") or "").lower()
-            source = (reference.get("source") or "").lower()
+        for index, reference in enumerate(focused, start=1):
             content = (reference.get("content") or "").strip()
             if not content:
                 continue
-            if source == "github" or any(token in title for token in ["changelog", "change", "history", "release", "migration", "upgrade"]):
-                sections.append(f"## {reference.get('title')}\n{content}")
+            sections.append(
+                "\n".join([
+                    f"## Evidence chunk {index}: {reference.get('title')}",
+                    f"source: {reference.get('source', '')}",
+                    f"url: {reference.get('url', '')}",
+                    f"document_kind: {reference.get('document_kind', '')}",
+                    f"matched_terms: {', '.join(reference.get('matched_terms', []))}",
+                    f"strong_terms: {', '.join(reference.get('strong_terms', []))}",
+                    content,
+                ])
+            )
         return "\n\n".join(sections)
 
     async def _analyze_references(
@@ -735,11 +1490,24 @@ class ScoutAgent:
         to_v: str,
         api_usages: Optional[list[str]],
         references: list[dict],
+        api_contexts: Optional[list[dict]] = None,
     ) -> dict:
-        evidence_references = self._focused_reference_snippets(references, api_usages)
+        evidence_references = self._focused_reference_snippets(
+            references,
+            api_usages,
+            api_contexts,
+            from_v,
+            to_v,
+        )
         result["evidence_references"] = evidence_references
-        changelog_text = self._references_changelog_text(references, api_usages)
-        if changelog_text.strip():
+        changelog_text = self._references_changelog_text(
+            references,
+            api_usages,
+            api_contexts,
+            from_v,
+            to_v,
+        )
+        if evidence_references and changelog_text.strip():
             llm_result = await self._analyze_changelog_with_llm(
                 package,
                 from_v,
@@ -749,6 +1517,7 @@ class ScoutAgent:
                 evidence_references or references,
             )
             result["breaking_changes"] = llm_result.get("breaking_changes", [])
+            result["api_evidence"] = llm_result.get("api_evidence", [])
             result["confidence_score"] = llm_result.get("confidence_score", 0.0)
             result["llm_provider"] = llm_result.get("llm_provider", "none")
             if result["breaking_changes"]:
@@ -779,9 +1548,10 @@ class ScoutAgent:
             usage_constraint = f"\nCRITICAL: You MUST ONLY extract breaking changes that affect these specific APIs used in the project: [{usages_str}]. Ignore all other breaking changes."
 
         prompt = f"""
-            Analyze the changelog for '{package}' from version {from_v} to {to_v} and extract ONLY breaking changes relevant to the package's ecosystem and API usage:{usage_constraint}
+            Analyze DepGuard's compact evidence dossier for '{package}' from version {from_v} to {to_v} and extract ONLY breaking changes relevant to the package's ecosystem and API usage:{usage_constraint}
+            The dossier is already retrieved and ranked. Do not use outside knowledge to add APIs, replacements, or version facts.
             Prefer old_api values that match the exact APIs used by the project when possible.
-            Fill new_api only when the references document a replacement, renamed API, changed signature, or clear migration pattern.
+            Fill new_api only when an evidence chunk documents a replacement, renamed API, changed signature, or clear migration pattern.
             If a referenced change needs review but no replacement is documented, leave new_api empty and explain why.
             Return a JSON object with this exact structure:
             {{
@@ -793,12 +1563,29 @@ class ScoutAgent:
                 "description": "short description"
                 }}
             ],
+            "api_evidence": [
+                {{
+                "api": "API affected",
+                "change_type": "removed|renamed|changed_signature|behavior_change|migration_review",
+                "replacement": "replacement/workaround or empty string",
+                "confidence": "high|medium|low",
+                "evidence": [
+                    {{
+                    "source_index": 1,
+                    "source": "release_notes|migration_guide|api_docs|registry|reference",
+                    "url": "source URL",
+                    "quote": "short supporting quote from the evidence dossier"
+                    }}
+                ],
+                "reason": "one sentence explaining why this evidence applies"
+                }}
+            ],
             "confidence_score": 0.9
             }}
-            References gathered by DepGuard:
+            Compact evidence chunks gathered by DepGuard:
             {self._format_references_for_llm(references or [])}
 
-            Changelog:
+            Evidence dossier:
             {changelog[:self.analysis_max_chars]}
             """
         try:
@@ -825,7 +1612,19 @@ class ScoutAgent:
                 return data
         return None
 
-    async def run(self, package_info: dict, api_usages: Optional[list[str]] = None) -> dict:
+    async def _close_router(self) -> None:
+        close = getattr(self.router, "aclose", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
+    async def run(
+        self,
+        package_info: dict,
+        api_usages: Optional[list[str]] = None,
+        api_contexts: Optional[list[dict]] = None,
+    ) -> dict:
         name = package_info.get("name")
         current_version = package_info.get("current_version")
         latest_version = package_info.get("latest_version")
@@ -851,30 +1650,60 @@ class ScoutAgent:
             "confidence_score": 0.0,
             "changelog_url": "",
             "references": [],
+            "evidence_references": [],
+            "api_evidence": [],
         }
-        async with httpx.AsyncClient() as client:
-            repo_url = await self._get_github_repo(client, name, ecosystem)
-            if not repo_url:
-                references = await self._collect_references(
-                    client,
-                    name,
-                    ecosystem,
-                    repo_url="",
-                    current_version=current_version,
-                    latest_version=latest_version,
-                )
-                result["references"] = references
-                return await self._analyze_references(
-                    result,
-                    name,
-                    current_version,
-                    latest_version,
-                    api_usages,
-                    references,
-                )
+        try:
+            async with httpx.AsyncClient() as client:
+                repo_url = await self._get_github_repo(client, name, ecosystem)
+                if not repo_url:
+                    references = await self._collect_references(
+                        client,
+                        name,
+                        ecosystem,
+                        repo_url="",
+                        current_version=current_version,
+                        latest_version=latest_version,
+                        api_usages=api_usages,
+                        api_contexts=api_contexts,
+                    )
+                    result["references"] = references
+                    return await self._analyze_references(
+                        result,
+                        name,
+                        current_version,
+                        latest_version,
+                        api_usages,
+                        references,
+                        api_contexts,
+                    )
 
-            owner, repo = self._parse_github_owner_repo(repo_url)
-            if not owner or not repo:
+                owner, repo = self._parse_github_owner_repo(repo_url)
+                if not owner or not repo:
+                    references = await self._collect_references(
+                        client,
+                        name,
+                        ecosystem,
+                        repo_url=repo_url,
+                        current_version=current_version,
+                        latest_version=latest_version,
+                        api_usages=api_usages,
+                        api_contexts=api_contexts,
+                    )
+                    result["references"] = references
+                    return await self._analyze_references(
+                        result,
+                        name,
+                        current_version,
+                        latest_version,
+                        api_usages,
+                        references,
+                        api_contexts,
+                    )
+                
+                result["changelog_url"] = f"https://github.com/{owner}/{repo}/releases"
+
+                changelog_text = await self._fetch_release_notes(client, owner, repo, current_version, latest_version)
                 references = await self._collect_references(
                     client,
                     name,
@@ -882,6 +1711,11 @@ class ScoutAgent:
                     repo_url=repo_url,
                     current_version=current_version,
                     latest_version=latest_version,
+                    owner=owner,
+                    repo=repo,
+                    release_notes=changelog_text,
+                    api_usages=api_usages,
+                    api_contexts=api_contexts,
                 )
                 result["references"] = references
                 return await self._analyze_references(
@@ -891,45 +1725,16 @@ class ScoutAgent:
                     latest_version,
                     api_usages,
                     references,
+                    api_contexts,
                 )
-            
-            result["changelog_url"] = f"https://github.com/{owner}/{repo}/releases"
-
-            changelog_text = await self._fetch_release_notes(client, owner, repo, current_version, latest_version)
-            references = await self._collect_references(
-                client,
-                name,
-                ecosystem,
-                repo_url=repo_url,
-                current_version=current_version,
-                latest_version=latest_version,
-                owner=owner,
-                repo=repo,
-                release_notes=changelog_text,
-            )
-            result["references"] = references
-            if not changelog_text:
-                return await self._analyze_references(
-                    result,
-                    name,
-                    current_version,
-                    latest_version,
-                    api_usages,
-                    references,
-                )
-            
-            llm_result = await self._analyze_changelog_with_llm(
-                name,
-                current_version,
-                latest_version,
-                changelog_text,
-                api_usages,
-                references,
-            )
-            result["breaking_changes"] = llm_result.get("breaking_changes", [])
-            result["confidence_score"] = llm_result.get("confidence_score", 0.0)
-            result["llm_provider"] = llm_result.get("llm_provider", "none")
+        finally:
+            await self._close_router()
         return result
 
-    def run_sync(self, package_info: dict, api_usages: Optional[list[str]] = None) -> dict:
-        return asyncio.run(self.run(package_info, api_usages))
+    def run_sync(
+        self,
+        package_info: dict,
+        api_usages: Optional[list[str]] = None,
+        api_contexts: Optional[list[dict]] = None,
+    ) -> dict:
+        return asyncio.run(self.run(package_info, api_usages, api_contexts))

@@ -214,8 +214,8 @@ def _migration_review_breaking_changes(package: str, from_v: str, to_v: str, api
 def _prefer_specific_api_usages(api_usages: list[str]) -> list[str]:
     """Drop broad parent APIs when a more precise child usage is present.
 
-    If usage discovery finds both ``pandas.DataFrame`` and
-    ``pandas.DataFrame.append``, the fallback should review the method-level
+    If usage discovery finds both ``package.Type`` and
+    ``package.Type.method``, the fallback should review the method-level
     target only. Keeping the parent creates noisy LLM calls around ordinary
     constructors and can drag unrelated methods in the same function into the
     review surface.
@@ -547,8 +547,9 @@ def preview_update(req: UpdateRequest):
 
         ast_scanner = ASTScanner()
         api_usages = ast_scanner.find_api_usages(str(folder_path), package)
+        api_contexts = ast_scanner.find_api_usage_contexts(str(folder_path), package)
         scout = ScoutAgent()
-        scout_output = scout.run_sync(pkg_info_dict, api_usages)
+        scout_output = scout.run_sync(pkg_info_dict, api_usages, api_contexts)
         scout_output, ast_output = _scan_breaking_changes_with_review_fallback(
             ast_scanner,
             folder_path,
@@ -824,10 +825,11 @@ def update_package(req: UpdateRequest):
         
         # Step 1: Find API usages in codebase first
         api_usages = ast_scanner.find_api_usages(str(folder_path), pkg_info_dict.get("name", ""))
+        api_contexts = ast_scanner.find_api_usage_contexts(str(folder_path), pkg_info_dict.get("name", ""))
         
         # Step 2: Run targeted Scout
         scout = ScoutAgent()
-        scout_output = scout.run_sync(pkg_info_dict, api_usages)
+        scout_output = scout.run_sync(pkg_info_dict, api_usages, api_contexts)
         
         breaking_changes = scout_output.get("breaking_changes", [])
         

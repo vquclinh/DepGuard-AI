@@ -70,7 +70,7 @@ class LockfileResolver:
         with open(lockfile, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # npm v2/v3 lockfile: "packages" key uses paths like "node_modules/react"
+        # npm v2/v3 lockfile: "packages" key stores package paths under node_modules.
         packages = data.get("packages", {})
         for path, info in packages.items():
             pkg_name = path.replace("node_modules/", "").lower()

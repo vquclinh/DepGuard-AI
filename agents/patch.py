@@ -6,6 +6,7 @@ import logging
 import argparse
 import subprocess
 import ast
+import inspect
 import uuid
 import sys
 import time
@@ -290,6 +291,7 @@ class PatchAgent:
         compact_breaking_changes = scout_context.get("breaking_changes", [])[:16]
         matches_str = json.dumps(compact_matches, separators=(",", ":"))
         bc_str = json.dumps(compact_breaking_changes, separators=(",", ":"))
+        api_evidence_str = self._format_api_evidence(scout_context.get("api_evidence", []))
         references_str = self._format_scout_references(
             scout_context.get("evidence_references") or scout_context.get("references", [])
         )
@@ -320,8 +322,8 @@ class PatchAgent:
         system_prompt = (
             "You are DepGuard's deterministic code migration patch engine.\n"
             "Your job is to produce a machine-parseable patch plan, not a narrative.\n"
-            "Use the package/version migration context, matched API usages, source code, and widely known compatibility rules to decide whether a code edit is needed.\n"
-            "When new_api is empty, analyze the matched code and source carefully; propose a safe migration if the required replacement is clear from the code/API behavior.\n"
+            "Use the package/version migration context, matched API usages, source code, and DepGuard API evidence to decide whether a code edit is needed.\n"
+            "Prefer documented Scout evidence over model memory. When new_api is empty, only infer a migration if the attached evidence or source block makes the replacement unambiguous.\n"
             "Do not make unrelated stylistic rewrites or speculative edits outside the matched migration surface.\n"
             "Patch only exact target ranges supplied by DepGuard. Never return line-level edits inside a larger target block.\n"
             "Preserve unrelated code, behavior, formatting, comments, imports, and indentation unless the migration evidence requires a change.\n"
@@ -335,6 +337,9 @@ class PatchAgent:
             Package Migration Context: {scout_context.get("package")} {scout_context.get("from_version")} -> {scout_context.get("to_version")}
             Breaking Changes:
             {bc_str}
+
+            DepGuard API Evidence:
+            {api_evidence_str}
 
             DepGuard Scout References:
             {references_str}
@@ -378,6 +383,40 @@ class PatchAgent:
             """
         return system_prompt, prompt, target_blocks
 
+    def _format_api_evidence(self, api_evidence: list, max_chars: int = 10000) -> str:
+        if not api_evidence:
+            return "No structured API evidence was attached by Scout."
+        blocks = []
+        for index, item in enumerate(api_evidence[:12], start=1):
+            if not isinstance(item, dict):
+                continue
+            evidence_lines = []
+            for evidence in item.get("evidence", [])[:3]:
+                if not isinstance(evidence, dict):
+                    continue
+                quote = str(evidence.get("quote", "") or "").strip()
+                evidence_lines.append(
+                    " | ".join(filter(None, [
+                        str(evidence.get("source", "") or ""),
+                        str(evidence.get("url", "") or ""),
+                        quote[:500],
+                    ]))
+                )
+            block = [
+                f"[{index}] api: {item.get('api', '')}",
+                f"change_type: {item.get('change_type', '')}",
+                f"replacement: {item.get('replacement', '')}",
+                f"confidence: {item.get('confidence', '')}",
+                f"reason: {item.get('reason', '')}",
+            ]
+            if evidence_lines:
+                block.extend(["evidence:", "\n".join(evidence_lines)])
+            blocks.append("\n".join(block))
+            if len("\n\n".join(blocks)) > max_chars:
+                blocks.append("... API evidence truncated ...")
+                break
+        return "\n\n".join(blocks)[:max_chars]
+
     def _format_scout_references(self, references: list, max_chars: int = 12000) -> str:
         if not references:
             return "No external references were attached by Scout."
@@ -391,6 +430,10 @@ class PatchAgent:
                 f"source: {reference.get('source', '')}",
                 f"url: {reference.get('url', '')}",
             ]
+            if reference.get("document_kind"):
+                block.append(f"document_kind: {reference.get('document_kind')}")
+            if reference.get("matched_terms"):
+                block.append(f"matched_terms: {', '.join(reference.get('matched_terms', []))}")
             if content:
                 block.extend(["excerpt:", content[:2000]])
             blocks.append("\n".join(block))
@@ -934,8 +977,21 @@ class PatchAgent:
         report["overall_status"] = "success"
         return report
 
+    async def _close_router(self) -> None:
+        close = getattr(self.router, "aclose", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
     def run_sync(self, scout_output: dict, ast_scanner_output: dict, dep_file_path: str) -> dict:
-        return asyncio.run(self.run(scout_output, ast_scanner_output, dep_file_path))
+        async def _run_and_close() -> dict:
+            try:
+                return await self.run(scout_output, ast_scanner_output, dep_file_path)
+            finally:
+                await self._close_router()
+
+        return asyncio.run(_run_and_close())
 
     async def preview(self, scout_output: dict, ast_scanner_output: dict) -> dict:
         package = scout_output.get("package", "unknown")
@@ -985,4 +1041,10 @@ class PatchAgent:
         return report
 
     def preview_sync(self, scout_output: dict, ast_scanner_output: dict) -> dict:
-        return asyncio.run(self.preview(scout_output, ast_scanner_output))
+        async def _preview_and_close() -> dict:
+            try:
+                return await self.preview(scout_output, ast_scanner_output)
+            finally:
+                await self._close_router()
+
+        return asyncio.run(_preview_and_close())

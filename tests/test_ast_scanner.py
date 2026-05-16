@@ -84,6 +84,27 @@ def test_find_api_usages_tracks_python_constructor_method_dataflow(tmp_path: Pat
     assert "pandas.DataFrame.append" in usages
 
 
+def test_find_api_usage_contexts_for_scout_retrieval(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "import pandas as pd",
+            "",
+            "def dummy_pandas_trap():",
+            "    df1 = pd.DataFrame({'A': [1, 2]})",
+            "    df2 = pd.DataFrame({'A': [3, 4]})",
+            "    result = df1.append(df2, ignore_index=True)",
+            "    return result",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    contexts = ASTScanner().find_api_usage_contexts(str(tmp_path), "pandas")
+
+    assert any(context["api"] == "pandas.DataFrame.append" for context in contexts)
+    assert any("df1.append" in context["context"] for context in contexts)
+
+
 def test_scan_matches_python_constructor_method_dataflow_target(tmp_path: Path):
     (tmp_path / "app.py").write_text(
         "\n".join([
@@ -147,23 +168,25 @@ def test_scan_does_not_match_native_list_append_as_pandas_append(tmp_path: Path)
     assert matches[0]["code_snippet"].strip().startswith("result = df1.append")
 
 
-def test_find_api_usages_uses_common_python_aliases_when_import_is_missing(tmp_path: Path):
+def test_find_api_usages_uses_aliases_declared_in_code(tmp_path: Path):
     (tmp_path / "app.py").write_text(
         "\n".join([
-            "def dummy_pandas_trap():",
-            "    df1 = pd.DataFrame({'A': [1, 2]})",
-            "    df2 = pd.DataFrame({'A': [3, 4]})",
-            "    result = df1.append(df2, ignore_index=True)",
+            "import examplepkg as ex",
+            "",
+            "def dummy_usage():",
+            "    item1 = ex.Widget({'A': [1, 2]})",
+            "    item2 = ex.Widget({'A': [3, 4]})",
+            "    result = item1.merge(item2, ignore_index=True)",
             "    return result",
             "",
         ]),
         encoding="utf-8",
     )
 
-    usages = ASTScanner().find_api_usages(str(tmp_path), "pandas")
+    usages = ASTScanner().find_api_usages(str(tmp_path), "examplepkg")
 
-    assert "pandas.DataFrame" in usages
-    assert "pandas.DataFrame.append" in usages
+    assert "examplepkg.Widget" in usages
+    assert "examplepkg.Widget.merge" in usages
 
 
 def test_find_api_usages_handles_unicode_comments_before_method_calls(tmp_path: Path):

@@ -7,7 +7,7 @@ from api.main import PackageInfo, UpdateRequest, _migration_review_breaking_chan
 
 
 class EmptyScout:
-    def run_sync(self, package_info: dict, api_usages: list[str]):
+    def run_sync(self, package_info: dict, api_usages: list[str], api_contexts: list[dict] | None = None):
         return {
             "package": package_info["name"],
             "from_version": package_info["current_version"],

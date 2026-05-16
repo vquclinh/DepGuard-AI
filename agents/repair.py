@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -112,7 +113,17 @@ class RepairAgent:
         }
 
     def repair_sync(self, verification: dict[str, Any], changed_files: list[str]) -> dict[str, Any]:
-        return asyncio.run(self.repair(verification, changed_files))
+        async def _repair_and_close() -> dict[str, Any]:
+            try:
+                return await self.repair(verification, changed_files)
+            finally:
+                close = getattr(self.router, "aclose", None)
+                if callable(close):
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+
+        return asyncio.run(_repair_and_close())
 
     def _verification_error_text(self, verification: dict[str, Any]) -> str:
         chunks = []

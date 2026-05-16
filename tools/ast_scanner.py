@@ -151,20 +151,6 @@ class ASTScanner:
         "template_substitution", "char_literal", "character_literal",
     }
 
-    COMMON_PACKAGE_ALIASES = {
-        "cv2": {"cv"},
-        "matplotlib": {"mpl"},
-        "matplotlib.pyplot": {"plt"},
-        "numpy": {"np"},
-        "pandas": {"pd"},
-        "plotly.express": {"px"},
-        "polars": {"pl"},
-        "pyarrow": {"pa"},
-        "seaborn": {"sns"},
-        "tensorflow": {"tf"},
-        "torch": {"th"},
-    }
-
     def __init__(self):
         self.parsers: dict[str, Any] = {}
         self._tree_sitter_language: Any = None
@@ -268,6 +254,46 @@ class ASTScanner:
             all_used_apis.update(self._find_package_usages(content, package_name, aliases, ignored_ranges))
 
         return sorted(all_used_apis)
+
+    def find_api_usage_contexts(self, root_folder: str, package_name: str, limit: int = 40) -> list[dict]:
+        """Return compact code snippets for package API usages.
+
+        Scout uses these snippets to build better retrieval terms without asking
+        an LLM to guess which APIs are deprecated.
+        """
+        usages = self.find_api_usages(root_folder, package_name)
+        if not usages:
+            return []
+
+        synthetic_changes = [
+            {"old_api": usage, "new_api": "", "description": "", "type": "usage_context"}
+            for usage in usages
+        ]
+        scan_result = self.scan(root_folder, synthetic_changes)
+        contexts = []
+        for filepath, matches in scan_result.get("matches_by_file", {}).items():
+            try:
+                lines = self._read_text(Path(filepath)).splitlines()
+            except OSError:
+                continue
+            for match in matches:
+                line = int(match.get("line") or 0)
+                if line <= 0:
+                    continue
+                start = max(1, line - 2)
+                end = min(len(lines), line + 2)
+                snippet = "\n".join(lines[start - 1:end])
+                contexts.append({
+                    "file": filepath,
+                    "line": line,
+                    "api": match.get("old_api", ""),
+                    "matched_text": match.get("matched_text", ""),
+                    "code_snippet": match.get("code_snippet", ""),
+                    "context": snippet,
+                })
+                if len(contexts) >= limit:
+                    return contexts
+        return contexts
 
     def scan(self, root_folder: str, breaking_changes: list) -> dict:
         root = Path(root_folder)
@@ -495,13 +521,13 @@ class ASTScanner:
         """Infer package type method usages from simple local assignments.
 
         This keeps migration-review targets specific. For example:
-            import pandas as pd
-            df = pd.DataFrame(...)
-            df.append(...)
+            import package as pkg
+            value = pkg.Type(...)
+            value.method(...)
 
         becomes:
-            pandas.DataFrame
-            pandas.DataFrame.append
+            package.Type
+            package.Type.method
 
         The inference is intentionally conservative and lexical: it handles
         straightforward constructor assignments and reassignment chains without
@@ -513,8 +539,6 @@ class ASTScanner:
         for alias, real_name in aliases.items():
             if real_name == package_name or real_name.startswith(f"{package_name}.") or real_name.startswith(f"{package_name}/"):
                 package_aliases[alias] = real_name
-        for alias in self._common_aliases_for_package(package_name):
-            package_aliases.setdefault(alias, package_name)
 
         usages: set[str] = set()
         variable_types = self._infer_package_variable_types(
@@ -597,9 +621,6 @@ class ASTScanner:
             if real_name == package_name or real_name.startswith(f"{package_name}.") or real_name.startswith(f"{package_name}/"):
                 package_aliases[alias] = real_name
 
-        for alias in self._common_aliases_for_package(package_name):
-            package_aliases.setdefault(alias, package_name)
-
         return package_name, package_aliases
 
     def _find_dataflow_api_matches(
@@ -644,13 +665,6 @@ class ASTScanner:
             matches.extend(re.finditer(pattern, content, re.DOTALL))
 
         return matches
-
-    def _common_aliases_for_package(self, package_name: str) -> set[str]:
-        aliases = set(self.COMMON_PACKAGE_ALIASES.get(package_name, set()))
-        for module, module_aliases in self.COMMON_PACKAGE_ALIASES.items():
-            if module.startswith(f"{package_name}."):
-                aliases.update(module_aliases)
-        return aliases
 
     def _extract_aliases(self, content: str) -> dict[str, str]:
         aliases: dict[str, str] = {}

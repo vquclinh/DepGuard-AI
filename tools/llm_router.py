@@ -3,6 +3,7 @@ import time
 import json
 import logging
 import hashlib
+import inspect
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -93,6 +94,29 @@ class LLMRouter:
         else:
             self.qwen_client = None
             self.qwen_status = "disabled"
+
+    async def aclose(self) -> None:
+        clients = [
+            getattr(self, "anthropic_client", None),
+            getattr(self, "qwen_client", None),
+        ]
+        for client in clients:
+            if not client:
+                continue
+            close = getattr(client, "aclose", None) or getattr(client, "close", None)
+            if not callable(close):
+                continue
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except RuntimeError as exc:
+                if "event loop is closed" not in str(exc).lower():
+                    raise
+            except Exception as exc:
+                logger.debug("Error closing LLM client %s: %s", client.__class__.__name__, exc)
+        self.anthropic_client = None
+        self.qwen_client = None
 
     def _env_bool(self, name: str, default: bool = False) -> bool:
         value = os.getenv(name)

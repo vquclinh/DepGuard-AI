@@ -204,3 +204,21 @@ async def test_qwen_timeout_is_skipped_for_followup_calls(router_setup):
         await router.complete("sys", "user 2")
 
     assert "Qwen skipped after a previous timeout" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_router_aclose_closes_async_provider_clients(router_setup):
+    router = router_setup
+    anthropic_client = MagicMock()
+    anthropic_client.aclose = AsyncMock()
+    qwen_client = MagicMock()
+    qwen_client.aclose = AsyncMock()
+    router.anthropic_client = anthropic_client
+    router.qwen_client = qwen_client
+
+    await router.aclose()
+
+    anthropic_client.aclose.assert_awaited_once()
+    qwen_client.aclose.assert_awaited_once()
+    assert router.anthropic_client is None
+    assert router.qwen_client is None
