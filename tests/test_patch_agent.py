@@ -52,6 +52,17 @@ class JsonReplacementRouter:
         )
 
 
+class TextOnlyRouter:
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1000, task_type: str = "general"):
+        return LLMResponse(
+            content="I changed the deprecated call. The code should now use newpkg::do_thing().",
+            provider="fake",
+            model="test",
+            latency_ms=1,
+            fallback_used=False,
+        )
+
+
 def test_patch_agent_changes_rust_code_and_updates_cargo_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     src = tmp_path / "src"
     src.mkdir()
@@ -194,6 +205,37 @@ def test_patch_preview_sends_code_slice_not_full_file(tmp_path: Path, monkeypatc
     assert "fn unrelated" in report["files"][0]["patched"]
     assert "TARGET CODE BLOCKS TO PATCH" in router.last_prompt
     assert "fn unrelated" not in router.last_prompt
+
+
+def test_patch_preview_rejects_text_only_llm_response(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rust_file = tmp_path / "main.rs"
+    original = "fn main() {\n    oldpkg::do_thing();\n}\n"
+    rust_file.write_text(original, encoding="utf-8")
+
+    breaking_changes = [{
+        "type": "renamed",
+        "old_api": "oldpkg.do_thing",
+        "new_api": "newpkg.do_thing",
+        "description": "The function moved to newpkg.",
+    }]
+    scan_output = ASTScanner().scan(str(tmp_path), breaking_changes)
+
+    monkeypatch.setattr(patch_module, "LLMRouter", lambda: TextOnlyRouter())
+    monkeypatch.setattr(PatchAgent, "_get_impact_result", lambda self, filepath, matches: None)
+
+    report = PatchAgent(project_root=str(tmp_path)).preview_sync(
+        {
+            "package": "oldpkg",
+            "from_version": "1.0.0",
+            "to_version": "2.0.0",
+            "breaking_changes": breaking_changes,
+        },
+        scan_output,
+    )
+
+    assert report["files"][0]["status"] == "failed"
+    assert "did not contain JSON replacements" in report["files"][0]["error"]
+    assert report["files"][0]["patched"] == original
 
 
 def test_patch_agent_expands_related_impact_nodes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

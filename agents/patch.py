@@ -329,9 +329,13 @@ class PatchAgent:
         if replacements is not None:
             return self._apply_replacements(original_content, replacements, target_blocks)
 
-        # Backward compatibility for older prompts/tests/providers that return a
-        # complete file instead of JSON replacements.
-        return self._extract_code(response_text)
+        # Backward compatibility for older tests/providers that return a whole
+        # file in a code fence. Plain prose is never treated as source code.
+        fenced_code = self._extract_fenced_code(response_text)
+        if fenced_code is not None:
+            return fenced_code
+
+        raise ValueError("LLM response did not contain JSON replacements or fenced full-file code")
 
     def _absolute_project_file(self, file_path: str) -> str:
         path = Path(file_path)
@@ -418,6 +422,10 @@ class PatchAgent:
         if match:
             return match.group(1)
         return response_text.strip()
+
+    def _extract_fenced_code(self, response_text: str) -> str | None:
+        match = re.search(r'```(?:[A-Za-z0-9_+\-.#]+)?\n(.*?)\n```', response_text, re.DOTALL)
+        return match.group(1) if match else None
 
     def _code_fence_language(self, filepath: str) -> str:
         extension = os.path.splitext(filepath)[1].lower()

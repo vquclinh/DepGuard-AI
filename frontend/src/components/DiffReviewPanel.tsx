@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { RefObject } from "react";
+import type { ReactNode, RefObject } from "react";
 import {
-  Activity,
   AlertTriangle,
   ArrowLeft,
   Check,
@@ -306,10 +305,6 @@ export function DiffReviewActivityPanel({ activity }: { activity: DiffReviewActi
   if (!activity) {
     return (
       <div className="flex h-full min-h-0 flex-col overflow-hidden">
-        <div className="flex h-10 shrink-0 items-center gap-2 border-b px-3">
-          <Activity className="h-4 w-4" />
-          <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Progress</h2>
-        </div>
         <div className="min-h-0 flex-1 overflow-auto p-3">
           <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
             Click Update to preview changes and watch checker/repair progress here.
@@ -319,50 +314,99 @@ export function DiffReviewActivityPanel({ activity }: { activity: DiffReviewActi
     );
   }
 
-  const { preview, summary, isApplying, applyResult, applyError } = activity;
+  const { preview, isApplying, applyResult, applyError } = activity;
   const verification = applyResult?.repair?.final_verification ?? applyResult?.verification ?? null;
   const repair = applyResult?.repair ?? null;
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
-      <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
-        <div className="rounded-lg border bg-background p-3">
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Review</p>
-          <div className="mt-3 grid grid-cols-3 gap-2 text-center">
-            <Metric label="Accepted" value={summary.accepted} tone="emerald" />
-            <Metric label="Rejected" value={summary.rejected} tone="red" />
-            <Metric label="Pending" value={summary.pending} tone="zinc" />
-          </div>
+      <div className="min-h-0 flex-1 overflow-auto p-3">
+        <div className="space-y-3 border-l pl-3">
+          <ActivityEntry
+            title="Prepared review"
+            eyebrow="Preview response"
+            status="done"
+            detail={`${preview.package} ${preview.from_version} -> ${preview.to_version}`}
+          >
+            <ResponseLines
+              lines={[
+                `${preview.summary.total_files_changed} file(s) changed`,
+                `+${preview.summary.total_additions} additions, -${preview.summary.total_deletions} deletions`,
+                ...preview.files.slice(0, 6).map((file) => `${file.relative_path} (+${file.additions}/-${file.deletions})`),
+                ...(preview.files.length > 6 ? [`...${preview.files.length - 6} more file(s)`] : []),
+              ]}
+            />
+          </ActivityEntry>
+          <ActivityEntry
+            title={isApplying ? "Applying accepted changes" : applyResult ? "Applied accepted changes" : applyError ? "Apply failed" : "Waiting for apply"}
+            eyebrow="Current work"
+            status={isApplying ? "running" : applyResult ? "done" : applyError ? "failed" : "waiting"}
+            detail={
+              applyResult
+                ? `${applyResult.files_accepted.length} accepted, ${applyResult.files_rejected.length} rejected`
+                : applyError || "Review blocks, then click Apply Accepted."
+            }
+          />
+          <ActivityEntry
+            title={verification ? "Project check finished" : isApplying ? "Running project check" : "Project check pending"}
+            eyebrow="Checker"
+            status={verification ? verificationStatus(verification) : isApplying ? "running" : "waiting"}
+            detail={verification?.message ?? "DepGuard will run the project checker after files are written."}
+          >
+            {verification && <VerificationDetails verification={verification} />}
+          </ActivityEntry>
+          <ActivityEntry
+            title={repair ? "Repair Agent response" : "Repair Agent pending"}
+            eyebrow="Repair"
+            status={repair ? repairStatus(repair) : "waiting"}
+            detail={repairDescription(repair)}
+          >
+            {repair && repair.attempts.length > 0 && <RepairDetails repair={repair} />}
+          </ActivityEntry>
         </div>
-
-        <PipelineStep
-          title="Preview"
-          status="done"
-          description={`${preview.summary.total_files_changed} file(s) prepared for ${preview.package}.`}
-        />
-        <PipelineStep
-          title="Apply accepted changes"
-          status={isApplying ? "running" : applyResult ? "done" : applyError ? "failed" : "waiting"}
-          description={
-            applyResult
-              ? `${applyResult.files_accepted.length} file(s) accepted, ${applyResult.files_rejected.length} rejected.`
-              : applyError || "Waiting for Apply Accepted."
-          }
-        />
-        <PipelineStep
-          title="Run project check"
-          status={verification ? verificationStatus(verification) : isApplying ? "running" : "waiting"}
-          description={verification?.message ?? "DepGuard runs commands like cargo check, pytest, or npm test after apply."}
-        />
-        <PipelineStep
-          title="Repair Agent"
-          status={repair ? repairStatus(repair) : "waiting"}
-          description={repairDescription(repair)}
-        />
-
-        {verification && <VerificationDetails verification={verification} />}
-        {repair && repair.attempts.length > 0 && <RepairDetails repair={repair} />}
       </div>
+    </div>
+  );
+}
+
+function ActivityEntry({
+  title,
+  eyebrow,
+  status,
+  detail,
+  children,
+}: {
+  title: string;
+  eyebrow: string;
+  status: "done" | "running" | "failed" | "waiting";
+  detail: string;
+  children?: ReactNode;
+}) {
+  return (
+    <section className="relative rounded-lg border bg-background p-3">
+      <span className="absolute -left-[22px] top-4 flex h-4 w-4 items-center justify-center rounded-full bg-card">
+        {status === "done" && <CheckCircle2 className="h-4 w-4 text-emerald-500" />}
+        {status === "running" && <Loader2 className="h-4 w-4 animate-spin text-sky-400" />}
+        {status === "failed" && <XCircle className="h-4 w-4 text-red-500" />}
+        {status === "waiting" && <span className="h-3 w-3 rounded-full border bg-background" />}
+      </span>
+      <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{eyebrow}</p>
+      <h3 className="mt-1 text-sm font-semibold">{title}</h3>
+      <p className="mt-2 text-xs leading-5 text-muted-foreground">{detail}</p>
+      {children && <div className="mt-3">{children}</div>}
+    </section>
+  );
+}
+
+function ResponseLines({ lines }: { lines: string[] }) {
+  return (
+    <div className="space-y-1 rounded-md border bg-card p-2">
+      {lines.map((line, index) => (
+        <div key={`${index}-${line}`} className="flex gap-2 text-[11px] leading-4 text-muted-foreground">
+          <span className="select-none text-muted-foreground/60">{index + 1}</span>
+          <span className="min-w-0 break-words">{line}</span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -546,29 +590,6 @@ function HunkBlock({
   );
 }
 
-function PipelineStep({
-  title,
-  status,
-  description,
-}: {
-  title: string;
-  status: "done" | "running" | "failed" | "waiting";
-  description: string;
-}) {
-  return (
-    <div className="rounded-lg border bg-background p-3">
-      <div className="flex items-center gap-2">
-        {status === "done" && <CheckCircle2 className="h-4 w-4 text-emerald-500" />}
-        {status === "running" && <Loader2 className="h-4 w-4 animate-spin text-sky-400" />}
-        {status === "failed" && <XCircle className="h-4 w-4 text-red-500" />}
-        {status === "waiting" && <div className="h-4 w-4 rounded-full border" />}
-        <p className="text-sm font-semibold">{title}</p>
-      </div>
-      <p className="mt-2 text-xs leading-5 text-muted-foreground">{description}</p>
-    </div>
-  );
-}
-
 function VerificationDetails({ verification }: { verification: VerificationReport }) {
   return (
     <div className="rounded-lg border bg-background p-3">
@@ -621,22 +642,6 @@ function RepairDetails({ repair }: { repair: RepairReport }) {
           </div>
         ))}
       </div>
-    </div>
-  );
-}
-
-function Metric({ label, value, tone }: { label: string; value: number; tone: "emerald" | "red" | "zinc" }) {
-  const toneClass =
-    tone === "emerald"
-      ? "text-emerald-500 bg-emerald-500/10"
-      : tone === "red"
-        ? "text-red-500 bg-red-500/10"
-        : "text-muted-foreground bg-muted";
-
-  return (
-    <div className={cn("rounded-md px-2 py-2", toneClass)}>
-      <div className="text-sm font-bold">{value}</div>
-      <div className="text-[10px] uppercase tracking-wide opacity-80">{label}</div>
     </div>
   );
 }
