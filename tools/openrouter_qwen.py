@@ -47,6 +47,7 @@ class OpenRouterQwenClient:
             ],
             max_tokens=max_tokens,
             temperature=0.1,
+            response_format={"type": "json_object"},
         )
         choice = response.choices[0]
         if choice.finish_reason == "length":

@@ -70,8 +70,6 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
   const [reviewActivity, setReviewActivity] = useState<DiffReviewActivityState | null>(null);
   const [rightPanelMode, setRightPanelMode] = useState<"dependencies" | "progress">("dependencies");
 
-  const visiblePackages = packages.slice(0, 12);
-
   const resetWorkspaceState = () => {
     setFiles([]);
     setFileQuery("");
@@ -369,7 +367,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
             )
           ) : (
             <DependenciesPanel
-              packages={visiblePackages}
+              packages={packages}
               updatingPackage={updatingPackage}
               onUpdate={(pkg) => void handleUpdate(pkg)}
             />
@@ -405,34 +403,115 @@ function DependenciesPanel({
   updatingPackage: string;
   onUpdate: (pkg: PackageData) => void;
 }) {
+  const [query, setQuery] = useState("");
+  const [filterMode, setFilterMode] = useState<"all" | "outdated" | "vulnerable" | "unpinned">("all");
+
+  const filteredPackages = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    const severityOrder: Record<string, number> = { CRITICAL: 5, HIGH: 4, UNPINNED: 3.5, MEDIUM: 3, LOW: 2, OK: 1 };
+
+    return packages
+      .filter((pkg) => {
+        if (normalizedQuery) {
+          const haystack = `${pkg.name} ${pkg.ecosystem} ${pkg.file_path} ${pkg.current_version} ${pkg.latest_version}`.toLowerCase();
+          if (!haystack.includes(normalizedQuery)) return false;
+        }
+
+        if (filterMode === "vulnerable") return Boolean(pkg.cves?.length);
+        if (filterMode === "unpinned") return pkg.severity === "UNPINNED";
+        if (filterMode === "outdated") {
+          const current = (pkg.current_version || "").replace(/^[\^~=<>v\s]+/i, "");
+          const latest = (pkg.latest_version || "").replace(/^[\^~=<>v\s]+/i, "");
+          return Boolean(current && latest && current !== latest);
+        }
+        return true;
+      })
+      .sort((left, right) => {
+        const severityDiff = (severityOrder[right.severity] || 0) - (severityOrder[left.severity] || 0);
+        if (severityDiff !== 0) return severityDiff;
+        const ecosystemDiff = (left.ecosystem || "").localeCompare(right.ecosystem || "");
+        if (ecosystemDiff !== 0) return ecosystemDiff;
+        return left.name.localeCompare(right.name);
+      });
+  }, [filterMode, packages, query]);
+
+  const groupedPackages = useMemo(() => {
+    return filteredPackages.reduce((groups, pkg) => {
+      const ecosystem = pkg.ecosystem || "Unknown";
+      if (!groups[ecosystem]) groups[ecosystem] = [];
+      groups[ecosystem].push(pkg);
+      return groups;
+    }, {} as Record<string, PackageData[]>);
+  }, [filteredPackages]);
+
   return (
-    <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="shrink-0 space-y-2 border-b p-3">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search dependencies"
+            className="h-8 w-full rounded-md border bg-background pl-8 pr-2 text-xs outline-none transition focus:border-primary"
+          />
+        </div>
+        <div className="flex gap-1 overflow-x-auto pb-0.5">
+          {(["all", "outdated", "vulnerable", "unpinned"] as const).map((mode) => (
+            <button
+              key={mode}
+              onClick={() => setFilterMode(mode)}
+              className={cn(
+                "shrink-0 rounded-md border px-2 py-1 text-[11px] font-semibold capitalize transition",
+                filterMode === mode ? "border-primary bg-primary text-primary-foreground" : "bg-background text-muted-foreground hover:bg-muted"
+              )}
+            >
+              {mode}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
       {packages.length === 0 ? (
         <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
           Run a scan from the dashboard to populate dependency actions.
         </div>
+      ) : filteredPackages.length === 0 ? (
+        <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+          No dependencies match the current filter.
+        </div>
       ) : (
-        packages.map((pkg) => (
-          <div key={`${pkg.ecosystem}-${pkg.name}`} className="rounded-lg border bg-background p-3">
-            <div className="min-w-0">
-              <div className="truncate text-sm font-semibold">{pkg.name}</div>
-              <div className="mt-1 text-xs text-muted-foreground">
-                {pkg.current_version} → {pkg.latest_version}
+        Object.entries(groupedPackages).map(([ecosystem, ecosystemPackages]) => (
+          <div key={ecosystem} className="space-y-2">
+            <div className="sticky top-0 z-10 flex items-center justify-between border-y bg-card/95 px-1 py-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground backdrop-blur">
+              <span>{ecosystem}</span>
+              <span>{ecosystemPackages.length}</span>
+            </div>
+            {ecosystemPackages.map((pkg) => (
+              <div key={`${pkg.ecosystem}-${pkg.name}-${pkg.file_path}`} className="rounded-lg border bg-background p-3">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-semibold" title={pkg.name}>{pkg.name}</div>
+                  <div className="mt-1 truncate text-xs text-muted-foreground" title={`${pkg.current_version} -> ${pkg.latest_version}`}>
+                    {pkg.current_version} → {pkg.latest_version}
+                  </div>
+                </div>
+                <div className="mt-3 flex items-center justify-between gap-2">
+                  <span className="rounded-md border px-2 py-1 text-xs text-muted-foreground">{pkg.severity}</span>
+                  <button
+                    onClick={() => onUpdate(pkg)}
+                    disabled={Boolean(updatingPackage)}
+                    className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition hover:bg-primary/90 disabled:opacity-60"
+                  >
+                    {updatingPackage === pkg.name ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Update"}
+                  </button>
+                </div>
               </div>
-            </div>
-            <div className="mt-3 flex items-center justify-between gap-2">
-              <span className="rounded-md border px-2 py-1 text-xs text-muted-foreground">{pkg.severity}</span>
-              <button
-                onClick={() => onUpdate(pkg)}
-                disabled={Boolean(updatingPackage)}
-                className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition hover:bg-primary/90 disabled:opacity-60"
-              >
-                {updatingPackage === pkg.name ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Update"}
-              </button>
-            </div>
+            ))}
           </div>
         ))
       )}
+      </div>
     </div>
   );
 }

@@ -101,7 +101,7 @@ def test_preview_uses_api_usage_fallback_when_scout_finds_no_breaking_changes(
     assert rust_file.read_text(encoding="utf-8").count("request_token") == 2
 
 
-def test_preview_skips_low_confidence_code_review_for_patch_update(
+def test_preview_uses_api_usage_fallback_for_patch_update(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -134,15 +134,20 @@ def test_preview_skips_low_confidence_code_review_for_patch_update(
         encoding="utf-8",
     )
 
-    class UnexpectedPatchAgent:
+    class TrackingPatchAgent:
+        called = False
+
         def __init__(self, project_root: str | None = None):
             self.project_root = project_root
 
         def preview_sync(self, scout_output: dict, ast_output: dict):
-            raise AssertionError("PatchAgent should not be called for low-confidence patch updates")
+            TrackingPatchAgent.called = True
+            assert scout_output["migration_review_fallback"] is True
+            assert ast_output["matches_by_file"]
+            return {"files": [], "llm_provider": "fake", "fallback_used": False}
 
     monkeypatch.setattr(api_main, "ScoutAgent", lambda: EmptyScout())
-    monkeypatch.setattr(api_main, "PatchAgent", UnexpectedPatchAgent)
+    monkeypatch.setattr(api_main, "PatchAgent", TrackingPatchAgent)
 
     response = api_main.preview_update(
         UpdateRequest(
@@ -160,3 +165,4 @@ def test_preview_skips_low_confidence_code_review_for_patch_update(
     changed_paths = {file["relative_path"] for file in response["files"]}
     assert changed_paths == {"Cargo.toml"}
     assert response["summary"]["total_files_changed"] == 1
+    assert TrackingPatchAgent.called is True

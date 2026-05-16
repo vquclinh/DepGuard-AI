@@ -181,7 +181,7 @@ def _dependency_preview_content(dep_file_path: str, package: str, from_v: str, t
     return original, patched
 
 def _migration_review_breaking_changes(package: str, from_v: str, to_v: str, api_usages: list[str], limit: int = 80) -> list[dict]:
-    """Build low-confidence API review targets when Scout cannot extract exact changes.
+    """Build API review targets when Scout cannot extract exact changes.
 
     The patch agent still has to produce a real diff for a file to appear in the
     review UI, so this broad fallback remains review-first rather than direct
@@ -210,23 +210,6 @@ def _migration_review_breaking_changes(package: str, from_v: str, to_v: str, api
         for usage in concrete_usages[:limit]
     ]
 
-def _semver_tuple(version: str) -> tuple[int, int, int] | None:
-    match = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", version or "")
-    if not match:
-        return None
-    return (
-        int(match.group(1)),
-        int(match.group(2) or 0),
-        int(match.group(3) or 0),
-    )
-
-def _is_patch_version_update(from_v: str, to_v: str) -> bool:
-    current = _semver_tuple(from_v)
-    latest = _semver_tuple(to_v)
-    if not current or not latest:
-        return False
-    return current[0] == latest[0] and current[1] == latest[1] and latest[2] > current[2]
-
 def _scan_breaking_changes_with_review_fallback(
     ast_scanner,
     folder_path: Path,
@@ -251,15 +234,6 @@ def _scan_breaking_changes_with_review_fallback(
     if ast_output.get("total_matches", 0) > 0:
         return scout_output, ast_output
 
-    if _is_patch_version_update(from_v, to_v):
-        logger.info(
-            "Skipping low-confidence migration review fallback for patch update %s %s -> %s",
-            package,
-            from_v,
-            to_v,
-        )
-        return scout_output, ast_output
-
     fallback_changes = _migration_review_breaking_changes(package, from_v, to_v, api_usages)
     if not fallback_changes:
         return scout_output, ast_output
@@ -272,7 +246,6 @@ def _scan_breaking_changes_with_review_fallback(
         **scout_output,
         "breaking_changes": fallback_changes,
         "migration_review_fallback": True,
-        "confidence_score": min(float(scout_output.get("confidence_score", 0.0) or 0.0), 0.35),
     }
     logger.info(
         "Using migration review fallback for %s: %s API target(s), %s code file(s)",
