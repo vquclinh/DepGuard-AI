@@ -136,7 +136,7 @@ function App() {
                   const isAvail = p.status === "available";
                   return (
                     <span key={p.name} className={`flex items-center gap-1 ${isAvail ? 'text-green-500 font-medium' : 'text-muted-foreground'}`}>
-                      {p.name.charAt(0).toUpperCase() + p.name.slice(1)} {isAvail ? "✅" : (p.name === "qwen" ? "⚡ Kaggle" : "❌")}
+                      {p.name.charAt(0).toUpperCase() + p.name.slice(1)} {isAvail ? "✅" : (p.name === "qwen" ? "⚡ OpenRouter" : "❌")}
                     </span>
                   );
                 })}

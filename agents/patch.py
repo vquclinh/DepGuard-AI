@@ -43,6 +43,16 @@ class PatchAgent:
         self.project_root = project_root or os.getcwd()
         self._impact_finder = None
         self.syntax_scanner = TreeSitterScanner() if TreeSitterScanner else None
+        self.target_block_max_lines = self._env_int("PATCH_TARGET_MAX_LINES", 140)
+        self.target_block_max_chars = self._env_int("PATCH_TARGET_MAX_CHARS", 14000)
+        self.impact_context_max_chars = self._env_int("PATCH_IMPACT_CONTEXT_MAX_CHARS", 6000)
+        self.import_context_max_lines = self._env_int("PATCH_IMPORT_CONTEXT_MAX_LINES", 80)
+
+    def _env_int(self, name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except ValueError:
+            return default
 
     def _get_changed_lines(self, matches: list) -> list[int]:
         return sorted({
@@ -86,6 +96,27 @@ class PatchAgent:
             "source": "\n".join(lines[start_line - 1:end_line]),
         }
 
+    def _bounded_node_block(self, filepath: str, lines: list[str], line: int, location) -> dict:
+        source = location.source
+        line_count = location.end_line - location.start_line + 1
+        if line_count > self.target_block_max_lines or len(source) > self.target_block_max_chars:
+            radius = max(12, min(45, self.target_block_max_lines // 2))
+            block = self._line_window_block(filepath, lines, line, radius=radius)
+            block["context_type"] = f"{location.context_type}_slice"
+            block["name"] = location.name
+            block["parent"] = location.parent
+            return block
+
+        return {
+            "file": filepath,
+            "start_line": location.start_line,
+            "end_line": location.end_line,
+            "context_type": location.context_type,
+            "name": location.name,
+            "parent": location.parent,
+            "source": source,
+        }
+
     def _target_blocks(self, filepath: str, matches: list, lines: list[str], impact_result) -> list[dict]:
         blocks_by_range: dict[tuple[int, int], dict] = {}
 
@@ -99,15 +130,8 @@ class PatchAgent:
 
             if node:
                 location = node.location
-                blocks_by_range[(location.start_line, location.end_line)] = {
-                    "file": filepath,
-                    "start_line": location.start_line,
-                    "end_line": location.end_line,
-                    "context_type": location.context_type,
-                    "name": location.name,
-                    "parent": location.parent,
-                    "source": location.source,
-                }
+                block = self._bounded_node_block(filepath, lines, line, location)
+                blocks_by_range[(block["start_line"], block["end_line"])] = block
             else:
                 block = self._line_window_block(filepath, lines, line)
                 blocks_by_range[(block["start_line"], block["end_line"])] = block
@@ -115,15 +139,8 @@ class PatchAgent:
         if not blocks_by_range and impact_result:
             for node in impact_result.changed_nodes:
                 location = node.location
-                blocks_by_range[(location.start_line, location.end_line)] = {
-                    "file": filepath,
-                    "start_line": location.start_line,
-                    "end_line": location.end_line,
-                    "context_type": location.context_type,
-                    "name": location.name,
-                    "parent": location.parent,
-                    "source": location.source,
-                }
+                block = self._bounded_node_block(filepath, lines, location.start_line, location)
+                blocks_by_range[(block["start_line"], block["end_line"])] = block
 
         return [blocks_by_range[key] for key in sorted(blocks_by_range)]
 
@@ -146,10 +163,11 @@ class PatchAgent:
 
         return "\n".join(context_lines[:max_lines]).rstrip()
 
-    def _compact_impact_context(self, impact_result, current_file: str, max_chars: int = 12000) -> str:
+    def _compact_impact_context(self, impact_result, current_file: str, max_chars: int | None = None) -> str:
         if not impact_result:
             return ""
 
+        max_chars = max_chars or self.impact_context_max_chars
         current_path = Path(current_file).resolve()
         parts = [impact_result.summary]
 
@@ -174,7 +192,7 @@ class PatchAgent:
             # related files, include only a compact excerpt because those files
             # are expanded into their own LLM review targets when needed.
             if Path(node_file).resolve() != current_path:
-                excerpt = "\n".join(location.source.splitlines()[:12])
+                excerpt = "\n".join(location.source.splitlines()[:8])
                 if excerpt:
                     parts.append(excerpt)
 
@@ -206,8 +224,19 @@ class PatchAgent:
         impact_context = self._compact_impact_context(impact_result, filepath)
         target_blocks = self._target_blocks(filepath, matches, lines, impact_result)
         code_language = self._code_fence_language(filepath)
-        matches_str = json.dumps(matches, indent=2)
-        bc_str = json.dumps(scout_context.get("breaking_changes", []), indent=2)
+        compact_matches = [
+            {
+                "line": match.get("line"),
+                "old_api": match.get("old_api"),
+                "new_api": match.get("new_api"),
+                "type": match.get("type"),
+                "description": match.get("description"),
+            }
+            for match in matches[:16]
+        ]
+        compact_breaking_changes = scout_context.get("breaking_changes", [])[:16]
+        matches_str = json.dumps(compact_matches, separators=(",", ":"))
+        bc_str = json.dumps(compact_breaking_changes, separators=(",", ":"))
         blocks_str = json.dumps(
             [
                 {
@@ -220,15 +249,16 @@ class PatchAgent:
                 }
                 for block in target_blocks
             ],
-            indent=2,
+            separators=(",", ":"),
         )
-        import_context = self._top_level_context(lines)
+        import_context = self._top_level_context(lines, max_lines=self.import_context_max_lines)
 
         system_prompt = (
             "You are an expert code migration assistant.\n"
             "Use the provided Tree-sitter/LSP impact context to patch only the target line ranges.\n"
             "Do NOT change unrelated code, logic, formatting, or comments.\n"
-            "If a target range does not require a code change, return its original source unchanged.\n"
+            "If no code change is required, return {\"replacements\":[]}.\n"
+            "Do not echo unchanged code.\n"
             "Return ONLY JSON with this shape: "
             "{\"replacements\":[{\"start_line\":1,\"end_line\":2,\"replacement\":\"code\"}]}."
         )
@@ -257,6 +287,9 @@ class PatchAgent:
             - Return replacements for the target blocks only.
             - Keep each replacement as complete code for the exact start_line/end_line range.
             - Include all necessary edits within those ranges if related code in the same block must change.
+            - If a target block does not require a code change, omit it from replacements.
+            - If no target block requires a code change, return exactly {{"replacements":[]}}.
+            - Do not return original unchanged blocks.
             - Do not return markdown.
             """
         return system_prompt, prompt, target_blocks
@@ -267,7 +300,7 @@ class PatchAgent:
         if fenced:
             text = fenced.group(1).strip()
 
-        match = re.search(r"\{.*\}", text, re.DOTALL)
+        match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
         if not match:
             return None
 
@@ -276,7 +309,7 @@ class PatchAgent:
         except json.JSONDecodeError:
             return None
 
-        replacements = data.get("replacements")
+        replacements = data.get("replacements") if isinstance(data, dict) else data
         if not isinstance(replacements, list):
             return None
 

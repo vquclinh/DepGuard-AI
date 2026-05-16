@@ -99,3 +99,64 @@ def test_preview_uses_api_usage_fallback_when_scout_finds_no_breaking_changes(
     assert "src/main.rs" in changed_paths
     assert response["summary"]["total_files_changed"] == 2
     assert rust_file.read_text(encoding="utf-8").count("request_token") == 2
+
+
+def test_preview_skips_low_confidence_code_review_for_patch_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    src = tmp_path / "src"
+    src.mkdir()
+    cargo = tmp_path / "Cargo.toml"
+    rust_file = src / "main.rs"
+
+    cargo.write_text(
+        "\n".join([
+            "[package]",
+            'name = "spotify-demo"',
+            'version = "0.1.0"',
+            "",
+            "[dependencies]",
+            'rspotify = "0.16"',
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    rust_file.write_text(
+        "\n".join([
+            "use rspotify::AuthCodePkceSpotify;",
+            "",
+            "fn main() {",
+            "    let _ = AuthCodePkceSpotify::default();",
+            "}",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    class UnexpectedPatchAgent:
+        def __init__(self, project_root: str | None = None):
+            self.project_root = project_root
+
+        def preview_sync(self, scout_output: dict, ast_output: dict):
+            raise AssertionError("PatchAgent should not be called for low-confidence patch updates")
+
+    monkeypatch.setattr(api_main, "ScoutAgent", lambda: EmptyScout())
+    monkeypatch.setattr(api_main, "PatchAgent", UnexpectedPatchAgent)
+
+    response = api_main.preview_update(
+        UpdateRequest(
+            folder_path=str(tmp_path),
+            package_info=PackageInfo(
+                name="rspotify",
+                current_version="0.16",
+                latest_version="0.16.1",
+                ecosystem="cargo",
+                file_path=str(cargo),
+            ),
+        )
+    )
+
+    changed_paths = {file["relative_path"] for file in response["files"]}
+    assert changed_paths == {"Cargo.toml"}
+    assert response["summary"]["total_files_changed"] == 1

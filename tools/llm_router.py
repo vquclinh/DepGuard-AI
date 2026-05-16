@@ -17,7 +17,7 @@ from google.genai import types as genai_types
 
 from anthropic.types import TextBlock
 
-from openai import AsyncOpenAI
+from tools.openrouter_qwen import OpenRouterQwenClient
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -45,14 +45,15 @@ class LLMRouter:
     def __init__(self):
         self.claude_api_key = os.getenv("ANTHROPIC_API_KEY")
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
-        self.qwen_base_url = self._normalize_base_url(os.getenv("QWEN_BASE_URL"))
-        self.qwen_model = os.getenv("QWEN_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
+        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+        self.qwen_model = os.getenv("QWEN_MODEL", OpenRouterQwenClient.DEFAULT_MODEL)
         self.claude_model = "claude-sonnet-4-20250514"
         self.gemini_model = "gemini-2.0-flash"
         self.provider_order = self._parse_provider_order(os.getenv("LLM_PROVIDER_ORDER"))
         self.enable_claude = self._env_bool("ENABLE_CLAUDE", True)
         self.enable_gemini = self._env_bool("ENABLE_GEMINI", True)
         self.enable_qwen = self._env_bool("ENABLE_QWEN", True)
+        self.qwen_max_tokens = self._env_int("QWEN_MAX_TOKENS", 8000)
         self.qwen_timeout = httpx.Timeout(
             connect=self._env_float("QWEN_CONNECT_TIMEOUT", 5.0),
             read=self._env_float("QWEN_READ_TIMEOUT", 60.0),
@@ -68,7 +69,6 @@ class LLMRouter:
         )
         self.skip_qwen = False
         self.qwen_status = "not_configured"
-        self.qwen_headers = {"ngrok-skip-browser-warning": "true"}
 
         # Create Client For Each Models
         if self.gemini_api_key and not self.skip_gemini:
@@ -82,42 +82,16 @@ class LLMRouter:
             self.anthropic_client = None
             self.skip_claude = True
 
-        if self.qwen_base_url and self.enable_qwen:
-            self.qwen_client = AsyncOpenAI(
-                base_url=f"{self.qwen_base_url}/v1",
-                api_key="not-needed",
-                default_headers=self.qwen_headers,
-                max_retries=0,
+        if self.enable_qwen:
+            self.qwen_client = OpenRouterQwenClient(
+                api_key=self.openrouter_api_key,
+                model=self.qwen_model,
                 timeout=self.qwen_timeout,
             )
+            self.qwen_status = self.qwen_client.status
         else:
             self.qwen_client = None
-
-        # Determine Qwen status on init if possible 
-        if self.qwen_base_url and self.enable_qwen:
-            self.qwen_status = "available"
-            try:
-                # Fast timeout sync check
-                resp = httpx.get(
-                    f"{self.qwen_base_url}/v1/models",
-                    headers=self.qwen_headers,
-                    timeout=3.0,
-                    follow_redirects=True,
-                )
-                if resp.status_code < 500:
-                    self.qwen_status = "available"
-                else:
-                    self.qwen_status = "offline"
-            except Exception:
-                self.qwen_status = "offline"
-
-    def _normalize_base_url(self, value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-        base_url = value.strip().rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3].rstrip("/")
-        return base_url or None
+            self.qwen_status = "disabled"
 
     def _env_bool(self, name: str, default: bool = False) -> bool:
         value = os.getenv(name)
@@ -128,6 +102,12 @@ class LLMRouter:
     def _env_float(self, name: str, default: float) -> float:
         try:
             return float(os.getenv(name, str(default)))
+        except ValueError:
+            return default
+
+    def _env_int(self, name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
         except ValueError:
             return default
 
@@ -229,16 +209,11 @@ class LLMRouter:
             raise Exception(f"Qwen skipped: status is {self.qwen_status}")
 
         try:
-            response = await self.qwen_client.chat.completions.create(
-                model=self.qwen_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_tokens=max_tokens,
-                temperature=0.1
+            return await self.qwen_client.complete(
+                system_prompt,
+                user_prompt,
+                min(max_tokens, self.qwen_max_tokens),
             )
-            return response.choices[0].message.content or ""
         except Exception as e:
             if "timed out" in str(e).lower() or e.__class__.__name__ == "APITimeoutError":
                 self.skip_qwen = True
@@ -355,9 +330,9 @@ class LLMRouter:
             "name": "qwen",
             "status": qwen_status,
             "model": self.qwen_model,
-            "host": "ngrok",
+            "host": "openrouter",
             "priority": priority.get("qwen", 99),
-            "note": "Hosted via OpenAI-compatible Qwen endpoint"
+            "note": "Qwen hosted by OpenRouter"
         })
         
         return sorted(providers, key=lambda provider: provider["priority"])

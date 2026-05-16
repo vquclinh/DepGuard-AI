@@ -210,6 +210,23 @@ def _migration_review_breaking_changes(package: str, from_v: str, to_v: str, api
         for usage in concrete_usages[:limit]
     ]
 
+def _semver_tuple(version: str) -> tuple[int, int, int] | None:
+    match = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", version or "")
+    if not match:
+        return None
+    return (
+        int(match.group(1)),
+        int(match.group(2) or 0),
+        int(match.group(3) or 0),
+    )
+
+def _is_patch_version_update(from_v: str, to_v: str) -> bool:
+    current = _semver_tuple(from_v)
+    latest = _semver_tuple(to_v)
+    if not current or not latest:
+        return False
+    return current[0] == latest[0] and current[1] == latest[1] and latest[2] > current[2]
+
 def _scan_breaking_changes_with_review_fallback(
     ast_scanner,
     folder_path: Path,
@@ -232,6 +249,15 @@ def _scan_breaking_changes_with_review_fallback(
         ast_output = ast_scanner.scan(str(folder_path), breaking_changes)
 
     if ast_output.get("total_matches", 0) > 0:
+        return scout_output, ast_output
+
+    if _is_patch_version_update(from_v, to_v):
+        logger.info(
+            "Skipping low-confidence migration review fallback for patch update %s %s -> %s",
+            package,
+            from_v,
+            to_v,
+        )
         return scout_output, ast_output
 
     fallback_changes = _migration_review_breaking_changes(package, from_v, to_v, api_usages)
@@ -617,7 +643,7 @@ def apply_preview(req: ApplyPreviewRequest):
         PREVIEW_SESSIONS.pop(req.session_id, None)
         verification = ProjectChecker(str(folder_path)).run()
         repair = {
-            "status": "not_needed",
+            "status": "skipped",
             "attempts": [],
             "final_verification": verification,
         }
@@ -634,15 +660,21 @@ def apply_preview(req: ApplyPreviewRequest):
                 verification = ProjectChecker(str(folder_path)).run()
                 attempts.append({
                     "attempt": attempt_number,
-                    "repair": repair_report,
-                    "verification": verification,
+                    "status": repair_report.get("status", "failed"),
+                    "files_repaired": repair_report.get("files_repaired", []),
+                    "error": "; ".join(
+                        item.get("error", "")
+                        for item in repair_report.get("errors", [])
+                        if item.get("error")
+                    ) or None,
+                    "final_verification": verification,
                 })
                 if verification.get("status") != "failed":
                     break
                 if repair_report.get("status") not in {"success", "partial"}:
                     break
             repair = {
-                "status": "repaired" if verification.get("status") == "passed" else "failed",
+                "status": "success" if verification.get("status") == "passed" else "failed",
                 "attempts": attempts,
                 "final_verification": verification,
             }

@@ -63,6 +63,40 @@ class TextOnlyRouter:
         )
 
 
+class NoChangeRouter:
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1000, task_type: str = "general"):
+        return LLMResponse(
+            content='{"replacements":[]}',
+            provider="fake",
+            model="test",
+            latency_ms=1,
+            fallback_used=False,
+        )
+
+
+class TopLevelArrayRouter:
+    def __init__(self):
+        self.last_prompt = ""
+
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1000, task_type: str = "general"):
+        self.last_prompt = user_prompt
+        marker = "TARGET CODE BLOCKS TO PATCH:"
+        block_text = user_prompt.split(marker, 1)[1].split("Related Tree-sitter/LSP Impact Context:", 1)[0]
+        block = json.loads(block_text)[0]
+        replacement = block["source"].replace("oldpkg::do_thing()", "newpkg::do_thing()")
+        return LLMResponse(
+            content=json.dumps([{
+                "start_line": block["start_line"],
+                "end_line": block["end_line"],
+                "replacement": replacement,
+            }]),
+            provider="fake",
+            model="test",
+            latency_ms=1,
+            fallback_used=False,
+        )
+
+
 def test_patch_agent_changes_rust_code_and_updates_cargo_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     src = tmp_path / "src"
     src.mkdir()
@@ -236,6 +270,66 @@ def test_patch_preview_rejects_text_only_llm_response(tmp_path: Path, monkeypatc
     assert report["files"][0]["status"] == "failed"
     assert "did not contain JSON replacements" in report["files"][0]["error"]
     assert report["files"][0]["patched"] == original
+
+
+def test_patch_preview_accepts_empty_replacements_as_no_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rust_file = tmp_path / "main.rs"
+    original = "fn main() {\n    oldpkg::do_thing();\n}\n"
+    rust_file.write_text(original, encoding="utf-8")
+
+    breaking_changes = [{
+        "type": "migration_review",
+        "old_api": "oldpkg.do_thing",
+        "new_api": "",
+        "description": "Review the usage and change only if needed.",
+    }]
+    scan_output = ASTScanner().scan(str(tmp_path), breaking_changes)
+
+    monkeypatch.setattr(patch_module, "LLMRouter", lambda: NoChangeRouter())
+    monkeypatch.setattr(PatchAgent, "_get_impact_result", lambda self, filepath, matches: None)
+
+    report = PatchAgent(project_root=str(tmp_path)).preview_sync(
+        {
+            "package": "oldpkg",
+            "from_version": "1.0.0",
+            "to_version": "1.0.1",
+            "breaking_changes": breaking_changes,
+        },
+        scan_output,
+    )
+
+    assert report["files"][0]["status"] == "success"
+    assert report["files"][0]["patched"] == original
+
+
+def test_patch_preview_accepts_top_level_replacement_array(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rust_file = tmp_path / "main.rs"
+    original = "fn main() {\n    oldpkg::do_thing();\n}\n"
+    rust_file.write_text(original, encoding="utf-8")
+
+    breaking_changes = [{
+        "type": "renamed",
+        "old_api": "oldpkg.do_thing",
+        "new_api": "newpkg.do_thing",
+        "description": "The function moved to newpkg.",
+    }]
+    scan_output = ASTScanner().scan(str(tmp_path), breaking_changes)
+
+    monkeypatch.setattr(patch_module, "LLMRouter", lambda: TopLevelArrayRouter())
+    monkeypatch.setattr(PatchAgent, "_get_impact_result", lambda self, filepath, matches: None)
+
+    report = PatchAgent(project_root=str(tmp_path)).preview_sync(
+        {
+            "package": "oldpkg",
+            "from_version": "1.0.0",
+            "to_version": "2.0.0",
+            "breaking_changes": breaking_changes,
+        },
+        scan_output,
+    )
+
+    assert report["files"][0]["status"] == "success"
+    assert "newpkg::do_thing()" in report["files"][0]["patched"]
 
 
 def test_patch_agent_expands_related_impact_nodes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

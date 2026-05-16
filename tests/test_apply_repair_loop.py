@@ -76,6 +76,7 @@ def test_apply_runs_repair_loop_when_verification_fails(tmp_path: Path, monkeypa
     )
 
     assert response["verification"]["status"] == "passed"
-    assert response["repair"]["status"] == "repaired"
-    assert response["repair"]["attempts"][0]["repair"]["llm_provider"] == "fake"
+    assert response["repair"]["status"] == "success"
+    assert response["repair"]["attempts"][0]["status"] == "success"
+    assert response["repair"]["attempts"][0]["files_repaired"] == ["app.py"]
     assert target.read_text(encoding="utf-8") == patched
