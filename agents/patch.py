@@ -1086,6 +1086,47 @@ class PatchAgent:
 
         return "\n".join(lines) + trailing_newline
 
+
+    _PY_KEYWORDS: frozenset = frozenset(dir(builtins)) | frozenset({
+        "if", "else", "elif", "for", "while", "try", "except", "finally",
+        "with", "return", "raise", "import", "from", "as", "class", "def",
+        "and", "or", "not", "in", "is", "None", "True", "False", "pass",
+        "break", "continue", "lambda", "yield", "del", "global", "nonlocal",
+        "assert", "async", "await", "self", "cls",
+    })
+
+    def _name_tokens(self, text: str) -> set:
+        # Strip string literals so words inside them don't appear as meaningful tokens
+        stripped = re.sub(r'''[bruf]*(?:'[^'\\]*(?:\\.[^'\\]*)*'|"[^"\\]*(?:\\.[^"\\]*)*")''', '', text)
+        return {t for t in re.findall(r'\b([a-zA-Z_]\w*)\b', stripped) if t not in self._PY_KEYWORDS}
+
+    def _names_removed_from_matched_lines(
+        self,
+        block_source: str,
+        block_start_line: int,
+        matched_lines: set,
+        replacement_text: str,
+    ) -> set:
+        source_lines = block_source.splitlines()
+        matched_names: set = set()
+        for offset, line in enumerate(source_lines):
+            if block_start_line + offset in matched_lines:
+                matched_names |= self._name_tokens(line)
+        if not matched_names:
+            return set()
+        return matched_names - self._name_tokens(replacement_text)
+
+    def _allowed_keywords_from_breaking_changes(self, scout_context) -> set:
+        if not scout_context:
+            return set()
+        allowed: set = set()
+        for bc in scout_context.get("breaking_changes", []):
+            new_api = str(bc.get("new_api", "") or "")
+            for token in re.findall(r'\b([a-zA-Z_]\w*)\b', new_api):
+                if len(token) > 2:
+                    allowed.add(token.lower())
+        return allowed
+
     def _validate_replacements_preserve_unchanged_code(
         self,
         replacements: list[dict],
@@ -1138,6 +1179,31 @@ class PatchAgent:
                     continue
                 search_from = found_at + 1
 
+            if missing:
+                removed_names = self._names_removed_from_matched_lines(
+                    str(block.get("source", "") or ""),
+                    start_line,
+                    matched_lines,
+                    str(replacement.get("replacement", "") or ""),
+                )
+                if removed_names:
+                    block_source_lines = str(block.get("source", "") or "").splitlines()
+                    truly_missing = []
+                    for line_no in missing:
+                        offset = line_no - start_line
+                        line_src = (
+                            block_source_lines[offset].strip()
+                            if 0 <= offset < len(block_source_lines) else ""
+                        )
+                        line_names = self._name_tokens(line_src)
+                        if line_names and line_names.issubset(removed_names):
+                            continue  # orphaned — all names came from removed matched lines
+                        # Also orphan if line has no user-defined names but references
+                        # a removed name in raw source (e.g. in an f-string)
+                        if not line_names and any(name in line_src for name in removed_names):
+                            continue
+                        truly_missing.append(line_no)
+                    missing = truly_missing
             if missing:
                 sample = ", ".join(str(line) for line in missing[:8])
                 raise PatchResponseError(
@@ -1309,6 +1375,7 @@ class PatchAgent:
             (block["start_line"], block["end_line"]): block
             for block in target_blocks
         }
+        allowed_from_new_api = self._allowed_keywords_from_breaking_changes(scout_context)
         undocumented = set()
         for replacement in replacements:
             block = blocks_by_range.get((replacement["start_line"], replacement["end_line"]))
@@ -1317,6 +1384,8 @@ class PatchAgent:
             original_keywords = self._call_keyword_names(str(block.get("source", "") or ""))
             replacement_keywords = self._call_keyword_names(str(replacement.get("replacement", "") or ""))
             for keyword in replacement_keywords - original_keywords:
+                if keyword.lower() in allowed_from_new_api:
+                    continue
                 if not self._evidence_mentions_keyword(evidence_text, keyword):
                     undocumented.add(keyword)
 

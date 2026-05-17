@@ -888,8 +888,12 @@ class ASTScanner:
         for variable, resolved_type in variable_types.items():
             if resolved_type != type_path:
                 continue
+            # Method call: variable.method(...)
             pattern = rf"(?<![\w$]){re.escape(variable)}\.{re.escape(method_name)}\s*\("
             matches.extend(re.finditer(pattern, content))
+            # Attribute/decorator access without call parens (e.g. @app.before_first_request)
+            attr_pattern = rf"(?<![\w$]){re.escape(variable)}\.{re.escape(method_name)}(?![\w$\(])"
+            matches.extend(re.finditer(attr_pattern, content))
 
         class_bases = self._infer_package_class_bases(content, package_aliases, ignored_ranges)
         for class_name, resolved_base in class_bases.items():
@@ -897,6 +901,8 @@ class ASTScanner:
                 continue
             pattern = rf"(?<![\w$]){re.escape(class_name)}\.{re.escape(method_name)}\s*\("
             matches.extend(re.finditer(pattern, content))
+            attr_pattern = rf"(?<![\w$]){re.escape(class_name)}\.{re.escape(method_name)}(?![\w$\(])"
+            matches.extend(re.finditer(attr_pattern, content))
 
         constructor = parts[-2]
         for alias, real_name in package_aliases.items():
