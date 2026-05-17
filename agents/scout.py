@@ -1376,7 +1376,7 @@ class ScoutAgent:
             "breaking", "backwards incompatible", "migration", "upgrade",
             "changed signature", "signature", "requires", "must", "now named",
             "renamed to", "has been renamed", "has moved", "moved to",
-            "review", "construction", "setup",
+            "migrate", "review", "construction", "setup",
         ])
 
     def _normalized_evidence_text(self, text: str) -> str:
@@ -1510,21 +1510,106 @@ class ScoutAgent:
                     window_start = paragraph_start + 2
                 if paragraph_end != -1 and paragraph_end - index <= window_size:
                     window_end = paragraph_end
+                adjusted_start, adjusted_end = self._extend_bounds_to_code_blocks(
+                    content,
+                    window_start,
+                    window_end,
+                )
+                code_extended = (adjusted_start, adjusted_end) != (window_start, window_end)
+                window_start, window_end = adjusted_start, adjusted_end
                 key = (window_start, window_end)
                 if key in seen_windows:
                     continue
                 seen_windows.add(key)
                 line_start = content[:window_start].count("\n") + 1
                 line_end = line_start + content[window_start:window_end].count("\n")
+                chunk_content = content[window_start:window_end].strip()
+                if not code_extended:
+                    chunk_content = chunk_content[: self.evidence_chunk_chars + 300]
                 chunks.append({
                     **reference,
-                    "content": content[window_start:window_end].strip()[: self.evidence_chunk_chars + 300],
+                    "content": chunk_content,
                     "line_start": line_start,
                     "line_end": max(line_start, line_end),
                     "document_kind": self._document_kind(reference),
                     "api_centered": True,
                 })
         return chunks
+
+    def _extend_bounds_to_code_blocks(self, content: str, start: int, end: int) -> tuple[int, int]:
+        spans = self._document_code_block_spans(content)
+        if not spans:
+            return start, end
+
+        adjusted_start = start
+        adjusted_end = end
+        changed = True
+        while changed:
+            changed = False
+            for span_start, span_end in spans:
+                if span_start < adjusted_end and span_end > adjusted_start:
+                    next_start = min(adjusted_start, span_start)
+                    next_end = max(adjusted_end, span_end)
+                    if next_start != adjusted_start or next_end != adjusted_end:
+                        adjusted_start, adjusted_end = next_start, next_end
+                        changed = True
+        return adjusted_start, adjusted_end
+
+    def _document_code_block_spans(self, content: str) -> list[tuple[int, int]]:
+        lines = content.splitlines(keepends=True)
+        offsets = []
+        offset = 0
+        for line in lines:
+            offsets.append(offset)
+            offset += len(line)
+
+        spans: list[tuple[int, int]] = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+            fence_match = re.match(r"(```|~~~)", stripped)
+            if fence_match:
+                fence = fence_match.group(1)
+                start = offsets[index]
+                index += 1
+                end = offset
+                while index < len(lines):
+                    end = offsets[index] + len(lines[index])
+                    if lines[index].lstrip().startswith(fence):
+                        index += 1
+                        break
+                    index += 1
+                spans.append((start, end))
+                continue
+
+            if re.match(r"\.\.\s+(?:code-block|code)::", stripped):
+                start = offsets[index]
+                index += 1
+                end = offsets[index - 1] + len(lines[index - 1])
+                saw_body = False
+                while index < len(lines):
+                    current = lines[index]
+                    current_stripped = current.strip()
+                    current_indent = len(current) - len(current.lstrip())
+                    if not current_stripped:
+                        end = offsets[index] + len(current)
+                        index += 1
+                        continue
+                    if current_indent > indent:
+                        saw_body = True
+                        end = offsets[index] + len(current)
+                        index += 1
+                        continue
+                    if saw_body:
+                        break
+                    break
+                spans.append((start, end))
+                continue
+
+            index += 1
+        return spans
 
     def _method_evidence_score(
         self,
@@ -1685,48 +1770,125 @@ class ScoutAgent:
         if not content:
             return []
 
-        paragraphs = re.split(r"\n\s*\n", content)
         chunks: list[dict] = []
-        current: list[str] = []
-        current_start = 1
-        line_cursor = 1
+        current: list[dict] = []
 
-        def flush(end_line: int) -> None:
-            nonlocal current, current_start
-            text = "\n\n".join(part.strip() for part in current if part.strip()).strip()
+        def flush() -> None:
+            nonlocal current
+            if not current:
+                return
+            start = current[0]["start"]
+            end = current[-1]["end"]
+            adjusted_start, adjusted_end = self._extend_bounds_to_code_blocks(content, start, end)
+            code_extended = (adjusted_start, adjusted_end) != (start, end)
+            text = content[adjusted_start:adjusted_end].strip()
             if text:
+                if not code_extended:
+                    text = text[: self.evidence_chunk_chars + 300]
+                line_start = content[:adjusted_start].count("\n") + 1
+                line_end = line_start + content[adjusted_start:adjusted_end].count("\n")
                 chunks.append({
                     **reference,
-                    "content": text[: self.evidence_chunk_chars + 300],
-                    "line_start": current_start,
-                    "line_end": max(current_start, end_line),
+                    "content": text,
+                    "line_start": line_start,
+                    "line_end": max(line_start, line_end),
                     "document_kind": self._document_kind(reference),
                 })
             current = []
-            current_start = line_cursor
 
-        for paragraph in paragraphs:
-            paragraph = paragraph.strip()
-            if not paragraph:
-                line_cursor += 1
+        for paragraph in self._reference_paragraphs(content):
+            pending_len = (
+                sum(len(item["text"]) for item in current)
+                + max(0, len(current)) * 2
+                + len(paragraph["text"])
+            )
+            if current and pending_len > self.evidence_chunk_chars:
+                flush()
+            if len(paragraph["text"]) > self.evidence_chunk_chars:
+                flush()
+                start = paragraph["start"]
+                end = paragraph["end"]
+                adjusted_start, adjusted_end = self._extend_bounds_to_code_blocks(content, start, end)
+                if (adjusted_start, adjusted_end) != (start, end):
+                    text = content[adjusted_start:adjusted_end].strip()
+                    line_start = content[:adjusted_start].count("\n") + 1
+                    line_end = line_start + content[adjusted_start:adjusted_end].count("\n")
+                    chunks.append({
+                        **reference,
+                        "content": text,
+                        "line_start": line_start,
+                        "line_end": max(line_start, line_end),
+                        "document_kind": self._document_kind(reference),
+                    })
+                else:
+                    paragraph_text = paragraph["text"]
+                    for offset in range(0, len(paragraph_text), self.evidence_chunk_chars):
+                        part_start = start + offset
+                        part_end = min(end, start + offset + self.evidence_chunk_chars)
+                        text = content[part_start:part_end].strip()
+                        if not text:
+                            continue
+                        line_start = content[:part_start].count("\n") + 1
+                        line_end = line_start + content[part_start:part_end].count("\n")
+                        chunks.append({
+                            **reference,
+                            "content": text,
+                            "line_start": line_start,
+                            "line_end": max(line_start, line_end),
+                            "document_kind": self._document_kind(reference),
+                        })
                 continue
-            paragraph_lines = paragraph.count("\n") + 1
-            pending = "\n\n".join(current + [paragraph])
-            if current and len(pending) > self.evidence_chunk_chars:
-                flush(line_cursor - 1)
-            if not current:
-                current_start = line_cursor
-            if len(paragraph) > self.evidence_chunk_chars:
-                for start in range(0, len(paragraph), self.evidence_chunk_chars):
-                    current = [paragraph[start:start + self.evidence_chunk_chars]]
-                    flush(line_cursor + paragraph_lines - 1)
-            else:
-                current.append(paragraph)
-            line_cursor += paragraph_lines + 1
+            current.append(paragraph)
 
-        if current:
-            flush(line_cursor - 1)
+        flush()
         return chunks
+
+    def _reference_paragraphs(self, content: str) -> list[dict]:
+        lines = content.splitlines(keepends=True)
+        paragraphs: list[dict] = []
+        start_line = 0
+        start_offset = 0
+        end_line = 0
+        end_offset = 0
+        in_paragraph = False
+        offset = 0
+
+        for line_number, line in enumerate(lines, start=1):
+            line_start = offset
+            line_end = offset + len(line)
+            offset = line_end
+            if line.strip():
+                if not in_paragraph:
+                    start_line = line_number
+                    start_offset = line_start
+                    in_paragraph = True
+                end_line = line_number
+                end_offset = line_end
+                continue
+
+            if in_paragraph:
+                text = content[start_offset:end_offset].strip()
+                if text:
+                    paragraphs.append({
+                        "text": text,
+                        "start": start_offset,
+                        "end": end_offset,
+                        "line_start": start_line,
+                        "line_end": end_line,
+                    })
+                in_paragraph = False
+
+        if in_paragraph:
+            text = content[start_offset:end_offset].strip()
+            if text:
+                paragraphs.append({
+                    "text": text,
+                    "start": start_offset,
+                    "end": end_offset,
+                    "line_start": start_line,
+                    "line_end": end_line,
+                })
+        return paragraphs
 
     def _score_evidence_chunk(
         self,
@@ -2488,6 +2650,14 @@ class ScoutAgent:
             old_api = str(change.get("old_api", "") or "").strip()
             if not old_api:
                 continue
+            change_type = str(change.get("type", "") or "").strip()
+            new_api = str(change.get("new_api", "") or "").strip()
+            if change_type == "renamed" and (
+                not new_api
+                or self._normalized_api_name(old_api) == self._normalized_api_name(new_api)
+            ):
+                logger.debug("Dropping LLM migration for %s: no-op rename", old_api)
+                continue
             if allowed_apis and not any(
                 old_api == allowed_api or old_api.startswith(f"{allowed_api}.")
                 for allowed_api in allowed_apis
@@ -2712,8 +2882,28 @@ class ScoutAgent:
         parts = [part for part in normalized_api.split(".") if part]
         if len(parts) >= 2:
             variants.add(".".join(parts[-2:]))
-            if len(parts[-1]) >= 8:
-                variants.add(parts[-1])
+            leaf = parts[-1]
+            ambiguous_leaves = {
+                "validator",
+                "serializer",
+                "model",
+                "field",
+                "fields",
+                "schema",
+                "config",
+                "base",
+                "basemodel",
+                "manager",
+                "client",
+                "create",
+                "open",
+                "append",
+            }
+            if len(leaf) >= 8 and leaf.lower() not in ambiguous_leaves:
+                variants.add(leaf)
+            if leaf.isidentifier():
+                variants.add(f"{leaf}(")
+                variants.add(f"@{leaf}")
         if len(parts) >= 3:
             variants.add(f"{parts[-1]}()")
         for context in api_contexts or []:
@@ -2729,6 +2919,13 @@ class ScoutAgent:
                 for match in re.findall(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", value):
                     variants.add(match.rstrip("("))
         return {variant for variant in variants if variant}
+
+    def _normalized_api_name(self, api_name: str) -> str:
+        value = (api_name or "").strip()
+        value = value.replace("::", ".").replace("/", ".")
+        value = re.sub(r"\(\)$", "", value)
+        value = value.strip(".")
+        return value.lower()
 
     def _contains_api_variant(self, normalized_text: str, variant: str) -> bool:
         normalized_variant = self._normalized_evidence_text(variant)

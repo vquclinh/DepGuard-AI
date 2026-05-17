@@ -263,6 +263,40 @@ class SqlAlchemyMissingImportRetryRouter:
         )
 
 
+class SqlAlchemyAlwaysMissingImportRouter:
+    def __init__(self):
+        self.calls = 0
+        self.last_prompt = ""
+
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1000, task_type: str = "general"):
+        self.calls += 1
+        self.last_prompt = user_prompt
+        marker = "TARGET CODE BLOCKS TO PATCH:"
+        block_text = user_prompt.split(marker, 1)[1].split("Related Tree-sitter/LSP Impact Context:", 1)[0]
+        block = json.loads(block_text)[0]
+        replacement = block["source"].replace(
+            '    result = engine.execute("SELECT COUNT(*) FROM users")',
+            '    with engine.connect() as connection:\n'
+            '        result = connection.execute(text("SELECT COUNT(*) FROM users"))',
+        )
+
+        return LLMResponse(
+            content=json.dumps({
+                "schema_version": "depguard.patch.v1",
+                "status": "patched",
+                "replacements": [{
+                    "start_line": block["start_line"],
+                    "end_line": block["end_line"],
+                    "replacement": replacement,
+                }],
+            }),
+            provider="fake",
+            model="test",
+            latency_ms=1,
+            fallback_used=False,
+        )
+
+
 class MalformedReplacementRouter:
     async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1000, task_type: str = "general"):
         return LLMResponse(
@@ -751,6 +785,177 @@ def test_patch_prompt_surfaces_string_argument_migration_obligations(tmp_path: P
     assert "local import inside the edited target block" in prompt
 
 
+def test_patch_prompt_keeps_context_manager_obligation_evidence_scoped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pandas_file = tmp_path / "data_ml.py"
+    pandas_original = "\n".join([
+        "import pandas as pd",
+        "",
+        "def add_new_record(df: pd.DataFrame, new_row: dict):",
+        "    updated_df = df.append(new_row, ignore_index=True)",
+        "    return updated_df",
+        "",
+    ])
+    pandas_file.write_text(pandas_original, encoding="utf-8")
+
+    agent = PatchAgent(project_root=str(tmp_path))
+    monkeypatch.setattr(agent, "_get_impact_result", lambda filepath, matches: None)
+
+    system_prompt, pandas_prompt, _blocks = agent._build_sliced_patch_prompt(
+        str(pandas_file),
+        [{
+            "file": str(pandas_file),
+            "line": 4,
+            "old_api": "pandas.DataFrame.append",
+            "new_api": "pandas.concat",
+            "type": "removed",
+            "description": "DataFrame.append was removed.",
+        }],
+        {
+            "package": "pandas",
+            "from_version": "1.5.3",
+            "to_version": "3.0.3",
+            "breaking_changes": [{
+                "type": "removed",
+                "old_api": "pandas.DataFrame.append",
+                "new_api": "pandas.concat",
+            }],
+            "api_evidence": [{
+                "api": "pandas.DataFrame.append",
+                "change_type": "removed",
+                "replacement": "pandas.concat",
+                "evidence": [{
+                    "source": "release_notes",
+                    "quote": "DataFrame.append and Series.append were removed. Use concat instead.",
+                }],
+            }],
+        },
+        pandas_original,
+    )
+
+    assert "Evidence documents a context-manager" not in pandas_prompt
+    assert "from sqlalchemy import text" in system_prompt
+    assert "response['choices'][0]['message']['content']" in system_prompt
+    assert "response.choices[0].message.content" in system_prompt
+
+    sqlalchemy_file = tmp_path / "auth_db.py"
+    sqlalchemy_original = "\n".join([
+        "from sqlalchemy import create_engine",
+        "",
+        "def get_user_count(db_url):",
+        "    engine = create_engine(db_url)",
+        "    result = engine.execute(\"SELECT COUNT(*) FROM users\")",
+        "    return result.scalar()",
+        "",
+    ])
+    sqlalchemy_file.write_text(sqlalchemy_original, encoding="utf-8")
+
+    _system, sqlalchemy_prompt, _blocks = agent._build_sliced_patch_prompt(
+        str(sqlalchemy_file),
+        [{
+            "file": str(sqlalchemy_file),
+            "line": 5,
+            "old_api": "sqlalchemy.create_engine.execute",
+            "new_api": "sqlalchemy.Connection.execute",
+            "type": "removed",
+            "description": "Engine.execute was removed.",
+        }],
+        {
+            "package": "SQLAlchemy",
+            "from_version": "1.4.46",
+            "to_version": "2.0.49",
+            "breaking_changes": [{
+                "type": "removed",
+                "old_api": "sqlalchemy.create_engine.execute",
+                "new_api": "sqlalchemy.Connection.execute",
+            }],
+            "api_evidence": [{
+                "api": "sqlalchemy.create_engine.execute",
+                "change_type": "removed",
+                "replacement": "sqlalchemy.Connection.execute",
+                "evidence": [{
+                    "source": "migration_guide",
+                    "quote": "Use with engine.connect() as connection and connection.execute(text(\"select 1\")); engine.execute() is legacy.",
+                }],
+            }],
+        },
+        sqlalchemy_original,
+    )
+
+    assert "Evidence documents a context-manager" in sqlalchemy_prompt
+
+
+def test_patch_prompt_marks_explicit_no_evidence_prior_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    py_file = tmp_path / "auth_db.py"
+    original = "\n".join([
+        "import jwt",
+        "",
+        "def verify_token(token, secret):",
+        "    return jwt.decode(token, secret, verify=True)",
+        "",
+    ])
+    py_file.write_text(original, encoding="utf-8")
+
+    agent = PatchAgent(project_root=str(tmp_path))
+    monkeypatch.setattr(agent, "_get_impact_result", lambda filepath, matches: None)
+
+    system_prompt, prompt, _blocks = agent._build_sliced_patch_prompt(
+        str(py_file),
+        [{
+            "file": str(py_file),
+            "line": 4,
+            "old_api": "jwt.decode",
+            "new_api": "",
+            "type": "migration_review",
+            "description": "Review PyJWT migration.",
+        }],
+        {
+            "package": "PyJWT",
+            "from_version": "1.7.1",
+            "to_version": "2.12.1",
+            "breaking_changes": [{
+                "type": "migration_review",
+                "old_api": "jwt.decode",
+                "new_api": "",
+            }],
+            "llm_prior_fallback": True,
+        },
+        original,
+    )
+
+    assert "general dependency migration knowledge" in system_prompt
+    assert "explicit no-evidence migration fallback" in prompt
+    assert "For migration_review matches with no structured API evidence" not in prompt
+
+
+def test_patch_does_not_skip_review_when_structured_evidence_exists(tmp_path: Path):
+    agent = PatchAgent(project_root=str(tmp_path))
+    matches = [{
+        "old_api": "jwt.decode",
+        "type": "migration_review",
+        "line": 4,
+    }]
+    scout_context = {
+        "package": "PyJWT",
+        "from_version": "1.7.1",
+        "to_version": "2.12.1",
+        "breaking_changes": [{
+            "type": "migration_review",
+            "old_api": "jwt.decode",
+            "new_api": "",
+        }],
+        "api_evidence": [{
+            "api": "jwt.decode",
+            "change_type": "changed_signature",
+            "evidence": [{
+                "source": "migration_guide",
+                "quote": "jwt.decode now requires an algorithms argument when verifying signatures.",
+            }],
+        }],
+    }
+
+    assert agent._should_skip_speculative_review(matches, scout_context) is False
+
+
 def test_patch_string_argument_evidence_extraction_ignores_unrelated_doc_terms(tmp_path: Path):
     agent = PatchAgent(project_root=str(tmp_path))
     evidence = (
@@ -772,6 +977,170 @@ def test_patch_string_argument_evidence_extraction_ignores_unrelated_doc_terms(t
     assert "autocommit" not in call_names
     assert "DDL" not in helpers
     assert "legacy" not in helpers
+
+
+def test_patch_rejects_over_truncated_large_target_replacement(tmp_path: Path):
+    original = "\n".join([
+        "from PIL import Image",
+        "",
+        "class ImageProcessor:",
+        "    def __init__(self, size=(200, 200)):",
+        "        self.size = size",
+        "",
+        "    def create_thumbnail(self, image_path, output_path):",
+        "        img = Image.open(image_path)",
+        "        resized_img = img.resize(self.size, Image.ANTIALIAS)",
+        "        resized_img.save(output_path)",
+        "        return True",
+        "",
+        "from pydantic import BaseModel, validator",
+        "",
+        "class UserRegistration(BaseModel):",
+        "    age: int",
+        "",
+        "    @validator('age', always=True)",
+        "    def check_age(cls, v):",
+        "        if v < 18:",
+        "            raise ValueError(\"Tuổi phải từ 18 trở lên\")",
+        "        return v",
+        "",
+    ])
+    target_blocks = [{
+        "start_line": 1,
+        "end_line": 13,
+        "source": "\n".join(original.splitlines()[0:13]),
+    }]
+    matches = [{"line": 13, "old_api": "pydantic.validator", "type": "removed"}]
+    response = json.dumps({
+        "schema_version": "depguard.patch.v1",
+        "status": "patched",
+        "replacements": [{
+            "start_line": 1,
+            "end_line": 13,
+            "replacement": "from PIL import Image\nfrom pydantic import BaseModel",
+        }],
+    })
+
+    with pytest.raises(patch_module.PatchResponseError, match="unchanged code"):
+        PatchAgent(project_root=str(tmp_path))._patch_response_to_full_file(
+            response,
+            original,
+            target_blocks,
+            {"package": "pydantic", "from_version": "1.10.12", "to_version": "2.13.4"},
+            matches,
+        )
+
+
+def test_patch_rejects_unresolved_import_for_new_decorator(tmp_path: Path):
+    original = "\n".join([
+        "from pydantic import BaseModel, validator",
+        "",
+        "class UserRegistration(BaseModel):",
+        "    age: int",
+        "",
+        "    @validator('age', always=True)",
+        "    def check_age(cls, v):",
+        "        return v",
+        "",
+    ])
+    target_blocks = [{
+        "start_line": 1,
+        "end_line": 8,
+        "source": "\n".join(original.splitlines()[0:8]),
+    }]
+    matches = [
+        {"line": 1, "old_api": "pydantic.validator", "type": "removed"},
+        {"line": 6, "old_api": "pydantic.validator", "type": "removed"},
+    ]
+    response = json.dumps({
+        "schema_version": "depguard.patch.v1",
+        "status": "patched",
+        "replacements": [{
+            "start_line": 1,
+            "end_line": 8,
+            "replacement": "\n".join([
+                "from pydantic import BaseModel, validator",
+                "",
+                "class UserRegistration(BaseModel):",
+                "    age: int",
+                "",
+                "    @field_validator('age')",
+                "    def check_age(cls, v):",
+                "        return v",
+            ]),
+        }],
+    })
+
+    with pytest.raises(patch_module.PatchResponseError, match="field_validator"):
+        PatchAgent(project_root=str(tmp_path))._patch_response_to_full_file(
+            response,
+            original,
+            target_blocks,
+            {"package": "pydantic", "from_version": "1.10.12", "to_version": "2.13.4"},
+            matches,
+        )
+
+
+def test_patch_rejects_keyword_not_documented_by_scout_evidence(tmp_path: Path):
+    original = "\n".join([
+        "from pydantic import BaseModel, validator",
+        "",
+        "class UserRegistration(BaseModel):",
+        "    age: int",
+        "",
+        "    @validator('age', always=True)",
+        "    def check_age(cls, v):",
+        "        return v",
+        "",
+    ])
+    target_blocks = [{
+        "start_line": 1,
+        "end_line": 8,
+        "source": "\n".join(original.splitlines()[0:8]),
+    }]
+    matches = [
+        {"line": 1, "old_api": "pydantic.validator", "type": "removed"},
+        {"line": 6, "old_api": "pydantic.validator", "type": "removed"},
+    ]
+    response = json.dumps({
+        "schema_version": "depguard.patch.v1",
+        "status": "patched",
+        "replacements": [{
+            "start_line": 1,
+            "end_line": 8,
+            "replacement": "\n".join([
+                "from pydantic import BaseModel, field_validator",
+                "",
+                "class UserRegistration(BaseModel):",
+                "    age: int",
+                "",
+                "    @field_validator('age', mode='before')",
+                "    def check_age(cls, v):",
+                "        return v",
+            ]),
+        }],
+    })
+    scout_context = {
+        "package": "pydantic",
+        "from_version": "1.10.12",
+        "to_version": "2.13.4",
+        "api_evidence": [{
+            "api": "pydantic.validator",
+            "evidence": [{
+                "source": "migration_guide",
+                "quote": "The @validator decorator should be migrated to @field_validator.",
+            }],
+        }],
+    }
+
+    with pytest.raises(patch_module.PatchResponseError, match="undocumented keyword"):
+        PatchAgent(project_root=str(tmp_path))._patch_response_to_full_file(
+            response,
+            original,
+            target_blocks,
+            scout_context,
+            matches,
+        )
 
 
 def test_patch_preview_retries_when_string_argument_migration_is_incomplete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -910,8 +1279,83 @@ def test_patch_preview_retries_when_documented_helper_is_missing_import(tmp_path
     assert router.calls == 2
     assert "without making them available in scope" in router.last_prompt
     assert "add its import or definition inside the returned target block" in router.last_prompt
+    assert "from sqlalchemy import text" in router.last_prompt
     assert "from sqlalchemy import text" in report["files"][0]["patched"]
     assert 'conn.execute(text("SELECT * FROM users"))' in report["files"][0]["patched"]
+
+
+def test_patch_preview_auto_injects_documented_local_helper_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    py_file = tmp_path / "auth_db.py"
+    original = "\n".join([
+        "from sqlalchemy import create_engine",
+        "",
+        "def get_user_count(db_url):",
+        "    engine = create_engine(db_url)",
+        '    result = engine.execute("SELECT COUNT(*) FROM users")',
+        "    return result.scalar()",
+        "",
+    ])
+    py_file.write_text(original, encoding="utf-8")
+
+    router = SqlAlchemyAlwaysMissingImportRouter()
+    monkeypatch.setattr(patch_module, "LLMRouter", lambda: router)
+    monkeypatch.setattr(PatchAgent, "_get_impact_result", lambda self, filepath, matches: None)
+
+    scout_context = {
+        "package": "SQLAlchemy",
+        "from_version": "1.4.46",
+        "to_version": "2.0.49",
+        "breaking_changes": [{
+            "type": "removed",
+            "old_api": "sqlalchemy.create_engine.execute",
+            "new_api": "connection.execute",
+            "description": "Engine.execute was removed.",
+        }],
+        "api_evidence": [{
+            "api": "sqlalchemy.create_engine.execute",
+            "change_type": "removed",
+            "replacement": "connection.execute",
+            "confidence": "high",
+            "evidence": [{
+                "source": "migration_guide",
+                "url": "https://github.com/sqlalchemy/sqlalchemy/blob/main/doc/build/changelog/migration_20.rst",
+                "quote": "Engine.execute() is removed; use Connection.execute().",
+            }],
+        }],
+        "evidence_references": [{
+            "source": "github",
+            "title": "doc/build/changelog/migration_20.rst",
+            "url": "https://github.com/sqlalchemy/sqlalchemy/blob/main/doc/build/changelog/migration_20.rst",
+            "content": (
+                "from sqlalchemy import create_engine\n"
+                "from sqlalchemy import text\n\n"
+                "with engine.connect() as connection:\n"
+                "    # use connection.execute(), not engine.execute()\n"
+                "    # use the text() construct to execute textual SQL\n"
+                "    connection.execute(text(\"CREATE TABLE foo (id integer)\"))"
+            ),
+        }],
+    }
+    scan_output = {
+        "matches_by_file": {
+            str(py_file): [{
+                "file": str(py_file),
+                "line": 5,
+                "old_api": "sqlalchemy.create_engine.execute",
+                "new_api": "connection.execute",
+                "type": "removed",
+                "description": "Engine.execute was removed.",
+            }],
+        },
+    }
+
+    report = PatchAgent(project_root=str(tmp_path)).preview_sync(scout_context, scan_output)
+
+    assert report["files"][0]["status"] == "success"
+    assert router.calls == 1
+    patched = report["files"][0]["patched"]
+    assert "def get_user_count(db_url):\n    from sqlalchemy import text\n    engine = create_engine(db_url)" in patched
+    assert 'connection.execute(text("SELECT COUNT(*) FROM users"))' in patched
 
 
 def test_patch_prompt_merges_overlapping_target_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

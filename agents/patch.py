@@ -6,6 +6,7 @@ import logging
 import argparse
 import subprocess
 import ast
+import builtins
 import inspect
 import textwrap
 import uuid
@@ -325,15 +326,33 @@ class PatchAgent:
             }
             for block in target_blocks
         ]
+        llm_prior_fallback = self._allows_llm_prior_fallback(scout_context)
+        evidence_policy = (
+            "Scout did not find usable external migration evidence for this fallback path. "
+            "You may use your general dependency migration knowledge, but only for the exact matched APIs and version range, "
+            "and only when the code change is clear from the shown source. If uncertain, return no_change."
+            if llm_prior_fallback else
+            "Prefer documented Scout evidence over model memory. When new_api is empty, only infer a migration if the attached evidence or source block makes the replacement unambiguous. "
+            "For migration_review items, do not patch from model memory; return no_change unless Scout evidence documents a concrete required edit."
+        )
+        review_instruction = (
+            "- This is an explicit no-evidence migration fallback: you may use general package migration knowledge for the exact matched API only, but return no_change if the required edit is not clear."
+            if llm_prior_fallback else
+            "- For migration_review matches with no structured API evidence, return no_change with replacements []."
+        )
 
         system_prompt = (
             "You are DepGuard's deterministic code migration patch engine.\n"
             "Your job is to produce a machine-parseable patch plan, not a narrative.\n"
             "Use the package/version migration context, matched API usages, source code, and DepGuard API evidence to decide whether a code edit is needed.\n"
-            "Prefer documented Scout evidence over model memory. When new_api is empty, only infer a migration if the attached evidence or source block makes the replacement unambiguous.\n"
+            f"{evidence_policy}\n"
             "Do not make unrelated stylistic rewrites or speculative edits outside the matched migration surface.\n"
             "Patch only exact target ranges supplied by DepGuard. Never return line-level edits inside a larger target block.\n"
-            "Preserve unrelated code, behavior, formatting, comments, imports, and indentation unless the migration evidence requires a change.\n"
+            "Preserve unrelated code, behavior, formatting, comments, imports, and indentation unless the migration evidence requires a change. "
+            "A replacement for a larger target range must keep every unchanged line in that range.\n"
+            "If the top-level import area is outside the editable range and a migrated call needs a helper, inject the import locally inside the edited scope. "
+            "Example: if replacing engine.execute(\"SELECT 1\") with connection.execute(text(\"SELECT 1\")) and top-level imports are blocked, write `def get_user_count(db_url):\\n    from sqlalchemy import text\\n    ...`.\n"
+            "If you migrate an API call that binds its return value to a variable, and evidence or the package migration context shows the library shifted from dictionaries to Pydantic/object models, audit the entire target block for downstream uses of that variable and convert dictionary lookups like `response['choices'][0]['message']['content']` into attribute access like `response.choices[0].message.content`.\n"
             "If evidence is insufficient, or no target block needs a change, return status no_change with an empty replacements array.\n"
             "Return one JSON object only. Do not return markdown, prose, code fences, or explanations outside JSON.\n"
             "The JSON object must follow this schema:\n"
@@ -387,9 +406,13 @@ class PatchAgent:
             - Keep each replacement as complete code for the exact start_line/end_line range.
             - Valid replacement ranges are: {[(block["start_line"], block["end_line"]) for block in target_blocks]}.
             - Do not return smaller line edits inside a target block.
-            - If new_api is empty, infer the migration from the matched API usage and target source when the replacement is clear; otherwise return no_change.
+            - Preserve every unrelated line inside each returned target block; if only an import or decorator changes, return the full block with the rest intact.
+            - If new_api is empty, infer the migration only when the evidence/fallback policy above permits it and the replacement is clear; otherwise return no_change.
+            {review_instruction}
             - Apply all coupled requirements documented by the same evidence chunk for the matched expression, including required argument wrappers/conversions and transaction/context-manager changes.
             - If a helper/import is required but import lines are outside the allowed ranges, prefer a local import inside the edited target block when that is valid for the language; otherwise return no_change and explain why.
+            - Local import few-shot: def get_user_count(db_url):\n    from sqlalchemy import text\n    ...
+            - If a migrated call's assigned return object is used later in the target block, update coupled downstream access patterns documented by the migration evidence or explicit fallback policy, including dictionary-to-object response access when a library moved to object/Pydantic responses.
             - Include all necessary edits within those ranges if related code in the same block must change.
             - If a target block does not require a code change, omit it from replacements.
             - If no target block requires a code change, return status no_change with replacements [].
@@ -653,13 +676,15 @@ class PatchAgent:
 
     def _evidence_mentions_context_manager(self, evidence_text: str) -> bool:
         normalized = self._normalize_text(evidence_text)
-        return any(marker in normalized for marker in [
-            "with ",
-            "context manager",
-            "connect() as",
-            "begin() as",
-            "explicit transaction",
-        ])
+        return (
+            re.search(r"\bwith\s+[^.\n]{0,120}\bas\b", normalized) is not None
+            or any(marker in normalized for marker in [
+                "context manager",
+                "connect() as",
+                "begin() as",
+                "explicit transaction",
+            ])
+        )
 
     def _normalize_text(self, text: str) -> str:
         value = (text or "").lower()
@@ -1061,14 +1086,322 @@ class PatchAgent:
 
         return "\n".join(lines) + trailing_newline
 
+    def _validate_replacements_preserve_unchanged_code(
+        self,
+        replacements: list[dict],
+        target_blocks: list[dict],
+        matches: list,
+    ) -> None:
+        if not replacements:
+            return
+
+        blocks_by_range = {
+            (block["start_line"], block["end_line"]): block
+            for block in target_blocks
+        }
+        matched_lines = {
+            int(match.get("line"))
+            for match in matches or []
+            if isinstance(match, dict) and isinstance(match.get("line"), int)
+        }
+
+        for replacement in replacements:
+            key = (replacement["start_line"], replacement["end_line"])
+            block = blocks_by_range.get(key)
+            if not block:
+                continue
+            protected_lines = []
+            start_line = block["start_line"]
+            for offset, line in enumerate(str(block.get("source", "") or "").splitlines()):
+                absolute_line = start_line + offset
+                if absolute_line in matched_lines:
+                    continue
+                if not line.strip():
+                    continue
+                protected_lines.append((absolute_line, line.strip()))
+
+            if not protected_lines:
+                continue
+
+            replacement_stripped = [
+                line.strip()
+                for line in str(replacement.get("replacement", "") or "").splitlines()
+                if line.strip()
+            ]
+            search_from = 0
+            missing = []
+            for absolute_line, expected in protected_lines:
+                try:
+                    found_at = replacement_stripped.index(expected, search_from)
+                except ValueError:
+                    missing.append(absolute_line)
+                    continue
+                search_from = found_at + 1
+
+            if missing:
+                sample = ", ".join(str(line) for line in missing[:8])
+                raise PatchResponseError(
+                    "Replacement removed or rewrote unchanged code inside an allowed range. "
+                    f"Protected original line(s) missing from replacement: {sample}. "
+                    "Return the complete target block with unrelated code preserved."
+                )
+
+    def _validate_replacements_do_not_introduce_unresolved_bare_calls(
+        self,
+        replacements: list[dict],
+        target_blocks: list[dict],
+        original_content: str,
+    ) -> None:
+        if not replacements:
+            return
+
+        available = self._top_level_python_names(original_content)
+        for replacement in replacements:
+            available.update(self._defined_python_names(str(replacement.get("replacement", "") or "")))
+
+        builtin_names = set(dir(builtins))
+        blocks_by_range = {
+            (block["start_line"], block["end_line"]): block
+            for block in target_blocks
+        }
+
+        missing_names = set()
+        for replacement in replacements:
+            block = blocks_by_range.get((replacement["start_line"], replacement["end_line"]))
+            if not block:
+                continue
+            original_calls = self._bare_call_names(str(block.get("source", "") or ""))
+            replacement_calls = self._bare_call_names(str(replacement.get("replacement", "") or ""))
+            introduced = replacement_calls - original_calls
+            missing_names.update(
+                name
+                for name in introduced
+                if name not in available and name not in builtin_names
+            )
+
+        if missing_names:
+            names = ", ".join(sorted(missing_names))
+            raise PatchResponseError(
+                "Replacement introduced new bare call(s) without making them available in scope: "
+                f"{names}. Add an import or definition inside the returned target block or another returned block."
+            )
+
+    def _repair_replacements_with_documented_local_imports(
+        self,
+        replacements: list[dict],
+        target_blocks: list[dict],
+        original_content: str,
+        scout_context: dict | None,
+    ) -> list[dict]:
+        if not replacements or not scout_context:
+            return replacements
+
+        evidence_text = self._combined_evidence_text(
+            scout_context.get("api_evidence", []),
+            scout_context.get("evidence_references") or scout_context.get("references", []),
+        )
+        documented_imports = self._documented_helper_imports(evidence_text)
+        if not documented_imports:
+            return replacements
+
+        available_global = self._top_level_python_names(original_content)
+        builtin_names = set(dir(builtins))
+        blocks_by_range = {
+            (block["start_line"], block["end_line"]): block
+            for block in target_blocks
+        }
+
+        repaired = []
+        for replacement in replacements:
+            block = blocks_by_range.get((replacement["start_line"], replacement["end_line"]))
+            if not block:
+                repaired.append(replacement)
+                continue
+
+            replacement_source = str(replacement.get("replacement", "") or "")
+            original_calls = self._bare_call_names(str(block.get("source", "") or ""))
+            replacement_calls = self._bare_call_names(replacement_source)
+            available = set(available_global)
+            available.update(self._defined_python_names(replacement_source))
+            missing_names = {
+                name
+                for name in replacement_calls - original_calls
+                if name not in available and name not in builtin_names
+            }
+            import_lines = [
+                documented_imports[name]
+                for name in sorted(missing_names)
+                if name in documented_imports
+            ]
+            if not import_lines:
+                repaired.append(replacement)
+                continue
+
+            repaired.append({
+                **replacement,
+                "replacement": self._insert_local_imports(replacement_source, import_lines),
+            })
+
+        return repaired
+
+    def _documented_helper_imports(self, evidence_text: str) -> dict[str, str]:
+        imports: dict[str, str] = {}
+        for match in re.finditer(
+            r"(?m)^\s*from\s+([A-Za-z_][\w.]*)\s+import\s+([A-Za-z_][\w]*(?:\s+as\s+[A-Za-z_][\w]*)?(?:\s*,\s*[A-Za-z_][\w]*(?:\s+as\s+[A-Za-z_][\w]*)?)*)",
+            evidence_text or "",
+        ):
+            module = match.group(1)
+            for item in match.group(2).split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                parts = re.split(r"\s+as\s+", item, maxsplit=1)
+                imported = parts[0].strip()
+                local_name = parts[1].strip() if len(parts) > 1 else imported
+                if imported and local_name and imported.isidentifier() and local_name.isidentifier():
+                    imports.setdefault(local_name, f"from {module} import {item}")
+        return imports
+
+    def _insert_local_imports(self, source: str, import_lines: list[str]) -> str:
+        lines = (source or "").splitlines()
+        unique_imports = []
+        seen = {line.strip() for line in lines}
+        for import_line in import_lines:
+            stripped = import_line.strip()
+            if stripped and stripped not in seen and stripped not in unique_imports:
+                unique_imports.append(stripped)
+        if not unique_imports:
+            return source
+
+        insert_at = 0
+        import_indent = ""
+        for index, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped.startswith("def ") or stripped.startswith("async def "):
+                base_indent = line[:len(line) - len(stripped)]
+                import_indent = base_indent + "    "
+                insert_at = index + 1
+                break
+        else:
+            while insert_at < len(lines) and (
+                not lines[insert_at].strip()
+                or lines[insert_at].lstrip().startswith(("#!", "# -*-", "# coding"))
+            ):
+                insert_at += 1
+
+        insertion = [f"{import_indent}{import_line}" for import_line in unique_imports]
+        return "\n".join(lines[:insert_at] + insertion + lines[insert_at:])
+
+    def _validate_replacements_do_not_introduce_undocumented_keywords(
+        self,
+        replacements: list[dict],
+        target_blocks: list[dict],
+        scout_context: dict | None,
+    ) -> None:
+        if not replacements or not scout_context or self._allows_llm_prior_fallback(scout_context):
+            return
+
+        evidence_text = self._combined_evidence_text(
+            scout_context.get("api_evidence", []),
+            scout_context.get("evidence_references") or scout_context.get("references", []),
+        )
+        blocks_by_range = {
+            (block["start_line"], block["end_line"]): block
+            for block in target_blocks
+        }
+        undocumented = set()
+        for replacement in replacements:
+            block = blocks_by_range.get((replacement["start_line"], replacement["end_line"]))
+            if not block:
+                continue
+            original_keywords = self._call_keyword_names(str(block.get("source", "") or ""))
+            replacement_keywords = self._call_keyword_names(str(replacement.get("replacement", "") or ""))
+            for keyword in replacement_keywords - original_keywords:
+                if not self._evidence_mentions_keyword(evidence_text, keyword):
+                    undocumented.add(keyword)
+
+        if undocumented:
+            names = ", ".join(sorted(undocumented))
+            raise PatchResponseError(
+                "Replacement introduced undocumented keyword argument(s): "
+                f"{names}. Only add keyword arguments that appear in Scout evidence."
+            )
+
+    def _bare_call_names(self, source: str) -> set[str]:
+        try:
+            tree = ast.parse(textwrap.dedent(source or ""))
+        except SyntaxError:
+            return set()
+        return {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+
+    def _call_keyword_names(self, source: str) -> set[str]:
+        try:
+            tree = ast.parse(textwrap.dedent(source or ""))
+        except SyntaxError:
+            return set()
+        keywords = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg:
+                    keywords.add(keyword.arg)
+        return keywords
+
+    def _evidence_mentions_keyword(self, evidence_text: str, keyword: str) -> bool:
+        if not keyword:
+            return False
+        raw = evidence_text or ""
+        normalized = self._normalize_text(raw)
+        escaped = re.escape(keyword.lower())
+        return (
+            re.search(rf"\b{escaped}\s*=", normalized) is not None
+            or re.search(rf"(``|`|'|\"){escaped}(``|`|'|\")", raw, flags=re.IGNORECASE) is not None
+            or re.search(rf"\b{escaped}\s+(parameter|argument|option|keyword)\b", normalized) is not None
+        )
+
+    def _allows_llm_prior_fallback(self, scout_context: dict | None) -> bool:
+        if not scout_context:
+            return False
+        return bool(
+            scout_context.get("llm_prior_fallback")
+            or scout_context.get("migration_review_fallback")
+        )
+
     def _patch_response_to_full_file(
         self,
         response_text: str,
         original_content: str,
         target_blocks: list[dict],
         scout_context: dict | None = None,
+        matches: list | None = None,
     ) -> str:
         replacements = self._parse_replacements(response_text)
+        self._validate_replacements_preserve_unchanged_code(
+            replacements,
+            target_blocks,
+            matches or [],
+        )
+        replacements = self._repair_replacements_with_documented_local_imports(
+            replacements,
+            target_blocks,
+            original_content,
+            scout_context,
+        )
+        self._validate_replacements_do_not_introduce_unresolved_bare_calls(
+            replacements,
+            target_blocks,
+            original_content,
+        )
+        self._validate_replacements_do_not_introduce_undocumented_keywords(
+            replacements,
+            target_blocks,
+            scout_context,
+        )
         self._validate_replacements_against_migration_obligations(
             replacements,
             target_blocks,
@@ -1100,7 +1433,7 @@ class PatchAgent:
         if "without making them available in scope" in error_message:
             obligation_retry_hint += (
                 "\n            - If you use a helper as a bare function call, add its import or definition inside the returned target block "
-                "unless it already exists in the shown code context."
+                "unless it already exists in the shown code context. Example: add `from sqlalchemy import text` inside the edited function before `conn.execute(text(...))` when top-level imports are outside the allowed range."
             )
 
         return f"""{original_prompt}
@@ -1281,6 +1614,9 @@ class PatchAgent:
         except Exception as e:
                 return False, f"Could not read file: {e}", {}, "", ""
 
+        if self._should_skip_speculative_review(matches, scout_context):
+            return True, "", {}, original_content, original_content
+
         system_prompt, prompt, target_blocks = self._build_sliced_patch_prompt(
             filepath,
             matches,
@@ -1309,6 +1645,7 @@ class PatchAgent:
                     original_content,
                     target_blocks,
                     scout_context,
+                    matches,
                 )
 
                 validation_error = self._validate_patched_content(filepath, patched_content)
@@ -1340,6 +1677,72 @@ class PatchAgent:
                 return False, str(e), llm_info, original_content, ""
 
         return False, last_error or "LLM patch failed", llm_info, original_content, ""
+
+    def _should_skip_speculative_review(self, matches: list, scout_context: dict | None) -> bool:
+        """Keep ordinary review-only findings deterministic.
+
+        ``migration_review`` and ``impact_review`` are not evidence by
+        themselves. The API layer may explicitly set ``llm_prior_fallback`` (or
+        its legacy marker ``migration_review_fallback``) when retrieval found no
+        docs and the user still wants the LLM to try from general migration
+        knowledge. All other review-only findings remain no-change.
+        """
+        if not matches or self._allows_llm_prior_fallback(scout_context):
+            return False
+
+        review_types = {"migration_review", "impact_review"}
+        if any(str(match.get("type", "") or "") not in review_types for match in matches):
+            return False
+
+        if not scout_context:
+            return True
+
+        actionable_types = {"removed", "renamed", "changed_signature"}
+        actionable_apis = {
+            str(change.get("old_api", "") or "").strip()
+            for change in scout_context.get("breaking_changes", []) or []
+            if str(change.get("type", "") or "") in actionable_types
+        }
+        if actionable_apis:
+            matched_apis = {
+                str(match.get("old_api", "") or "").strip()
+                for match in matches
+                if str(match.get("old_api", "") or "").strip()
+            }
+            return not any(
+                matched == actionable
+                or matched.startswith(f"{actionable}.")
+                or actionable.startswith(f"{matched}.")
+                for matched in matched_apis
+                for actionable in actionable_apis
+            )
+
+        matched_apis = {
+            str(match.get("old_api", "") or "").strip()
+            for match in matches
+            if str(match.get("old_api", "") or "").strip()
+        }
+        for item in scout_context.get("api_evidence", []) or []:
+            if not isinstance(item, dict):
+                continue
+            api = str(item.get("api", "") or "").strip()
+            if not api:
+                continue
+            if not (
+                item.get("evidence")
+                or str(item.get("replacement", "") or "").strip()
+                or str(item.get("reason", "") or "").strip()
+            ):
+                continue
+            if any(
+                matched == api
+                or matched.startswith(f"{api}.")
+                or api.startswith(f"{matched}.")
+                for matched in matched_apis
+            ):
+                return False
+
+        return True
 
 
     async def _patch_file(self, filepath: str, matches: list, scout_context: dict, task_type: str) -> tuple[bool, str, dict]:

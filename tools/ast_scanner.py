@@ -152,6 +152,15 @@ class ASTScanner:
         "template_substitution", "char_literal", "character_literal",
     }
 
+    KNOWN_IMPORT_ALIASES = {
+        "PyJWT": {"jwt"},
+        "PyYAML": {"yaml"},
+        "scikit-learn": {"sklearn"},
+        "beautifulsoup4": {"bs4"},
+        "Pillow": {"PIL"},
+        "python-dotenv": {"dotenv"},
+    }
+
     def __init__(self):
         self.parsers: dict[str, Any] = {}
         self._tree_sitter_language: Any = None
@@ -521,6 +530,10 @@ class ASTScanner:
             package_name.replace("-", "_"),
             package_name.replace("_", "-"),
         }
+        package_norm = self._normalize_package_token(package_name)
+        for known_name, aliases in self.KNOWN_IMPORT_ALIASES.items():
+            if self._normalize_package_token(known_name) == package_norm:
+                roots.update(aliases)
         roots.update(self._distribution_import_roots(package_name))
         return {root for root in roots if root}
 
@@ -764,6 +777,15 @@ class ASTScanner:
                 constructor = match.group(2) if "{constructor}" in type_template else ""
                 variable_types[variable] = type_template.format(constructor=constructor)
 
+        variable_types.update(
+            self._infer_annotated_package_variable_types(
+                content,
+                package_aliases,
+                class_bases,
+                ignored_ranges,
+            )
+        )
+
         # Follow simple reassignment chains such as result = df.
         for _ in range(3):
             changed = False
@@ -776,6 +798,40 @@ class ASTScanner:
                     changed = True
             if not changed:
                 break
+
+        return variable_types
+
+    def _infer_annotated_package_variable_types(
+        self,
+        content: str,
+        package_aliases: dict[str, str],
+        class_bases: dict[str, str],
+        ignored_ranges: list[tuple[int, int]],
+    ) -> dict[str, str]:
+        variable_types: dict[str, str] = {}
+
+        for match in re.finditer(r"(?m)^\s*def\s+[A-Za-z_$][\w$]*\s*\((.*?)\)\s*(?:->[^:]+)?\s*:", content, re.DOTALL):
+            if self._is_ignored_offset(match.start(), ignored_ranges):
+                continue
+            for param in self._split_top_level_commas(match.group(1)):
+                param = param.strip()
+                if ":" not in param:
+                    continue
+                name, annotation = param.split(":", 1)
+                name = name.strip().lstrip("*")
+                annotation = annotation.split("=", 1)[0].strip()
+                if not re.match(r"^[A-Za-z_$][\w$]*$", name):
+                    continue
+                resolved = self._resolve_package_expression(annotation, package_aliases, class_bases)
+                if resolved:
+                    variable_types[name] = resolved
+
+        for match in re.finditer(r"(?m)^\s*([A-Za-z_$][\w$]*)\s*:\s*([^=\n]+)(?:=.*)?$", content):
+            if self._is_ignored_offset(match.start(), ignored_ranges):
+                continue
+            resolved = self._resolve_package_expression(match.group(2).strip(), package_aliases, class_bases)
+            if resolved:
+                variable_types[match.group(1)] = resolved
 
         return variable_types
 

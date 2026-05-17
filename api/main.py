@@ -271,6 +271,7 @@ def _scan_breaking_changes_with_review_fallback(
         **scout_output,
         "breaking_changes": fallback_changes,
         "migration_review_fallback": True,
+        "llm_prior_fallback": True,
     }
     logger.info(
         "Using migration review fallback for %s: %s API target(s), %s code file(s)",

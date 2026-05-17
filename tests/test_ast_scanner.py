@@ -316,6 +316,153 @@ def test_find_api_usages_does_not_leak_embedded_package_suffix(tmp_path: Path):
     assert usages == []
 
 
+def test_find_api_usages_covers_three_file_migration_fixture(tmp_path: Path):
+    (tmp_path / "requirements.txt").write_text(
+        "\n".join([
+            "pydantic==1.10.12",
+            "PyJWT==1.7.1",
+            "pandas==1.5.3",
+            "SQLAlchemy==1.4.46",
+            "openai==0.28.0",
+            "cryptography==35.0.0",
+            "scikit-learn==0.24.2",
+            "Pillow==9.4.0",
+            "pytest==7.0.0",
+            "python-dotenv==0.21.1",
+            "numpy==1.23.5",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    (tmp_path / "data_ml.py").write_text(
+        "\n".join([
+            "import pandas as pd",
+            "import numpy as np",
+            "import openai",
+            "from sklearn.metrics import plot_confusion_matrix",
+            "from PIL import Image",
+            "import pytest",
+            "",
+            "def add_new_record(df: pd.DataFrame, new_row: dict):",
+            "    updated_df = df.append(new_row, ignore_index=True)",
+            "    return updated_df",
+            "",
+            "def sanitize_array(arr):",
+            "    return np.array(arr, dtype=np.float)",
+            "",
+            "def resize_avatar(img_path, output_path):",
+            "    img = Image.open(img_path)",
+            "    resized = img.resize((200, 200), Image.ANTIALIAS)",
+            "    resized.save(output_path)",
+            "    return True",
+            "",
+            "def generate_summary(text):",
+            "    openai.api_key = \"dummy-key\"",
+            "    response = openai.ChatCompletion.create(",
+            "        model=\"gpt-3.5-turbo\",",
+            "        messages=[{\"role\": \"user\", \"content\": text}]",
+            "    )",
+            "    return response['choices'][0]['message']['content']",
+            "",
+            "def evaluate_model(model, X_test, y_test):",
+            "    disp = plot_confusion_matrix(model, X_test, y_test, cmap=\"Blues\")",
+            "    return disp",
+            "",
+            "@pytest.yield_fixture",
+            "def mock_db_session():",
+            "    print(\"Setup DB\")",
+            "    yield {\"status\": \"connected\"}",
+            "    print(\"Teardown DB\")",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    (tmp_path / "auth_db.py").write_text(
+        "\n".join([
+            "import os",
+            "from dotenv import load_dotenv",
+            "import jwt",
+            "from pydantic import BaseModel, validator",
+            "from sqlalchemy import create_engine",
+            "from cryptography import x509",
+            "from cryptography.hazmat.backends import default_backend",
+            "",
+            "load_dotenv()",
+            "",
+            "class User(BaseModel):",
+            "    username: str",
+            "    age: int",
+            "",
+            "    @validator('age', always=True)",
+            "    def check_age(cls, v):",
+            "        if v < 18:",
+            "            raise ValueError(\"Tuổi phải từ 18 trở lên\")",
+            "        return v",
+            "",
+            "def verify_token(token):",
+            "    secret = os.getenv(\"JWT_SECRET\", \"supersecret\")",
+            "    try:",
+            "        data = jwt.decode(token, secret, verify=True)",
+            "        return data",
+            "    except jwt.PyJWTError:",
+            "        return None",
+            "",
+            "def get_user_count(db_url):",
+            "    engine = create_engine(db_url)",
+            "    result = engine.execute(\"SELECT COUNT(*) FROM users\")",
+            "    return result.scalar()",
+            "",
+            "def load_cert(pem_data):",
+            "    cert = x509.load_pem_x509_certificate(pem_data, backend=default_backend())",
+            "    return cert",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    scanner = ASTScanner()
+    expected_by_package = {
+        "pandas": {"pandas.DataFrame", "pandas.DataFrame.append"},
+        "numpy": {"numpy.array", "numpy.float"},
+        "openai": {"openai.ChatCompletion.create"},
+        "scikit-learn": {"sklearn.metrics.plot_confusion_matrix"},
+        "Pillow": {"PIL.Image", "PIL.Image.open", "PIL.Image.ANTIALIAS"},
+        "pytest": {"pytest.yield_fixture"},
+        "python-dotenv": {"dotenv.load_dotenv"},
+        "PyJWT": {"jwt.decode", "jwt.PyJWTError"},
+        "pydantic": {"pydantic.BaseModel", "pydantic.validator"},
+        "SQLAlchemy": {"sqlalchemy.create_engine", "sqlalchemy.create_engine.execute"},
+        "cryptography": {
+            "cryptography.x509.load_pem_x509_certificate",
+            "cryptography.hazmat.backends.default_backend",
+        },
+    }
+
+    for package, expected in expected_by_package.items():
+        usages = set(scanner.find_api_usages(str(tmp_path), package))
+        assert expected <= usages, f"{package} missing {expected - usages}; saw {sorted(usages)}"
+
+
+def test_static_import_aliases_do_not_guess_generic_py_prefixes(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "import auth",
+            "import jwt",
+            "",
+            "def load_user(token):",
+            "    return auth.decode(token)",
+            "",
+            "def load_claims(token, secret):",
+            "    return jwt.decode(token, secret)",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    assert ASTScanner().find_api_usages(str(tmp_path), "PyAuth") == []
+    assert "jwt.decode" in ASTScanner().find_api_usages(str(tmp_path), "pyjwt")
+
+
 def test_find_api_usages_isolates_overlapping_openai_and_langchain_openai(tmp_path: Path):
     (tmp_path / "app.py").write_text(
         "\n".join([

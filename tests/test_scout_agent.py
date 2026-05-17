@@ -746,6 +746,54 @@ def test_scout_filters_llm_changes_without_direct_api_evidence():
     assert "numpy.bool" not in {item["api"] for item in filtered["api_evidence"]}
 
 
+def test_scout_filters_noop_and_broad_pydantic_validator_claims():
+    scout = ScoutAgent()
+    data = {
+        "breaking_changes": [
+            {
+                "type": "renamed",
+                "old_api": "pydantic.BaseModel",
+                "new_api": "pydantic.BaseModel",
+                "description": "BaseModel methods changed, but the class remains available.",
+            },
+            {
+                "type": "removed",
+                "old_api": "pydantic.validator",
+                "new_api": "",
+                "description": "The validator decorator was replaced by field_validator.",
+            },
+        ],
+        "api_evidence": [
+            {
+                "api": "pydantic.BaseModel",
+                "confidence": "high",
+                "evidence": [{
+                    "quote": "Various method names have been changed; BaseModel methods now use model_* names.",
+                }],
+            },
+            {
+                "api": "pydantic.validator",
+                "confidence": "medium",
+                "evidence": [{
+                    "quote": "This release fixes supported after model validator function signatures.",
+                }],
+            },
+        ],
+        "confidence_score": 0.9,
+    }
+
+    filtered = scout._filter_llm_migrations_by_evidence(
+        data,
+        ["pydantic.BaseModel", "pydantic.validator"],
+        [],
+        [{"api": "pydantic.validator", "matched_text": "validator", "code_snippet": "@validator('age', always=True)"}],
+    )
+
+    assert filtered["breaking_changes"] == []
+    assert filtered["api_evidence"] == []
+    assert filtered["confidence_score"] == 0.0
+
+
 def test_scout_builds_compact_ranked_evidence_chunks():
     scout = ScoutAgent()
     scout.evidence_chunk_chars = 700
@@ -772,6 +820,79 @@ def test_scout_builds_compact_ranked_evidence_chunks():
     assert "DataFrame.append and Series.append were removed" in evidence[0]["content"]
     assert "Pandas Logo" not in evidence[0]["content"]
     assert len(evidence[0]["content"]) < 1000
+
+
+def test_scout_extends_markdown_code_block_chunks_to_closing_fence():
+    scout = ScoutAgent()
+    scout.evidence_chunk_chars = 220
+    references = [{
+        "source": "github",
+        "title": "migration/v1.md",
+        "url": "https://github.com/openai/openai-python/blob/main/migration/v1.md",
+        "content": "\n".join([
+            "openai.ChatCompletion.create was removed. Use the client chat completions API instead.",
+            "",
+            "```python",
+            "from openai import OpenAI",
+            "client = OpenAI(api_key='dummy-key')",
+            "completion = client.chat.completions.create(",
+            "    model='gpt-5.2',",
+            "    messages=[{'role': 'user', 'content': 'hello'}],",
+            ")",
+            "print(completion.choices[0].message.content)",
+            "```",
+            "",
+            "Other migration notes.",
+        ]),
+    }]
+
+    evidence = scout._focused_reference_snippets(
+        references,
+        ["openai.ChatCompletion.create"],
+        current_version="0.28.0",
+        latest_version="1.0.0",
+    )
+
+    assert evidence
+    assert "completion = client.chat.completions.create(" in evidence[0]["content"]
+    assert "completion.choices[0].message.content" in evidence[0]["content"]
+    assert "```" in evidence[0]["content"]
+
+
+def test_scout_extends_rst_code_block_chunks_to_complete_example():
+    scout = ScoutAgent()
+    scout.evidence_chunk_chars = 220
+    references = [{
+        "source": "github",
+        "title": "migration/v1.rst",
+        "url": "https://github.com/openai/openai-python/blob/main/migration/v1.rst",
+        "content": "\n".join([
+            "openai.ChatCompletion.create was removed. Use the client chat completions API instead.",
+            "",
+            ".. code-block:: python",
+            "",
+            "    from openai import OpenAI",
+            "    client = OpenAI(api_key='dummy-key')",
+            "    completion = client.chat.completions.create(",
+            "        model='gpt-5.2',",
+            "        messages=[{'role': 'user', 'content': 'hello'}],",
+            "    )",
+            "    print(completion.choices[0].message.content)",
+            "",
+            "Other migration notes.",
+        ]),
+    }]
+
+    evidence = scout._focused_reference_snippets(
+        references,
+        ["openai.ChatCompletion.create"],
+        current_version="0.28.0",
+        latest_version="1.0.0",
+    )
+
+    assert evidence
+    assert "completion = client.chat.completions.create(" in evidence[0]["content"]
+    assert "completion.choices[0].message.content" in evidence[0]["content"]
 
 
 def test_scout_filters_versioned_docs_outside_migration_window():
