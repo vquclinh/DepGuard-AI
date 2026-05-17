@@ -45,6 +45,10 @@ class ScoutAgent:
         "CHANGELOG.txt",
         "CHANGES.md",
         "CHANGES.rst",
+        "CHANGES.txt",
+        "NEWS.md",
+        "NEWS.rst",
+        "NEWS.txt",
         "HISTORY.md",
         "HISTORY.rst",
         "RELEASES.md",
@@ -82,7 +86,7 @@ class ScoutAgent:
         self.github_token = os.getenv("GITHUB_TOKEN")
         self.router = LLMRouter() # Abstraction layer: OpenAI, Claude, Gemini, Qwen, local models
         self.reference_max_chars = self._env_int("SCOUT_REFERENCE_MAX_CHARS", 16000)
-        self.changelog_file_max_chars = self._env_int("SCOUT_CHANGELOG_FILE_MAX_CHARS", 12000)
+        self.changelog_file_max_chars = self._env_int("SCOUT_CHANGELOG_FILE_MAX_CHARS", 30000)
         self.analysis_max_chars = self._env_int("SCOUT_ANALYSIS_MAX_CHARS", 30000)
         self.analysis_max_tokens = self._env_int("SCOUT_LLM_MAX_TOKENS", 4000)
         self.evidence_window_chars = self._env_int("SCOUT_EVIDENCE_WINDOW_CHARS", 900)
@@ -463,7 +467,9 @@ class ScoutAgent:
                 response = await client.get(raw_url, timeout=10.0)
                 if response.status_code != 200:
                     continue
-                content = response.text[:self.changelog_file_max_chars]
+                content = self._version_focused_changelog_content(
+                    response.text, path, current_version, latest_version
+                )
                 if not content.strip():
                     continue
                 references.append({
@@ -1101,7 +1107,9 @@ class ScoutAgent:
                 response = await client.get(raw_url, timeout=10.0)
                 if response.status_code != 200:
                     continue
-                content = (response.text or "")[:self.changelog_file_max_chars]
+                content = self._version_focused_changelog_content(
+                    response.text or "", path, current_version, latest_version
+                )
                 if not content.strip():
                     continue
                 references.append({
@@ -1175,11 +1183,114 @@ class ScoutAgent:
         if not current or not latest:
             return True
         low, high = sorted([current, latest])
-        
+
         # Broaden the lower bound to the base of the current major version
         # to catch breaking changes that happened at X.0.0
         low_bound = (low[0], 0, 0) if len(low) > 0 else low
         return low_bound <= version <= high
+
+    def _version_focused_changelog_content(
+        self,
+        raw_content: str,
+        path: str,
+        current_version: str,
+        latest_version: str,
+    ) -> str:
+        """
+        Parse a changelog file and return only the sections that fall within the
+        migration range [current_version, latest_version] (broadened to the base
+        major of current).  Falls back to a top-N slice when no version headers
+        are found so that non-standard files still produce useful output.
+        """
+        if not current_version or not latest_version or not raw_content:
+            return raw_content[:self.changelog_file_max_chars]
+
+        lines = raw_content.splitlines(keepends=True)
+        is_rst = path.lower().endswith(".rst")
+
+        md_heading = re.compile(
+            r'^#{1,3}\s+(?:\[?v?|[Vv]ersion\s+)(\d+\.\d+(?:\.\d+)*)'
+        )
+        rst_underline = re.compile(r'^[-=~^#*+]{3,}$')
+
+        section_starts: list[tuple[int, tuple[int, ...]]] = []  # (line_idx, version_tuple)
+
+        for i, raw_line in enumerate(lines):
+            stripped = raw_line.rstrip()
+            # Markdown heading
+            m = md_heading.match(stripped)
+            if m:
+                vt = self._version_tuple(m.group(1))
+                if vt:
+                    section_starts.append((i, vt))
+                    continue
+            # RST underline-style heading: current line has a version, next is all dashes/equals
+            if is_rst and i + 1 < len(lines):
+                next_stripped = lines[i + 1].rstrip()
+                if (
+                    next_stripped
+                    and rst_underline.match(next_stripped)
+                    and abs(len(next_stripped) - len(stripped)) <= 4
+                    and len(stripped) >= 3
+                ):
+                    m2 = re.search(r'v?(\d+\.\d+(?:\.\d+)*)', stripped)
+                    if m2:
+                        vt = self._version_tuple(m2.group(1))
+                        if vt:
+                            section_starts.append((i, vt))
+
+        if not section_starts:
+            # No recognisable version headers — just truncate from the top
+            return raw_content[:self.changelog_file_max_chars]
+
+        section_starts.sort(key=lambda x: x[0])
+
+        # Pair each section start with its end (= next section's start line)
+        sections: list[tuple[tuple[int, ...], int, int]] = []
+        for idx, (start, vt) in enumerate(section_starts):
+            end = section_starts[idx + 1][0] if idx + 1 < len(section_starts) else len(lines)
+            sections.append((vt, start, end))
+
+        # Keep only sections whose version falls inside the migration window
+        relevant = [
+            (vt, s, e)
+            for (vt, s, e) in sections
+            if self._version_is_relevant(vt, current_version, latest_version)
+        ]
+
+        if not relevant:
+            return raw_content[:self.changelog_file_max_chars]
+
+        # For migration across major versions (e.g. 1.x → 2.x) the X.0.0 section contains
+        # the most important breaking changes. Always include those FIRST so they are never
+        # crowded out by a large volume of recent minor-release notes.
+        major_boundary = [
+            (vt, s, e) for (vt, s, e) in relevant
+            if len(vt) >= 3 and vt[1] == 0 and vt[2] == 0
+        ]
+        other_sections = [
+            (vt, s, e) for (vt, s, e) in relevant
+            if not (len(vt) >= 3 and vt[1] == 0 and vt[2] == 0)
+        ]
+        major_boundary.sort(key=lambda x: x[0])           # oldest → newest (2.0.0 before 3.0.0)
+        other_sections.sort(key=lambda x: x[0], reverse=True)  # newest-first for the rest
+        ordered = major_boundary + other_sections
+
+        max_chars = self.changelog_file_max_chars * 3
+        parts: list[str] = []
+        total = 0
+        for vt, start, end in ordered:
+            chunk = "".join(lines[start:end])
+            if total + len(chunk) > max_chars:
+                remaining = max_chars - total
+                if remaining > 200:
+                    parts.append(chunk[:remaining])
+                break
+            parts.append(chunk)
+            total += len(chunk)
+
+        result = "".join(parts)
+        return result if result.strip() else raw_content[:self.changelog_file_max_chars]
 
     # Parse the repo
     def _parse_github_owner_repo(self, repo_url: str) -> tuple[str, str]:
@@ -1215,18 +1326,30 @@ class ScoutAgent:
             low_bound = (0, 0, 0)
             
         release_notes = []
+        max_pages = 3  # safety cap: fetch at most 300 releases
         try:
-            response = await client.get(url, headers=headers, params={"per_page": 100}, timeout=15.0)
-            if response.status_code == 200:
-                for release in response.json():
+            for page in range(1, max_pages + 1):
+                response = await client.get(
+                    url, headers=headers,
+                    params={"per_page": 100, "page": page},
+                    timeout=15.0,
+                )
+                if response.status_code != 200:
+                    break
+                page_data = response.json()
+                if not page_data:
+                    break
+                reached_lower_bound = False
+                for release in page_data:
                     tag_name = release.get("tag_name", "")
                     clean_tag = self._clean_version(tag_name)
                     tag_tuple = self._version_tuple(clean_tag)
-                    
                     release_notes.append(f"## Version {tag_name}\n{release.get('body', '')}\n")
-                    
                     if tag_tuple and tag_tuple < low_bound:
+                        reached_lower_bound = True
                         break
+                if reached_lower_bound or len(page_data) < 100:
+                    break
         except Exception as e:
             logger.debug(f"Error fetching releases for {owner}/{repo}: {e}")
         return "\n".join(release_notes)
@@ -1357,6 +1480,9 @@ class ScoutAgent:
         title = (reference.get("title") or "").lower()
         url = (reference.get("url") or "").lower()
         source = (reference.get("source") or "").lower()
+        # Registry source takes precedence over any content-based classification
+        if source in {"pypi", "npm", "crates.io", "maven"}:
+            return "registry"
         text = " ".join([title, url, source])
         if any(token in text for token in ["migration", "migrating", "upgrade", "upgrading"]):
             return "migration_guide"
@@ -1395,7 +1521,7 @@ class ScoutAgent:
         profiles = []
         for usage in api_usages or []:
             parts = [part for part in re.split(r"[.:/]+", usage or "") if part]
-            if len(parts) < 3:
+            if len(parts) < 2:
                 continue
             owner = parts[-2]
             method = parts[-1]
@@ -1640,9 +1766,25 @@ class ScoutAgent:
                 continue
             min_distance = min(abs(owner_pos - method_pos) for owner_pos in owner_positions for method_pos in method_positions)
             if min_distance <= 120:
-                score += 35
+                # Double the proximity score when migration language appears near the method name —
+                # e.g. "@validator has been deprecated" without the full "pydantic.validator" string
+                prox_score = 70 if self._method_has_migration_context(normalized, method) else 35
+                score += prox_score
                 matches.append(f"{profile['owner']}~{profile['method']}")
         return score, matches
+
+    def _method_has_migration_context(self, normalized: str, method: str) -> bool:
+        """True when the method name appears within 200 chars of migration-signalling language."""
+        migration_signals = [
+            "deprecated", "removed", "replaced", "no longer", "legacy",
+            "instead", "migrate", "migration", "breaking",
+        ]
+        method_lower = method.lower()
+        for m in re.finditer(re.escape(method_lower), normalized):
+            window = normalized[max(0, m.start() - 200): m.end() + 200]
+            if any(sig in window for sig in migration_signals):
+                return True
+        return False
 
     def _migration_replacement_boost(self, normalized_text: str, exact_api: str) -> int:
         exact = self._normalized_evidence_text(exact_api)
@@ -2026,14 +2168,34 @@ class ScoutAgent:
                     "chunk_index": chunk_index,
                 }))
 
+        # Migration/release docs are the most valuable; reference API docs are secondary.
+        # Limit how many chunks any single source URL can contribute so that a single
+        # reference doc (e.g. validators.md showing the new API) cannot crowd out more
+        # specific migration guides or changelogs.
+        kind_caps = {
+            "migration_guide": 6,
+            "release_notes":   5,
+            "api_docs":        2,
+            "reference":       2,
+            "registry":        2,
+        }
+        default_cap = 3
+
         ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
         evidence = []
-        seen = set()
+        seen: set = set()
+        source_counts: dict[str, int] = {}
         for _score, _ref_order, chunk in ranked:
             key = (chunk["url"], chunk["content"][:160])
             if key in seen:
                 continue
+            url = chunk.get("url", "")
+            kind = chunk.get("document_kind", "reference")
+            cap = kind_caps.get(kind, default_cap)
+            if source_counts.get(url, 0) >= cap:
+                continue
             seen.add(key)
+            source_counts[url] = source_counts.get(url, 0) + 1
             evidence.append(chunk)
             if len(evidence) >= self.evidence_max_chunks:
                 break
@@ -2262,7 +2424,7 @@ class ScoutAgent:
                         f"default_branch: {default_branch}",
                     ])),
                 })
-            references.extend(await self._fetch_github_changelog_files(
+            changelog_refs = await self._fetch_github_changelog_files(
                 client,
                 owner,
                 repo,
@@ -2271,7 +2433,21 @@ class ScoutAgent:
                 latest_version,
                 api_usages,
                 api_contexts,
-            ))
+            )
+            references.extend(changelog_refs)
+            # If nothing found on "main" (e.g. repo uses "master"), retry with "master"
+            if not changelog_refs and default_branch == "main":
+                master_refs = await self._fetch_github_changelog_files(
+                    client,
+                    owner,
+                    repo,
+                    "master",
+                    current_version,
+                    latest_version,
+                    api_usages,
+                    api_contexts,
+                )
+                references.extend(master_refs)
 
         if release_notes.strip():
             references.insert(0, {
@@ -2554,10 +2730,11 @@ class ScoutAgent:
             "Format strictly as JSON."
         )
         
-        usage_constraint = ""
         if api_usages:
             usages_str = ", ".join(api_usages)
             usage_constraint = f"\nCRITICAL: You MUST ONLY extract breaking changes that affect these specific APIs used in the project: [{usages_str}]. Ignore all other breaking changes."
+        else:
+            usage_constraint = "\nOnly extract breaking changes that are explicitly and directly documented in the provided evidence chunks. Do not infer, speculate about, or add undocumented API changes."
 
         prompt = f"""
             Analyze DepGuard's compact evidence dossier for '{package}' from version {from_v} to {to_v} and extract ONLY breaking changes relevant to the package's ecosystem and API usage:{usage_constraint}

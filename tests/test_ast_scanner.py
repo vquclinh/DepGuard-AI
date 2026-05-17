@@ -656,3 +656,362 @@ def test_validate_source_uses_tree_sitter_when_available():
 
     assert scanner.validate_source("example.py", "value = 1\n") is None
     assert scanner.validate_source("example.py", "def broken(:\n") is not None
+
+
+# ---------------------------------------------------------------------------
+# IGNORE_DIRS and binary-file filtering
+# ---------------------------------------------------------------------------
+
+def test_scan_skips_node_modules_directory(tmp_path: Path):
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "lib.js").write_text(
+        'import legacy from "legacylib";\nlegacy.oldMethod();\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        'import legacy from "legacylib";\nlegacy.oldMethod();\n',
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(str(tmp_path), [{"old_api": "legacylib.oldMethod", "new_api": "legacylib.newMethod"}])
+    matched_files = list(result["matches_by_file"].keys())
+
+    assert len(matched_files) == 1
+    assert all("node_modules" not in Path(f).parts for f in matched_files)
+
+
+def test_scan_skips_venv_directory(tmp_path: Path):
+    (tmp_path / "venv").mkdir()
+    (tmp_path / "venv" / "pkg.py").write_text(
+        "import legacypkg\nlegacypkg.old_func()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "main.py").write_text(
+        "import legacypkg\nlegacypkg.old_func()\n",
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(str(tmp_path), [{"old_api": "legacypkg.old_func", "new_api": "legacypkg.new_func"}])
+    matched_files = list(result["matches_by_file"].keys())
+
+    assert len(matched_files) == 1
+    assert all("venv" not in Path(f).parts for f in matched_files)
+
+
+def test_scan_skips_binary_files(tmp_path: Path):
+    # Write a file with null bytes (binary)
+    binary_path = tmp_path / "binary.py"
+    binary_path.write_bytes(b"import legacypkg\nlegacypkg.old_func()\x00\xff\xfe")
+
+    (tmp_path / "real.py").write_text(
+        "import legacypkg\nlegacypkg.old_func()\n",
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(str(tmp_path), [{"old_api": "legacypkg.old_func", "new_api": "legacypkg.new_func"}])
+    matched_files = list(result["matches_by_file"].keys())
+
+    assert len(matched_files) == 1
+    assert all("binary.py" not in f for f in matched_files)
+
+
+# ---------------------------------------------------------------------------
+# Empty / no-op inputs
+# ---------------------------------------------------------------------------
+
+def test_scan_returns_empty_for_no_breaking_changes(tmp_path: Path):
+    (tmp_path / "app.py").write_text("import pandas\npandas.DataFrame()\n", encoding="utf-8")
+
+    result = ASTScanner().scan(str(tmp_path), [])
+
+    assert result["total_matches"] == 0
+    assert result["matches_by_file"] == {}
+
+
+def test_scan_returns_empty_for_invalid_directory():
+    result = ASTScanner().scan("/nonexistent/path/that/does/not/exist", [{"old_api": "pkg.func"}])
+
+    assert result["total_files_scanned"] == 0
+    assert result["total_matches"] == 0
+
+
+def test_find_api_usages_returns_empty_for_invalid_directory():
+    usages = ASTScanner().find_api_usages("/nonexistent/path", "pandas")
+    assert usages == []
+
+
+# ---------------------------------------------------------------------------
+# Line / column accuracy
+# ---------------------------------------------------------------------------
+
+def test_scan_reports_accurate_line_and_col_for_match(tmp_path: Path):
+    code = "\n".join([
+        "import numpy as np",
+        "",
+        "def process():",
+        "    arr = np.array([1, 2, 3])",
+        "    mask = np.bool(arr > 0)",
+        "    return mask",
+        "",
+    ])
+    (tmp_path / "app.py").write_text(code, encoding="utf-8")
+
+    result = ASTScanner().scan(
+        str(tmp_path),
+        [{"old_api": "numpy.bool", "new_api": "numpy.bool_"}],
+    )
+    matches = next(iter(result["matches_by_file"].values()))
+
+    assert len(matches) >= 1
+    # np.bool is on line 5 (1-indexed)
+    match = next(m for m in matches if m["old_api"] == "numpy.bool")
+    assert match["line"] == 5
+    assert match["col"] >= 0
+
+
+def test_scan_does_not_produce_duplicate_matches_for_same_position(tmp_path: Path):
+    """The same API at the same line/col must not appear more than once."""
+    (tmp_path / "app.py").write_text(
+        "import pandas as pd\ndf = pd.DataFrame({'a': [1]})\n",
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(
+        str(tmp_path),
+        [{"old_api": "pandas.DataFrame", "new_api": "pandas.DataFrame2"}],
+    )
+    matches = [m for ms in result["matches_by_file"].values() for m in ms]
+    positions = [(m["line"], m["col"], m["old_api"]) for m in matches]
+    assert len(positions) == len(set(positions))
+
+
+# ---------------------------------------------------------------------------
+# Java import and method-call matching
+# ---------------------------------------------------------------------------
+
+def test_find_api_usages_java_simple_class_import(tmp_path: Path):
+    (tmp_path / "App.java").write_text(
+        "\n".join([
+            "import com.example.OldClient;",
+            "",
+            "public class App {",
+            "    public static void main(String[] args) {",
+            "        OldClient client = new OldClient();",
+            "        client.send(payload);",
+            "    }",
+            "}",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "com.example")
+
+    assert "com.example.OldClient" in usages
+
+
+def test_scan_matches_java_static_method(tmp_path: Path):
+    (tmp_path / "App.java").write_text(
+        "\n".join([
+            "import com.example.Helper;",
+            "",
+            "public class App {",
+            "    public void run() {",
+            "        Helper.oldStaticMethod(data);",
+            "    }",
+            "}",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(
+        str(tmp_path),
+        [{"old_api": "com.example.Helper.oldStaticMethod", "new_api": "com.example.Helper.newStaticMethod"}],
+    )
+    matches = [m for ms in result["matches_by_file"].values() for m in ms]
+
+    assert any(m["old_api"] == "com.example.Helper.oldStaticMethod" for m in matches)
+
+
+# ---------------------------------------------------------------------------
+# C# using-namespace and method matching
+# ---------------------------------------------------------------------------
+
+def test_find_api_usages_csharp_using_namespace(tmp_path: Path):
+    (tmp_path / "Program.cs").write_text(
+        "\n".join([
+            "using MyLib.Core;",
+            "",
+            "class Program {",
+            "    static void Main() {",
+            "        var obj = new OldClass();",
+            "        obj.OldMethod();",
+            "    }",
+            "}",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "MyLib")
+
+    assert "MyLib.Core" in usages or any("MyLib" in u for u in usages)
+
+
+# ---------------------------------------------------------------------------
+# TypeScript named imports
+# ---------------------------------------------------------------------------
+
+def test_find_api_usages_typescript_named_import_with_alias(tmp_path: Path):
+    (tmp_path / "app.ts").write_text(
+        "\n".join([
+            "import { ChatCompletion as CC } from 'openai';",
+            "",
+            "async function generate() {",
+            "    const result = CC.create({ model: 'gpt-4', messages: [] });",
+            "    return result;",
+            "}",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "openai")
+
+    # Should resolve CC back to openai.ChatCompletion
+    assert any("openai" in u for u in usages)
+
+
+def test_find_api_usages_typescript_default_import(tmp_path: Path):
+    (tmp_path / "app.ts").write_text(
+        "\n".join([
+            "import express from 'express';",
+            "",
+            "const app = express();",
+            "app.use(express.json());",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "express")
+
+    assert any("express" in u for u in usages)
+
+
+# ---------------------------------------------------------------------------
+# Go package alias import
+# ---------------------------------------------------------------------------
+
+def test_scan_matches_go_aliased_import(tmp_path: Path):
+    (tmp_path / "main.go").write_text(
+        "\n".join([
+            "package main",
+            "",
+            'import oldpkg "example.com/legacy/pkg"',
+            "",
+            "func main() {",
+            "    oldpkg.LegacyFunc()",
+            "}",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(
+        str(tmp_path),
+        [{"old_api": "example.com/legacy/pkg.LegacyFunc", "new_api": "example.com/new/pkg.NewFunc"}],
+    )
+    matches = [m for ms in result["matches_by_file"].values() for m in ms]
+
+    assert any(m["old_api"] == "example.com/legacy/pkg.LegacyFunc" for m in matches)
+
+
+# ---------------------------------------------------------------------------
+# Multi-package isolation in same file
+# ---------------------------------------------------------------------------
+
+def test_scan_isolates_two_packages_in_same_file(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "import pkgA",
+            "import pkgB",
+            "",
+            "pkgA.old_call()",
+            "pkgB.old_call()",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    result = ASTScanner().scan(
+        str(tmp_path),
+        [
+            {"old_api": "pkgA.old_call", "new_api": "pkgA.new_call"},
+            {"old_api": "pkgB.old_call", "new_api": "pkgB.new_call"},
+        ],
+    )
+    matches = [m for ms in result["matches_by_file"].values() for m in ms]
+    old_apis = {m["old_api"] for m in matches}
+
+    assert "pkgA.old_call" in old_apis
+    assert "pkgB.old_call" in old_apis
+
+
+# ---------------------------------------------------------------------------
+# find_api_usage_contexts limit parameter
+# ---------------------------------------------------------------------------
+
+def test_find_api_usage_contexts_respects_limit(tmp_path: Path):
+    lines = ["import pandas as pd"]
+    for i in range(50):
+        lines.append(f"df{i} = pd.DataFrame({{'{i}': [{i}]}})")
+    (tmp_path / "app.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    contexts = ASTScanner().find_api_usage_contexts(str(tmp_path), "pandas", limit=5)
+
+    assert len(contexts) <= 5
+
+
+# ---------------------------------------------------------------------------
+# Language detection by extension
+# ---------------------------------------------------------------------------
+
+def test_detect_language_covers_common_extensions():
+    scanner = ASTScanner()
+    assert scanner.detect_language("app.py") == "python"
+    assert scanner.detect_language("app.js") == "javascript"
+    assert scanner.detect_language("app.ts") == "typescript"
+    assert scanner.detect_language("app.tsx") == "tsx"
+    assert scanner.detect_language("main.rs") == "rust"
+    assert scanner.detect_language("main.go") == "go"
+    assert scanner.detect_language("App.java") == "java"
+    assert scanner.detect_language("App.cs") == "c_sharp"
+    assert scanner.detect_language("app.rb") == "ruby"
+    assert scanner.detect_language("app.php") == "php"
+    assert scanner.detect_language("app.swift") == "swift"
+    assert scanner.detect_language("app.kt") == "kotlin"
+    assert scanner.detect_language("unknown.xyz") is None
+
+
+# ---------------------------------------------------------------------------
+# Scan total counts are consistent
+# ---------------------------------------------------------------------------
+
+def test_scan_total_counts_match_matches_by_file(tmp_path: Path):
+    (tmp_path / "a.py").write_text("import numpy as np\nnp.float_(x)\nnp.bool_(y)\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("import numpy as np\nnp.float_(z)\n", encoding="utf-8")
+
+    result = ASTScanner().scan(
+        str(tmp_path),
+        [
+            {"old_api": "numpy.float_", "new_api": "float"},
+            {"old_api": "numpy.bool_", "new_api": "bool"},
+        ],
+    )
+
+    actual_matches = sum(len(ms) for ms in result["matches_by_file"].values())
+    assert result["total_matches"] == actual_matches
+    assert result["total_files_affected"] == len(result["matches_by_file"])
+    assert result["total_files_scanned"] >= result["total_files_affected"]
