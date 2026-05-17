@@ -837,9 +837,14 @@ class ASTScanner:
 
     def _assignment_target_matches_callable(self, variable: str, callable_name: str) -> bool:
         """Keep lowercase factory dataflow useful without treating all returns as package objects."""
+        callable_leaf = callable_name.rsplit(".", 1)[-1]
+        # Class instantiations (PascalCase callables) always produce an instance — track them
+        # regardless of how the variable is named (e.g. app = Flask(), engine = SQLAlchemy()).
+        if callable_leaf and callable_leaf[0].isupper():
+            return True
         variable_leaf = variable.rsplit(".", 1)[-1].lower()
-        callable_leaf = callable_name.rsplit(".", 1)[-1].lower()
-        callable_terms = {term for term in re.split(r"[_\W]+", callable_leaf) if term}
+        callable_leaf_lower = callable_leaf.lower()
+        callable_terms = {term for term in re.split(r"[_\W]+", callable_leaf_lower) if term}
         if not variable_leaf or not callable_terms:
             return False
         if variable_leaf in callable_terms:

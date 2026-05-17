@@ -399,10 +399,16 @@ PATCH_CASES: list[PatchTestCase] = [
                     return result
             """,
             "api/views.py": """\
-                from api.serializers import user_schema
+                from marshmallow import Schema, fields
+
+                class ResponseSchema(Schema):
+                    id = fields.Int()
+                    name = fields.Str()
+
+                resp_schema = ResponseSchema()
 
                 def get_user_response(user):
-                    data, errors = user_schema.dump(user)
+                    data, errors = resp_schema.dump(user)
                     if errors:
                         return {'error': str(errors)}, 400
                     return data, 200
@@ -453,7 +459,7 @@ PATCH_CASES: list[PatchTestCase] = [
                 ("result, errors = order_schema.dump", False),
             ],
             "api/views.py": [
-                ("data, errors = user_schema.dump", False),
+                ("data, errors = resp_schema.dump", False),
             ],
         },
     ),
