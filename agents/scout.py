@@ -1049,6 +1049,12 @@ class ScoutAgent:
 
         if len(current) >= 2 and len(latest) >= 2:
             low, high = sorted([current, latest])
+            
+            # Always include the major version roots to catch X.0.0 breaking changes
+            raw_versions.append(f"{low[0]}.0.0")
+            if high[0] > low[0]:
+                raw_versions.append(f"{high[0]}.0.0")
+
             if low[0] == high[0] and 0 <= high[1] - low[1] <= 12:
                 for minor in range(low[1], high[1] + 1):
                     raw_versions.append(f"{low[0]}.{minor}.0")
@@ -1161,7 +1167,11 @@ class ScoutAgent:
         if not current or not latest:
             return True
         low, high = sorted([current, latest])
-        return low <= version <= high
+        
+        # Broaden the lower bound to the base of the current major version
+        # to catch breaking changes that happened at X.0.0
+        low_bound = (low[0], 0, 0) if len(low) > 0 else low
+        return low_bound <= version <= high
 
     # Parse the repo
     def _parse_github_owner_repo(self, repo_url: str) -> tuple[str, str]:
@@ -1187,17 +1197,28 @@ class ScoutAgent:
     async def _fetch_release_notes(self, client: httpx.AsyncClient, owner: str, repo: str, current_version: str, latest_version: str) -> str:
         url = f"https://api.github.com/repos/{owner}/{repo}/releases"
         headers = self._github_headers()
-        def clean_version(v): return re.sub(r'^[^\d]+', '', v)
-        cv = clean_version(current_version)
+        current = self._version_tuple(self._clean_version(current_version))
+        latest = self._version_tuple(self._clean_version(latest_version))
+        
+        if current and latest:
+            low, high = sorted([current, latest])
+            low_bound = (low[0], 0, 0) if len(low) > 0 else (0, 0, 0)
+        else:
+            low_bound = (0, 0, 0)
+            
         release_notes = []
         try:
             response = await client.get(url, headers=headers, params={"per_page": 100}, timeout=15.0)
             if response.status_code == 200:
                 for release in response.json():
                     tag_name = release.get("tag_name", "")
-                    clean_tag = clean_version(tag_name)
+                    clean_tag = self._clean_version(tag_name)
+                    tag_tuple = self._version_tuple(clean_tag)
+                    
                     release_notes.append(f"## Version {tag_name}\n{release.get('body', '')}\n")
-                    if clean_tag == cv or tag_name == current_version: break
+                    
+                    if tag_tuple and tag_tuple < low_bound:
+                        break
         except Exception as e:
             logger.debug(f"Error fetching releases for {owner}/{repo}: {e}")
         return "\n".join(release_notes)
