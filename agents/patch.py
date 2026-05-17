@@ -352,6 +352,11 @@ class PatchAgent:
             "A replacement for a larger target range must keep every unchanged line in that range.\n"
             "If the top-level import area is outside the editable range and a migrated call needs a helper, inject the import locally inside the edited scope. "
             "Example: if replacing engine.execute(\"SELECT 1\") with connection.execute(text(\"SELECT 1\")) and top-level imports are blocked, write `def get_user_count(db_url):\\n    from sqlalchemy import text\\n    ...`.\n"
+            "IMPORTANT — when renaming a decorator or function call, also migrate its keyword arguments if they changed in the new version. "
+            "Do not carry forward keyword arguments that no longer exist in the new API — they will cause a TypeError at runtime. "
+            "Check the DepGuard API Evidence replacement examples for the correct new signature.\n"
+            "IMPORTANT — never insert a bare `import` or `from X import Y` statement at an indented level (inside a function or class body). "
+            "If a new import is needed and the module-level import block is outside the target range, either (a) add a local import at the start of the enclosing function body, or (b) if the symbol is already imported at module level per the Import Context, do not add it again.\n"
             "If you migrate an API call that binds its return value to a variable, and evidence or the package migration context shows the library shifted from dictionaries to Pydantic/object models, audit the entire target block for downstream uses of that variable and convert dictionary lookups like `response['choices'][0]['message']['content']` into attribute access like `response.choices[0].message.content`.\n"
             "If evidence is insufficient, or no target block needs a change, return status no_change with an empty replacements array.\n"
             "Return one JSON object only. Do not return markdown, prose, code fences, or explanations outside JSON.\n"
@@ -1299,6 +1304,57 @@ class PatchAgent:
                 f"{names}. Add an import or definition inside the returned target block or another returned block."
             )
 
+    def _extract_import_names(self, import_line: str) -> set:
+        """Extract imported symbol names from a single import statement line."""
+        stripped = import_line.strip()
+        names: set = set()
+        try:
+            import ast as _ast
+            tree = _ast.parse(stripped)
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.Import):
+                    for alias in node.names:
+                        names.add(alias.asname or alias.name.split(".")[0])
+                elif isinstance(node, _ast.ImportFrom):
+                    for alias in node.names:
+                        names.add(alias.asname or alias.name)
+        except SyntaxError:
+            pass
+        return names
+
+    def _validate_replacements_do_not_add_imports_in_function_bodies(
+        self,
+        replacements: list[dict],
+        target_blocks: list[dict],
+        original_content: str,
+    ) -> None:
+        """Reject replacements that re-import at an indented level a symbol already
+        available at module level. Local imports for genuinely new helpers are allowed."""
+        if not replacements:
+            return
+        module_names = self._top_level_python_names(original_content)
+        for replacement in replacements:
+            repl_text = str(replacement.get("replacement", "") or "")
+            for line in repl_text.splitlines():
+                stripped = line.lstrip()
+                if not stripped.startswith(("import ", "from ")):
+                    continue
+                indent = len(line) - len(stripped)
+                if indent == 0:
+                    continue  # module-level import is fine
+                imported = self._extract_import_names(stripped)
+                duplicates = imported & module_names
+                if duplicates:
+                    names_str = ", ".join(sorted(duplicates))
+                    raise PatchResponseError(
+                        f"Replacement added a redundant import inside an indented block: "
+                        f"{stripped!r}. "
+                        f"These names are already available at module level: {names_str}. "
+                        "Do not re-import symbols already imported at module level. "
+                        "Remove the local import from the replacement."
+                    )
+
+
     def _repair_replacements_with_documented_local_imports(
         self,
         replacements: list[dict],
@@ -1509,6 +1565,11 @@ class PatchAgent:
             scout_context,
         )
         self._validate_replacements_do_not_introduce_unresolved_bare_calls(
+            replacements,
+            target_blocks,
+            original_content,
+        )
+        self._validate_replacements_do_not_add_imports_in_function_bodies(
             replacements,
             target_blocks,
             original_content,
