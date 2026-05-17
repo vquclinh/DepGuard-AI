@@ -1116,6 +1116,48 @@ class PatchAgent:
             return set()
         return matched_names - self._name_tokens(replacement_text)
 
+    def _expand_matched_for_decorator_scopes(
+        self, block_source: str, block_start_line: int, matched_lines: set
+    ) -> set:
+        """When a matched line is a decorator (@...), also mark its decorated
+        function definition and body as removable — they are logically coupled."""
+        expanded = set(matched_lines)
+        source_lines = block_source.splitlines()
+        for line_no in sorted(matched_lines):
+            offset = line_no - block_start_line
+            if offset < 0 or offset >= len(source_lines):
+                continue
+            if not source_lines[offset].lstrip().startswith("@"):
+                continue
+            # Walk past any additional decorators to find the def
+            next_off = offset + 1
+            while next_off < len(source_lines):
+                nl = source_lines[next_off]
+                stripped = nl.strip()
+                if not stripped:
+                    next_off += 1
+                    continue
+                if stripped.startswith("@"):
+                    expanded.add(block_start_line + next_off)
+                    next_off += 1
+                    continue
+                if re.match(r"^(async\s+)?def\s+", stripped):
+                    expanded.add(block_start_line + next_off)
+                    def_indent = len(nl) - len(nl.lstrip())
+                    body_off = next_off + 1
+                    while body_off < len(source_lines):
+                        bl = source_lines[body_off]
+                        if not bl.strip():
+                            body_off += 1
+                            continue
+                        if len(bl) - len(bl.lstrip()) <= def_indent:
+                            break
+                        expanded.add(block_start_line + body_off)
+                        body_off += 1
+                    break
+                break
+        return expanded
+
     def _allowed_keywords_from_breaking_changes(self, scout_context) -> set:
         if not scout_context:
             return set()
@@ -1153,9 +1195,14 @@ class PatchAgent:
                 continue
             protected_lines = []
             start_line = block["start_line"]
-            for offset, line in enumerate(str(block.get("source", "") or "").splitlines()):
+            block_source = str(block.get("source", "") or "")
+            # Expand matched lines to include bodies of matched decorator functions
+            effective_matched = self._expand_matched_for_decorator_scopes(
+                block_source, start_line, matched_lines
+            )
+            for offset, line in enumerate(block_source.splitlines()):
                 absolute_line = start_line + offset
-                if absolute_line in matched_lines:
+                if absolute_line in effective_matched:
                     continue
                 if not line.strip():
                     continue
