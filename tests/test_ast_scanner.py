@@ -299,6 +299,45 @@ def test_find_api_usages_can_match_clear_import_root_prefix(tmp_path: Path):
     assert "sam.Tool.OLD_CONSTANT" in usages
 
 
+def test_find_api_usages_does_not_leak_embedded_package_suffix(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "import openai",
+            "",
+            "def call_native_openai():",
+            "    return openai.ChatCompletion.create(model='gpt-3.5-turbo', messages=[])",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "langchain-openai")
+
+    assert usages == []
+
+
+def test_find_api_usages_isolates_overlapping_openai_and_langchain_openai(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "import openai",
+            "from langchain_openai import ChatOpenAI",
+            "",
+            "def call_native_openai():",
+            "    return openai.ChatCompletion.create(model='gpt-3.5-turbo', messages=[])",
+            "",
+            "def call_langchain():",
+            "    return ChatOpenAI(model_name='gpt-4')",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "langchain-openai")
+
+    assert "langchain_openai.ChatOpenAI" in usages
+    assert all(not usage.startswith("openai.") for usage in usages)
+
+
 def test_scan_matches_imported_constant_attribute_target(tmp_path: Path):
     (tmp_path / "app.py").write_text(
         "\n".join([

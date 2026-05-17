@@ -927,6 +927,174 @@ def test_scout_prioritizes_receiver_method_migration_evidence():
     assert evidence[0]["evidence_confidence"] == "high"
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        {
+            "name": "openai_create_ignores_server_endpoint_create_noise",
+            "api_usages": ["openai.ChatCompletion.create"],
+            "api_contexts": [{"api": "openai.ChatCompletion.create", "code_snippet": "openai.ChatCompletion.create(model='gpt', messages=[])"}],
+            "references": [
+                ("docs/server-api.md", "LangSmith server API endpoints can create runs, projects, cron jobs, and datasets."),
+                ("migration/v1.md", "The openai.ChatCompletion.create API was removed. Use client.chat.completions.create instead."),
+            ],
+            "expected": "ChatCompletion.create API was removed",
+            "forbidden": "cron jobs",
+        },
+        {
+            "name": "pillow_open_ignores_generic_open_docs",
+            "api_usages": ["PIL.Image.open"],
+            "api_contexts": [{"api": "PIL.Image.open", "code_snippet": "img = Image.open(path)"}],
+            "references": [
+                ("CONTRIBUTING.md", "Open a pull request after you create a test branch."),
+                ("releasenotes/current.rst", "Image.open no longer accepts legacy mode strings. Use the documented mode enum instead."),
+            ],
+            "expected": "Image.open no longer accepts",
+            "forbidden": "pull request",
+        },
+        {
+            "name": "pandas_append_ignores_storage_append_noise",
+            "api_usages": ["pandas.DataFrame.append"],
+            "api_contexts": [{"api": "pandas.DataFrame.append", "code_snippet": "result = base_df.append(new_df, ignore_index=True)"}],
+            "references": [
+                ("io.rst", "HDFStore append table examples and append-to-file setup notes."),
+                ("whatsnew/v2.0.0.rst", "Removed deprecated DataFrame.append and Series.append; use concat instead."),
+            ],
+            "expected": "DataFrame.append",
+            "forbidden": "HDFStore",
+        },
+        {
+            "name": "langchain_openai_model_name_ignores_langsmith_model_name_noise",
+            "api_usages": ["langchain_openai.ChatOpenAI"],
+            "api_contexts": [{"api": "langchain_openai.ChatOpenAI", "code_snippet": "llm = ChatOpenAI(model_name='gpt-4')"}],
+            "references": [
+                ("langsmith/server.md", "The model_name field can be used in LangSmith trace metadata and cron job filters."),
+                ("langchain_openai/migration.md", "ChatOpenAI model_name was renamed to model. Use model instead of model_name."),
+            ],
+            "expected": "ChatOpenAI model_name",
+            "forbidden": "trace metadata",
+        },
+        {
+            "name": "langchain_openai_does_not_select_native_openai_migration",
+            "api_usages": ["langchain_openai.ChatOpenAI"],
+            "api_contexts": [{"api": "langchain_openai.ChatOpenAI", "code_snippet": "llm = ChatOpenAI(model_name='gpt-4')"}],
+            "references": [
+                ("openai/migration.md", "openai.ChatCompletion.create was removed. Use client.chat.completions.create instead."),
+                ("langchain_openai/migration.md", "ChatOpenAI model_name was renamed to model. Use model instead of model_name."),
+            ],
+            "expected": "ChatOpenAI model_name",
+            "forbidden": "ChatCompletion.create",
+        },
+        {
+            "name": "native_openai_does_not_select_langchain_openai_migration",
+            "api_usages": ["openai.ChatCompletion.create"],
+            "api_contexts": [{"api": "openai.ChatCompletion.create", "code_snippet": "openai.ChatCompletion.create(model='gpt', messages=[])"}],
+            "references": [
+                ("langchain_openai/migration.md", "ChatOpenAI model_name was renamed to model. Use model instead of model_name."),
+                ("openai/migration.md", "openai.ChatCompletion.create was removed. Use client.chat.completions.create instead."),
+            ],
+            "expected": "ChatCompletion.create",
+            "forbidden": "ChatOpenAI",
+        },
+        {
+            "name": "langsmith_create_endpoint_noise_only_returns_empty",
+            "api_usages": ["openai.ChatCompletion.create"],
+            "api_contexts": [{"api": "openai.ChatCompletion.create", "code_snippet": "openai.ChatCompletion.create(model='gpt', messages=[])"}],
+            "references": [
+                ("langsmith/server.md", "API endpoints create runs, create projects, create cron jobs, and create datasets."),
+                ("docs/setup.md", "Create a virtual environment and create an API key before running examples."),
+            ],
+            "expected_empty": True,
+        },
+        {
+            "name": "contributing_guides_with_generic_create_are_ignored",
+            "api_usages": ["example.Client.create"],
+            "api_contexts": [{"api": "example.Client.create", "code_snippet": "client.create(payload)"}],
+            "references": [
+                ("CONTRIBUTING.md", "Create a branch, create a pull request, and update the changelog."),
+                ("docs/release.md", "Maintainers create releases after tests pass."),
+            ],
+            "expected_empty": True,
+        },
+        {
+            "name": "buried_exact_api_window_beats_front_matter",
+            "api_usages": ["pandas.DataFrame.append"],
+            "api_contexts": [{"api": "pandas.DataFrame.append", "code_snippet": "result = base_df.append(new_df)"}],
+            "references": [
+                ("whatsnew/v2.0.0.rst", "\n\n".join([
+                    "Project front matter\n" + ("DataFrame examples and setup notes. " * 60),
+                    "Removed deprecated DataFrame.append and Series.append; use concat instead.",
+                ])),
+            ],
+            "expected": "DataFrame.append",
+            "forbidden": "front matter",
+        },
+        {
+            "name": "keyword_rename_requires_owner_anchor",
+            "api_usages": ["urllib3.util.retry.Retry"],
+            "api_contexts": [{"api": "urllib3.util.retry.Retry", "code_snippet": "Retry(total=3, method_whitelist={'GET'})"}],
+            "references": [
+                ("generic.md", "The method whitelist in an unrelated server can be configured by name."),
+                ("urllib3-2.0.rst", "Retry method_whitelist was renamed to allowed_methods. Use allowed_methods instead of method_whitelist."),
+            ],
+            "expected": "Retry method_whitelist",
+            "forbidden": "unrelated server",
+        },
+        {
+            "name": "private_underscore_suggestion_noise_is_not_evidence_without_old_api",
+            "api_usages": ["pandas.DataFrame.append"],
+            "api_contexts": [{"api": "pandas.DataFrame.append", "code_snippet": "base_df.append(new_df)"}],
+            "references": [
+                ("internal.md", "Internal developers may use _append while creating benchmarks."),
+                ("whatsnew/v2.0.0.rst", "Removed deprecated DataFrame.append and Series.append; use concat instead."),
+            ],
+            "expected": "DataFrame.append",
+            "forbidden": "_append",
+        },
+        {
+            "name": "setup_language_with_package_root_but_no_api_anchor_is_ignored",
+            "api_usages": ["langchain_openai.ChatOpenAI"],
+            "api_contexts": [{"api": "langchain_openai.ChatOpenAI", "code_snippet": "ChatOpenAI(model_name='gpt-4')"}],
+            "references": [
+                ("setup.md", "Install langchain-openai, create an API key, and open the dashboard."),
+            ],
+            "expected_empty": True,
+        },
+    ],
+    ids=lambda case: case["name"],
+)
+def test_scout_hardened_retrieval_noise_matrix(case):
+    scout = ScoutAgent()
+    scout.evidence_chunk_chars = 700
+    scout.evidence_max_chunks = 2
+    references = [
+        {
+            "source": "github",
+            "title": title,
+            "url": f"https://github.com/acme/project/blob/main/{title}",
+            "content": content,
+        }
+        for title, content in case["references"]
+    ]
+
+    evidence = scout._focused_reference_snippets(
+        references,
+        case["api_usages"],
+        api_contexts=case["api_contexts"],
+        current_version="1.0.0",
+        latest_version="2.0.0",
+    )
+
+    if case.get("expected_empty"):
+        assert evidence == []
+        return
+
+    assert evidence
+    assert case["expected"] in evidence[0]["content"]
+    assert case["forbidden"] not in evidence[0]["content"]
+    assert evidence[0]["evidence_confidence"] in {"high", "medium"}
+
+
 def test_scout_discards_html_not_found_pages():
     scout = ScoutAgent()
 

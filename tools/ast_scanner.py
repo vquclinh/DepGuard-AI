@@ -567,11 +567,7 @@ class ASTScanner:
         package_norm = self._normalize_package_token(package_name)
         if len(root_norm) < 3 or not package_norm:
             return False
-        return (
-            package_norm.startswith(root_norm)
-            or package_norm.endswith(root_norm)
-            or root_norm in package_norm
-        )
+        return package_norm.startswith(root_norm)
 
     def _real_name_has_known_root(self, real_name: str, package_roots: set[str]) -> bool:
         real_root = re.split(r"[./:]+", real_name, maxsplit=1)[0]

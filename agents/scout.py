@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 
 # --------------------------------- Scout Agent ------------------------------------
 class ScoutAgent:
+    GENERIC_EVIDENCE_TERMS = {
+        "add", "append", "build", "call", "close", "connect", "create", "delete",
+        "execute", "find", "get", "init", "insert", "list", "load", "make", "model",
+        "model_name", "name", "open", "parse", "post", "put", "read", "render",
+        "request", "run", "save", "send", "set", "setup", "start", "stop", "update",
+        "use", "write",
+    }
+
     CHANGELOG_PATHS = [
         "CHANGELOG.md",
         "CHANGELOG.rst",
@@ -1402,6 +1410,11 @@ class ScoutAgent:
         for context in api_contexts or []:
             if not isinstance(context, dict):
                 continue
+            usage_owners = []
+            for usage in api_usages or []:
+                usage_parts = [part for part in re.split(r"[.:/]+", str(usage or "")) if part]
+                if len(usage_parts) >= 2:
+                    usage_owners.append((str(usage or ""), usage_parts[-1]))
             snippet = "\n".join([
                 str(context.get("matched_text", "") or ""),
                 str(context.get("code_snippet", "") or ""),
@@ -1416,7 +1429,102 @@ class ScoutAgent:
                     "method": method,
                     "exact": f"{owner}.{method}",
                 })
+                context_api = str(context.get("api", "") or context.get("old_api", "") or "").strip()
+                context_parts = [part for part in re.split(r"[.:/]+", context_api) if part]
+                if len(context_parts) >= 2:
+                    api_owner = context_parts[-1]
+                    if api_owner and api_owner.lower() != method.lower():
+                        profiles.append({
+                            "api": context_api,
+                            "owner": api_owner,
+                            "method": method,
+                            "exact": f"{api_owner}.{method}",
+                        })
+                elif not context_api:
+                    for usage, api_owner in usage_owners:
+                        if api_owner and api_owner.lower() != method.lower():
+                            profiles.append({
+                                "api": usage,
+                                "owner": api_owner,
+                                "method": method,
+                                "exact": f"{api_owner}.{method}",
+                            })
         return profiles
+
+    def _api_centered_terms(
+        self,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> list[str]:
+        terms: set[str] = set()
+        for usage in api_usages or []:
+            normalized = str(usage or "").replace("::", ".").replace("/", ".").strip()
+            parts = [part for part in normalized.split(".") if part]
+            if len(parts) >= 2:
+                terms.add(".".join(parts[-2:]))
+            if len(parts) >= 3:
+                terms.add(".".join(parts[-3:]))
+                terms.add(normalized)
+        for profile in self._method_api_profiles(api_usages, api_contexts):
+            exact = str(profile.get("exact", "") or "").strip()
+            owner = str(profile.get("owner", "") or "").strip()
+            method = str(profile.get("method", "") or "").strip()
+            if exact and owner and method and not self._is_weak_unqualified_term(method):
+                terms.add(exact)
+            elif exact and owner and method:
+                terms.add(exact)
+        return sorted(terms, key=lambda item: (-len(item), item))
+
+    def _api_centered_reference_chunks(
+        self,
+        reference: dict,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> list[dict]:
+        content = (reference.get("content") or "").strip()
+        if not content:
+            return []
+
+        terms = self._api_centered_terms(api_usages, api_contexts)
+        if not terms:
+            return []
+
+        chunks: list[dict] = []
+        seen_windows: set[tuple[int, int]] = set()
+        normalized_content = self._normalized_evidence_text(content)
+        window_size = max(self.evidence_chunk_chars, 800)
+        half_window = window_size // 2
+
+        for term in terms:
+            normalized_term = self._normalized_evidence_text(term)
+            if not normalized_term:
+                continue
+            for match in re.finditer(rf"(?<![\w.]){re.escape(normalized_term)}(?![\w.])", normalized_content):
+                # normalized offsets are close enough for windowing because normalization mostly strips markup.
+                index = match.start()
+                window_start = max(0, index - half_window)
+                window_end = min(len(content), index + len(term) + half_window)
+                paragraph_start = content.rfind("\n\n", 0, window_start)
+                paragraph_end = content.find("\n\n", window_end)
+                if paragraph_start != -1 and index - paragraph_start <= window_size:
+                    window_start = paragraph_start + 2
+                if paragraph_end != -1 and paragraph_end - index <= window_size:
+                    window_end = paragraph_end
+                key = (window_start, window_end)
+                if key in seen_windows:
+                    continue
+                seen_windows.add(key)
+                line_start = content[:window_start].count("\n") + 1
+                line_end = line_start + content[window_start:window_end].count("\n")
+                chunks.append({
+                    **reference,
+                    "content": content[window_start:window_end].strip()[: self.evidence_chunk_chars + 300],
+                    "line_start": line_start,
+                    "line_end": max(line_start, line_end),
+                    "document_kind": self._document_kind(reference),
+                    "api_centered": True,
+                })
+        return chunks
 
     def _method_evidence_score(
         self,
@@ -1485,7 +1593,92 @@ class ScoutAgent:
                 if len(term_lower) > 4 and term_lower in normalized:
                     score += 18 if " " in term_lower else 7
                     matches.append(term)
+                    continue
+                fuzzy_score = self._fuzzy_semantic_term_score(term_lower, normalized)
+                if fuzzy_score:
+                    score += fuzzy_score
+                    matches.append(term)
         return score, matches
+
+    def _fuzzy_semantic_term_score(self, term: str, normalized_text: str) -> int:
+        if " " not in term or not normalized_text:
+            return 0
+        term_tokens = [
+            self._semantic_token_stem(token)
+            for token in re.findall(r"[a-z][a-z0-9_]{3,}", term)
+            if token not in {
+                "from", "into", "with", "this", "that", "other", "return",
+                "returns", "parameter", "parameters", "function", "method",
+            }
+        ]
+        term_tokens = [token for token in term_tokens if token]
+        if len(term_tokens) < 2:
+            return 0
+        text_tokens = {
+            self._semantic_token_stem(token)
+            for token in re.findall(r"[a-z][a-z0-9_]{3,}", normalized_text)
+        }
+        overlap = sum(1 for token in set(term_tokens) if token in text_tokens)
+        if overlap >= 3:
+            return 12
+        if overlap >= 2 and len(set(term_tokens)) <= 4:
+            return 9
+        return 0
+
+    def _semantic_token_stem(self, token: str) -> str:
+        value = (token or "").lower()
+        for suffix in ("ing", "ed", "es", "s"):
+            if len(value) > len(suffix) + 3 and value.endswith(suffix):
+                return value[: -len(suffix)]
+        return value
+
+    def _is_weak_unqualified_term(self, term: str) -> bool:
+        normalized = self._normalized_evidence_text(term)
+        if not normalized:
+            return True
+        if any(separator in normalized for separator in [".", "::", "/", "~"]):
+            return False
+        if " " in normalized:
+            return len(normalized) < 8
+        return (
+            len(normalized) <= 5
+            or normalized in self.GENERIC_EVIDENCE_TERMS
+            or normalized.endswith("_name")
+            or normalized.endswith("_id")
+            or normalized.endswith("_key")
+        )
+
+    def _is_strong_evidence_term(self, term: str, root_terms: set[str]) -> bool:
+        normalized = self._normalized_evidence_text(term)
+        if not normalized or normalized in root_terms or normalized == "breaking-change-section":
+            return False
+        return not self._is_weak_unqualified_term(normalized)
+
+    def _chunk_passes_evidence_anchor(
+        self,
+        chunk: dict,
+        matched_terms: list[str],
+        strong_terms: list[str],
+        method_score: int,
+        semantic_score: int,
+    ) -> bool:
+        content = str(chunk.get("content", "") or "")
+        has_migration = self._has_migration_language(content)
+        if not has_migration:
+            return False
+        if method_score >= 35:
+            return True
+        if semantic_score >= 18:
+            return has_migration
+        if any(any(separator in term for separator in [".", "::", "/", "~"]) for term in strong_terms):
+            return has_migration
+        if chunk.get("api_centered") and strong_terms:
+            return has_migration
+        if strong_terms:
+            return has_migration
+        if not matched_terms:
+            return False
+        return False
 
     def _split_reference_chunks(self, reference: dict) -> list[dict]:
         content = (reference.get("content") or "").strip()
@@ -1614,7 +1807,9 @@ class ScoutAgent:
             ])
             if not self._path_versions_are_relevant(reference_locator, current_version, latest_version):
                 continue
-            for chunk_index, chunk in enumerate(self._split_reference_chunks(reference), start=1):
+            chunks = self._api_centered_reference_chunks(reference, api_usages, api_contexts)
+            chunks.extend(self._split_reference_chunks(reference))
+            for chunk_index, chunk in enumerate(chunks, start=1):
                 score, matched_terms = self._score_evidence_chunk(
                     chunk,
                     terms,
@@ -1627,24 +1822,8 @@ class ScoutAgent:
                 strong_terms = [
                     term
                     for term in matched_terms
-                    if term.lower() not in root_terms and len(term.strip()) > 2
+                    if self._is_strong_evidence_term(term, root_terms)
                 ]
-                if chunk.get("document_kind") == "registry":
-                    semantic_score, _semantic_matches = self._semantic_evidence_score(
-                        str(chunk.get("content", "")),
-                        api_semantics,
-                    )
-                    method_score, _method_matches = self._method_evidence_score(
-                        str(chunk.get("content", "")),
-                        api_usages,
-                        api_contexts,
-                    )
-                    if method_score < 80 and semantic_score < 36:
-                        continue
-                if not strong_terms and not self._has_migration_language(str(chunk.get("content", ""))):
-                    continue
-                if score < 10 or not matched_terms:
-                    continue
                 semantic_score, semantic_matches = self._semantic_evidence_score(
                     str(chunk.get("content", "")),
                     api_semantics,
@@ -1654,7 +1833,20 @@ class ScoutAgent:
                     api_usages,
                     api_contexts,
                 )
-                confidence = "high" if method_score >= 80 else "medium" if semantic_score >= 18 or method_score >= 35 else "low"
+                if chunk.get("document_kind") == "registry":
+                    if method_score < 80 and semantic_score < 36:
+                        continue
+                if not self._chunk_passes_evidence_anchor(
+                    chunk,
+                    matched_terms,
+                    strong_terms,
+                    method_score,
+                    semantic_score,
+                ):
+                    continue
+                if score < 10 or not matched_terms:
+                    continue
+                confidence = "high" if method_score >= 80 else "medium" if semantic_score >= 18 or method_score >= 35 or strong_terms else "low"
                 ranked.append((score, -reference_index, {
                     "source": chunk.get("source", ""),
                     "title": chunk.get("title") or chunk.get("source") or "Reference",
@@ -1722,7 +1914,7 @@ class ScoutAgent:
             ]
 
         fallback = self._fallback_breaking_change_evidence(references, current_version, latest_version)
-        if fallback:
+        if fallback and not api_contexts:
             return fallback
 
         terms = self._api_search_terms(api_usages, api_contexts, api_semantics)
@@ -1733,6 +1925,12 @@ class ScoutAgent:
         focused = []
         for reference in self._dedupe_references(references):
             if reference.get("role") == "old_api_docs":
+                continue
+            reference_locator = " ".join([
+                str(reference.get("title", "")),
+                str(reference.get("url", "")),
+            ])
+            if not self._path_versions_are_relevant(reference_locator, current_version, latest_version):
                 continue
             content = (reference.get("content") or "").strip()
             if not content:
@@ -1759,13 +1957,10 @@ class ScoutAgent:
             strong_terms = [
                 term
                 for term in matched_terms
-                if term.lower() not in root_terms and len(term.strip()) > 2
+                if self._is_strong_evidence_term(term, root_terms)
             ]
-            if not strong_terms:
-                if self._document_kind(reference) == "registry":
-                    continue
-                if not self._has_migration_language(content):
-                    continue
+            if not strong_terms or not self._has_migration_language(content):
+                continue
 
             merged = []
             for start, end in sorted(windows):
