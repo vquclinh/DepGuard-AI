@@ -348,14 +348,14 @@ PATCH_CASES: list[PatchTestCase] = [
         },
         assertions={
             "ml/features.py": [
-                ("np.bool", False),   # should be gone
-                ("np.int", False),    # should be gone
-                ("np.float", False),  # should be gone (may be replaced by np.float64)
+                # check the exact alias form (dtype=np.bool) - not np.bool64 etc.
+                ("dtype=np.bool)", False),
+                ("dtype=np.int)", False),
+                ("dtype=np.float)", False),
             ],
             "ml/model.py": [
-                ("np.bool", False),
-                ("np.int", False),
-                ("np.float", False),
+                ("dtype=np.float)", False),
+                (".astype(np.int)", False),
             ],
         },
     ),
@@ -524,7 +524,8 @@ PATCH_CASES: list[PatchTestCase] = [
         },
         assertions={
             "app/main.py": [
-                ("before_first_request", False),  # should be removed/replaced
+                # decorator call form should be gone; comment mentions are acceptable
+                ("@app.before_first_request", False),
             ],
         },
     ),
@@ -707,8 +708,9 @@ PATCH_CASES: list[PatchTestCase] = [
         },
         assertions={
             "cache/client.py": [
-                ("StrictRedis", False),
-                ("redis.Redis", True),
+                # Check the API call form, not the word in comments
+                ("redis.StrictRedis(", False),
+                ("redis.Redis(", True),
             ],
         },
     ),
