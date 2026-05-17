@@ -171,6 +171,98 @@ class RetryThenValidRouter:
         )
 
 
+class SqlAlchemyStringArgRetryRouter:
+    def __init__(self):
+        self.calls = 0
+        self.last_prompt = ""
+
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1000, task_type: str = "general"):
+        self.calls += 1
+        self.last_prompt = user_prompt
+        marker = "TARGET CODE BLOCKS TO PATCH:"
+        block_text = user_prompt.split(marker, 1)[1].split("Related Tree-sitter/LSP Impact Context:", 1)[0]
+        block = json.loads(block_text)[0]
+        source = block["source"]
+        if self.calls == 1:
+            replacement = source.replace(
+                '        result = self.engine.execute("SELECT * FROM users")',
+                '        with self.engine.connect() as conn:\n'
+                '            result = conn.execute("SELECT * FROM users")',
+            )
+        else:
+            replacement = source.replace(
+                '        result = self.engine.execute("SELECT * FROM users")\n'
+                '        return [row for row in result]',
+                '        from sqlalchemy import text\n'
+                '        with self.engine.connect() as conn:\n'
+                '            result = conn.execute(text("SELECT * FROM users"))\n'
+                '            return [row for row in result]',
+            )
+
+        return LLMResponse(
+            content=json.dumps({
+                "schema_version": "depguard.patch.v1",
+                "status": "patched",
+                "replacements": [{
+                    "start_line": block["start_line"],
+                    "end_line": block["end_line"],
+                    "replacement": replacement,
+                }],
+            }),
+            provider="fake",
+            model="test",
+            latency_ms=1,
+            fallback_used=False,
+        )
+
+
+class SqlAlchemyMissingImportRetryRouter:
+    def __init__(self):
+        self.calls = 0
+        self.last_prompt = ""
+
+    async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1000, task_type: str = "general"):
+        self.calls += 1
+        self.last_prompt = user_prompt
+        marker = "TARGET CODE BLOCKS TO PATCH:"
+        block_text = user_prompt.split(marker, 1)[1].split("Related Tree-sitter/LSP Impact Context:", 1)[0]
+        block = json.loads(block_text)[0]
+        source = block["source"]
+        if self.calls == 1:
+            replacement = source.replace(
+                '        result = self.engine.execute("SELECT * FROM users")\n'
+                '        return [row for row in result]',
+                '        with self.engine.connect() as conn:\n'
+                '            result = conn.execute(text("SELECT * FROM users"))\n'
+                '            return [row for row in result]',
+            )
+        else:
+            replacement = source.replace(
+                '        result = self.engine.execute("SELECT * FROM users")\n'
+                '        return [row for row in result]',
+                '        from sqlalchemy import text\n'
+                '        with self.engine.connect() as conn:\n'
+                '            result = conn.execute(text("SELECT * FROM users"))\n'
+                '            return [row for row in result]',
+            )
+
+        return LLMResponse(
+            content=json.dumps({
+                "schema_version": "depguard.patch.v1",
+                "status": "patched",
+                "replacements": [{
+                    "start_line": block["start_line"],
+                    "end_line": block["end_line"],
+                    "replacement": replacement,
+                }],
+            }),
+            provider="fake",
+            model="test",
+            latency_ms=1,
+            fallback_used=False,
+        )
+
+
 class MalformedReplacementRouter:
     async def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1000, task_type: str = "general"):
         return LLMResponse(
@@ -574,6 +666,252 @@ def test_patch_prompt_slices_large_module_level_blocks(tmp_path: Path, monkeypat
     assert blocks[0]["end_line"] - blocks[0]["start_line"] + 1 <= 37
     assert "Valid replacement ranges are" in prompt
     assert "VALUE_1 = 1" not in blocks[0]["source"]
+
+
+def test_patch_prompt_surfaces_string_argument_migration_obligations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    py_file = tmp_path / "db.py"
+    original = "\n".join([
+        "from sqlalchemy import create_engine",
+        "",
+        "class DatabaseManager:",
+        "    def __init__(self, db_url='sqlite:///:memory:'):",
+        "        self.engine = create_engine(db_url)",
+        "",
+        "    def get_users(self):",
+        "        result = self.engine.execute('SELECT * FROM users')",
+        "        return [row for row in result]",
+        "",
+    ])
+    py_file.write_text(original, encoding="utf-8")
+
+    agent = PatchAgent(project_root=str(tmp_path))
+    monkeypatch.setattr(agent, "_get_impact_result", lambda filepath, matches: None)
+
+    _system, prompt, _blocks = agent._build_sliced_patch_prompt(
+        str(py_file),
+        [{
+            "file": str(py_file),
+            "line": 8,
+            "old_api": "sqlalchemy.create_engine.execute",
+            "new_api": "sqlalchemy.Connection.execute",
+            "type": "removed",
+            "description": "Engine.execute was removed; use Connection.execute.",
+        }],
+        {
+            "package": "SQLAlchemy",
+            "from_version": "1.4.46",
+            "to_version": "2.0.49",
+            "breaking_changes": [{
+                "type": "removed",
+                "old_api": "sqlalchemy.create_engine.execute",
+                "new_api": "sqlalchemy.Connection.execute",
+                "description": "Engine.execute was removed.",
+            }],
+            "api_evidence": [{
+                "api": "sqlalchemy.create_engine.execute",
+                "change_type": "removed",
+                "replacement": "sqlalchemy.Connection.execute",
+                "confidence": "high",
+                "evidence": [{
+                    "source": "migration_guide",
+                    "url": "https://github.com/sqlalchemy/sqlalchemy/blob/main/doc/build/changelog/migration_20.rst",
+                    "quote": (
+                        "The Engine.execute() function/method is considered legacy and will be removed in 2.0. "
+                        "All statement execution is performed by Connection.execute(). "
+                        "Passing a string to Connection.execute() is deprecated and will be removed in version 2.0. "
+                        "Use the text() construct, or the Connection.exec_driver_sql() method."
+                    ),
+                }],
+                "reason": "The migration guide documents both the call target and string argument migration.",
+            }],
+            "evidence_references": [{
+                "source": "github",
+                "title": "doc/build/changelog/migration_20.rst",
+                "url": "https://github.com/sqlalchemy/sqlalchemy/blob/main/doc/build/changelog/migration_20.rst",
+                "content": (
+                    "with engine.connect() as connection:\n"
+                    "    # use connection.execute(), not engine.execute()\n"
+                    "    connection.execute(text(\"CREATE TABLE foo (id integer)\"))\n"
+                    "Passing a string to Connection.execute() is deprecated and will be removed in version 2.0. "
+                    "Use the text() construct, or the Connection.exec_driver_sql() method."
+                ),
+            }],
+        },
+        original,
+    )
+
+    assert "Evidence-Derived Patch Obligations" in prompt
+    assert "string literal" in prompt
+    assert "migrate the string argument" in prompt
+    assert "text" in prompt
+    assert "must not leave the migrated call receiving a bare string literal" in prompt
+    assert "CRITICAL: If the replacement uses any documented helper as a bare function call" in prompt
+    assert "Supporting evidence" in prompt
+    assert "Passing a string to Connection.execute" in prompt
+    assert "local import inside the edited target block" in prompt
+
+
+def test_patch_string_argument_evidence_extraction_ignores_unrelated_doc_terms(tmp_path: Path):
+    agent = PatchAgent(project_root=str(tmp_path))
+    evidence = (
+        "The Engine.execute() function/method is considered legacy as of the 1.x series "
+        "of SQLAlchemy and will be removed in 2.0. All statement execution in SQLAlchemy "
+        "2.0 is performed by the Connection.execute() method of Connection. "
+        "Passing a string to Connection.execute() is deprecated and will be removed in version 2.0. "
+        "Use the text() construct, or the Connection.exec_driver_sql() method to invoke a driver-level SQL string. "
+        "The current statement is being autocommitted using implicit autocommit. "
+        "The sqlalchemy.schema package has DDL constructs and legacy examples."
+    )
+
+    helpers = agent._documented_string_argument_helpers(evidence)
+    call_names = agent._deprecated_string_argument_call_names(evidence)
+
+    assert helpers == ["text", "exec_driver_sql"]
+    assert {"Connection.execute", "execute"}.issubset(call_names)
+    assert "and" not in call_names
+    assert "autocommit" not in call_names
+    assert "DDL" not in helpers
+    assert "legacy" not in helpers
+
+
+def test_patch_preview_retries_when_string_argument_migration_is_incomplete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    py_file = tmp_path / "db.py"
+    original = "\n".join([
+        "from sqlalchemy import create_engine",
+        "",
+        "class DatabaseManager:",
+        "    def __init__(self, db_url='sqlite:///:memory:'):",
+        "        self.engine = create_engine(db_url)",
+        "",
+        "    def get_users(self):",
+        '        result = self.engine.execute("SELECT * FROM users")',
+        "        return [row for row in result]",
+        "",
+    ])
+    py_file.write_text(original, encoding="utf-8")
+
+    router = SqlAlchemyStringArgRetryRouter()
+    monkeypatch.setattr(patch_module, "LLMRouter", lambda: router)
+    monkeypatch.setattr(PatchAgent, "_get_impact_result", lambda self, filepath, matches: None)
+
+    scout_context = {
+        "package": "SQLAlchemy",
+        "from_version": "1.4.46",
+        "to_version": "2.0.49",
+        "breaking_changes": [{
+            "type": "removed",
+            "old_api": "sqlalchemy.create_engine.execute",
+            "new_api": "sqlalchemy.Connection.execute",
+            "description": "Engine.execute was removed.",
+        }],
+        "api_evidence": [{
+            "api": "sqlalchemy.create_engine.execute",
+            "change_type": "removed",
+            "replacement": "sqlalchemy.Connection.execute",
+            "confidence": "high",
+            "evidence": [{
+                "source": "migration_guide",
+                "url": "https://github.com/sqlalchemy/sqlalchemy/blob/main/doc/build/changelog/migration_20.rst",
+                "quote": (
+                    "The Engine.execute() function/method is considered legacy and will be removed in 2.0. "
+                    "All statement execution is performed by Connection.execute(). "
+                    "Passing a string to Connection.execute() is deprecated and will be removed in version 2.0. "
+                    "Use the text() construct, or the Connection.exec_driver_sql() method."
+                ),
+            }],
+            "reason": "The migration guide documents both the call target and string argument migration.",
+        }],
+    }
+    scan_output = {
+        "matches_by_file": {
+            str(py_file): [{
+                "file": str(py_file),
+                "line": 8,
+                "old_api": "sqlalchemy.create_engine.execute",
+                "new_api": "sqlalchemy.Connection.execute",
+                "type": "removed",
+                "description": "Engine.execute was removed; use Connection.execute.",
+            }],
+        },
+    }
+
+    report = PatchAgent(project_root=str(tmp_path)).preview_sync(scout_context, scan_output)
+
+    assert report["files"][0]["status"] == "success"
+    assert router.calls == 2
+    assert "string-argument migration" in router.last_prompt
+    assert "Also migrate the literal/string argument" in router.last_prompt
+    assert 'conn.execute(text("SELECT * FROM users"))' in report["files"][0]["patched"]
+    assert 'conn.execute("SELECT * FROM users")' not in report["files"][0]["patched"]
+
+
+def test_patch_preview_retries_when_documented_helper_is_missing_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    py_file = tmp_path / "db.py"
+    original = "\n".join([
+        "from sqlalchemy import create_engine",
+        "",
+        "class DatabaseManager:",
+        "    def __init__(self, db_url='sqlite:///:memory:'):",
+        "        self.engine = create_engine(db_url)",
+        "",
+        "    def get_users(self):",
+        '        result = self.engine.execute("SELECT * FROM users")',
+        "        return [row for row in result]",
+        "",
+    ])
+    py_file.write_text(original, encoding="utf-8")
+
+    router = SqlAlchemyMissingImportRetryRouter()
+    monkeypatch.setattr(patch_module, "LLMRouter", lambda: router)
+    monkeypatch.setattr(PatchAgent, "_get_impact_result", lambda self, filepath, matches: None)
+
+    scout_context = {
+        "package": "SQLAlchemy",
+        "from_version": "1.4.46",
+        "to_version": "2.0.49",
+        "breaking_changes": [{
+            "type": "removed",
+            "old_api": "sqlalchemy.create_engine.execute",
+            "new_api": "sqlalchemy.Connection.execute",
+            "description": "Engine.execute was removed.",
+        }],
+        "api_evidence": [{
+            "api": "sqlalchemy.create_engine.execute",
+            "change_type": "removed",
+            "replacement": "sqlalchemy.Connection.execute",
+            "confidence": "high",
+            "evidence": [{
+                "source": "migration_guide",
+                "url": "https://github.com/sqlalchemy/sqlalchemy/blob/main/doc/build/changelog/migration_20.rst",
+                "quote": (
+                    "Passing a string to Connection.execute() is deprecated and will be removed in version 2.0. "
+                    "Use the text() construct, or the Connection.exec_driver_sql() method."
+                ),
+            }],
+            "reason": "The migration guide documents both the call target and string argument migration.",
+        }],
+    }
+    scan_output = {
+        "matches_by_file": {
+            str(py_file): [{
+                "file": str(py_file),
+                "line": 8,
+                "old_api": "sqlalchemy.create_engine.execute",
+                "new_api": "sqlalchemy.Connection.execute",
+                "type": "removed",
+                "description": "Engine.execute was removed; use Connection.execute.",
+            }],
+        },
+    }
+
+    report = PatchAgent(project_root=str(tmp_path)).preview_sync(scout_context, scan_output)
+
+    assert report["files"][0]["status"] == "success"
+    assert router.calls == 2
+    assert "without making them available in scope" in router.last_prompt
+    assert "add its import or definition inside the returned target block" in router.last_prompt
+    assert "from sqlalchemy import text" in report["files"][0]["patched"]
+    assert 'conn.execute(text("SELECT * FROM users"))' in report["files"][0]["patched"]
 
 
 def test_patch_prompt_merges_overlapping_target_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

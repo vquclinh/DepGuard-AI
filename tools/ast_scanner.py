@@ -574,13 +574,19 @@ class ASTScanner:
         )
 
     def _real_name_has_known_root(self, real_name: str, package_roots: set[str]) -> bool:
-        return any(
-            real_name == root
-            or real_name.startswith(f"{root}.")
-            or real_name.startswith(f"{root}/")
-            or real_name.startswith(f"{root}::")
-            for root in package_roots
-        )
+        real_root = re.split(r"[./:]+", real_name, maxsplit=1)[0]
+        real_root_norm = self._normalize_package_token(real_root)
+        for root in package_roots:
+            if (
+                real_name == root
+                or real_name.startswith(f"{root}.")
+                or real_name.startswith(f"{root}/")
+                or real_name.startswith(f"{root}::")
+            ):
+                return True
+            if real_root_norm and real_root_norm == self._normalize_package_token(root):
+                return True
+        return False
 
     def _normalize_package_token(self, value: str) -> str:
         return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
@@ -645,7 +651,7 @@ class ASTScanner:
         for alias, real_name in package_aliases.items():
             alias_pattern = re.escape(alias)
             for match in re.finditer(
-                rf"(?<![\w$]){alias_pattern}\.([A-Za-z_$][\w$]*)\s*\([^)]*\)\.([A-Za-z_$][\w$]*)\s*\(",
+                rf"(?<![\w$]){alias_pattern}\.([A-Z][\w$]*)\s*\([^)]*\)\.([A-Za-z_$][\w$]*)\s*\(",
                 content,
                 re.DOTALL,
             ):
@@ -723,35 +729,42 @@ class ASTScanner:
         ignored_ranges: list[tuple[int, int]],
     ) -> dict[str, str]:
         variable_types: dict[str, str] = {}
-        assignment_patterns: list[tuple[str, str]] = []
+        assignment_patterns: list[tuple[str, str, str]] = []
+        assignment_target = r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)"
 
         for alias, real_name in package_aliases.items():
             alias_pattern = re.escape(alias)
             assignment_patterns.append((
-                rf"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*{alias_pattern}\.([A-Za-z_$][\w$]*)\s*\(",
+                rf"(?<![\w$.]){assignment_target}\s*=\s*{alias_pattern}\.([A-Z][\w$]*)\s*\(",
                 f"{real_name}.{{constructor}}",
+                "",
             ))
             if self._real_name_has_known_root(real_name, package_roots):
                 assignment_patterns.append((
-                    rf"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*{alias_pattern}\s*\(",
+                    rf"(?<![\w$.]){assignment_target}\s*=\s*{alias_pattern}\s*\(",
                     real_name,
+                    real_name.rsplit(".", 1)[-1],
                 ))
         for class_name, resolved_base in class_bases.items():
             class_pattern = re.escape(class_name)
             assignment_patterns.append((
-                rf"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*{class_pattern}\s*\(",
+                rf"(?<![\w$.]){assignment_target}\s*=\s*{class_pattern}\s*\(",
                 resolved_base,
+                "",
             ))
             assignment_patterns.append((
-                rf"(?<![\w$])([A-Za-z_$][\w$]*)\s*=\s*{class_pattern}\.[A-Za-z_$][\w$]*\s*\(",
+                rf"(?<![\w$.]){assignment_target}\s*=\s*{class_pattern}\.[A-Za-z_$][\w$]*\s*\(",
                 resolved_base,
+                "",
             ))
 
-        for pattern, type_template in assignment_patterns:
+        for pattern, type_template, callable_name in assignment_patterns:
             for match in re.finditer(pattern, content):
                 if self._is_ignored_offset(match.start(), ignored_ranges):
                     continue
                 variable = match.group(1)
+                if callable_name and not self._assignment_target_matches_callable(variable, callable_name):
+                    continue
                 constructor = match.group(2) if "{constructor}" in type_template else ""
                 variable_types[variable] = type_template.format(constructor=constructor)
 
@@ -769,6 +782,20 @@ class ASTScanner:
                 break
 
         return variable_types
+
+    def _assignment_target_matches_callable(self, variable: str, callable_name: str) -> bool:
+        """Keep lowercase factory dataflow useful without treating all returns as package objects."""
+        variable_leaf = variable.rsplit(".", 1)[-1].lower()
+        callable_leaf = callable_name.rsplit(".", 1)[-1].lower()
+        callable_terms = {term for term in re.split(r"[_\W]+", callable_leaf) if term}
+        if not variable_leaf or not callable_terms:
+            return False
+        if variable_leaf in callable_terms:
+            return True
+        return any(
+            len(term) >= 4 and (variable_leaf.endswith(term) or term.endswith(variable_leaf))
+            for term in callable_terms
+        )
 
     def _package_aliases_for_old_api(self, old_api: str, aliases: dict[str, str]) -> tuple[str, dict[str, str]]:
         package_name = re.split(r"[./:]", old_api, maxsplit=1)[0]

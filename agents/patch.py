@@ -7,6 +7,7 @@ import argparse
 import subprocess
 import ast
 import inspect
+import textwrap
 import uuid
 import sys
 import time
@@ -311,6 +312,11 @@ class PatchAgent:
             separators=(",", ":"),
         )
         import_context = self._top_level_context(lines, max_lines=self.import_context_max_lines)
+        migration_obligations = self._format_migration_obligations(
+            target_blocks,
+            scout_context.get("api_evidence", []),
+            scout_context.get("evidence_references") or scout_context.get("references", []),
+        )
         response_schema = json.dumps(self._patch_response_schema(), indent=2)
         allowed_ranges = [
             {
@@ -348,6 +354,9 @@ class PatchAgent:
             DepGuard Scout References:
             {references_str}
 
+            Evidence-Derived Patch Obligations:
+            {migration_obligations}
+
             File: {filepath}
             Matches to fix:
             {matches_str}
@@ -379,6 +388,8 @@ class PatchAgent:
             - Valid replacement ranges are: {[(block["start_line"], block["end_line"]) for block in target_blocks]}.
             - Do not return smaller line edits inside a target block.
             - If new_api is empty, infer the migration from the matched API usage and target source when the replacement is clear; otherwise return no_change.
+            - Apply all coupled requirements documented by the same evidence chunk for the matched expression, including required argument wrappers/conversions and transaction/context-manager changes.
+            - If a helper/import is required but import lines are outside the allowed ranges, prefer a local import inside the edited target block when that is valid for the language; otherwise return no_change and explain why.
             - Include all necessary edits within those ranges if related code in the same block must change.
             - If a target block does not require a code change, omit it from replacements.
             - If no target block requires a code change, return status no_change with replacements [].
@@ -477,6 +488,404 @@ class PatchAgent:
                 blocks.append("... references truncated ...")
                 break
         return "\n\n".join(blocks)[:max_chars]
+
+    def _format_migration_obligations(
+        self,
+        target_blocks: list[dict],
+        api_evidence: list,
+        references: list,
+        max_chars: int = 5000,
+    ) -> str:
+        evidence_text = self._combined_evidence_text(api_evidence, references)
+        target_source = "\n\n".join(str(block.get("source", "") or "") for block in target_blocks)
+        obligations = []
+
+        string_arg_obligations = self._string_argument_obligations(evidence_text, target_source)
+        obligations.extend(string_arg_obligations)
+
+        if self._evidence_mentions_context_manager(evidence_text) and re.search(r"\.\w+\s*\(", target_source):
+            obligations.append(
+                "Evidence documents a context-manager or explicit connection/transaction style. "
+                "When replacing a call target, also preserve resource lifetime and transaction behavior documented in the evidence."
+            )
+
+        if not obligations:
+            return "No additional coupled obligations detected beyond the listed API replacement evidence."
+
+        deduped = []
+        seen = set()
+        for obligation in obligations:
+            key = obligation.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(f"- {obligation}")
+        return "\n".join(deduped)[:max_chars]
+
+    def _combined_evidence_text(self, api_evidence: list, references: list) -> str:
+        parts = []
+        for item in api_evidence or []:
+            if not isinstance(item, dict):
+                continue
+            parts.extend([
+                str(item.get("reason", "") or ""),
+                str(item.get("replacement", "") or ""),
+                str(item.get("change_type", "") or ""),
+            ])
+            for evidence in item.get("evidence", []) or []:
+                if isinstance(evidence, dict):
+                    parts.extend([
+                        str(evidence.get("quote", "") or ""),
+                        str(evidence.get("url", "") or ""),
+                    ])
+        for reference in references or []:
+            if not isinstance(reference, dict):
+                continue
+            parts.extend([
+                str(reference.get("title", "") or ""),
+                str(reference.get("url", "") or ""),
+                str(reference.get("content", "") or ""),
+            ])
+        return "\n".join(part for part in parts if part)
+
+    def _string_argument_obligations(self, evidence_text: str, target_source: str) -> list[str]:
+        normalized_evidence = self._normalize_text(evidence_text)
+        if not normalized_evidence or not re.search(r"\w+\s*\(\s*(['\"])", target_source):
+            return []
+
+        string_arg_markers = [
+            "passing a string",
+            "string to",
+            "raw string",
+            "textual sql",
+            "textual statement",
+            "string statements require",
+            "sql string",
+        ]
+        migration_markers = [
+            "deprecated",
+            "removed",
+            "will be removed",
+            "no longer",
+            "requires",
+            "must",
+            "use ",
+        ]
+        if not any(marker in normalized_evidence for marker in string_arg_markers):
+            return []
+        if not any(marker in normalized_evidence for marker in migration_markers):
+            return []
+
+        helpers = self._documented_string_argument_helpers(evidence_text)
+        call_names = self._deprecated_string_argument_call_names(evidence_text)
+        snippets = self._string_argument_evidence_snippets(evidence_text)
+        helper_text = f" Documented helper/alternative mentions: {', '.join(helpers)}." if helpers else ""
+        call_text = f" Affected call names from evidence: {', '.join(sorted(call_names))}." if call_names else ""
+        snippet_text = f" Supporting evidence: {self._compact_evidence_sentence(snippets[0])}." if snippets else ""
+        return [
+            "Target code passes a string literal to a migrated call, and the evidence documents a string-argument migration. "
+            "Do not only rename/move the call; also migrate the string argument exactly as documented. "
+            "The replacement must not leave the migrated call receiving a bare string literal. "
+            "CRITICAL: If the replacement uses any documented helper as a bare function call, it must also make that helper available in scope; "
+            "when import lines are outside the allowed range, add the local import inside the target block."
+            f"{call_text}{helper_text}{snippet_text}"
+        ]
+
+    def _compact_evidence_sentence(self, text: str, max_chars: int = 420) -> str:
+        compact = re.sub(r"\s+", " ", text or "").strip()
+        if len(compact) <= max_chars:
+            return compact
+        return compact[:max_chars].rstrip() + "..."
+
+    def _documented_string_argument_helpers(self, evidence_text: str) -> list[str]:
+        helpers = []
+        snippets = self._string_argument_evidence_snippets(evidence_text)
+        for pattern in [
+            r"\b[Uu]se\s+(?:the\s+)?([A-Za-z_][\w.]*)(?:\(\))?\s+(?:construct|method|function)",
+            r"\bor\s+(?:the\s+)?([A-Za-z_][\w.]*)(?:\(\))?\s+(?:construct|method|function)",
+            r"\brequire[s]?\s+(?:the\s+)?([A-Za-z_][\w.]*)(?:\(\))?\s+(?:construct|method|function)",
+            r"\bunless\s+(?:the\s+)?([A-Za-z_][\w.]*)(?:\(\))?\s+(?:construct|method|function)",
+        ]:
+            for snippet in snippets:
+                for match in re.finditer(pattern, snippet, flags=re.IGNORECASE):
+                    helper = self._short_api_name(match.group(1))
+                    if helper.lower() in {"use", "method", "function", "construct", "execute"}:
+                        continue
+                    helpers.append(helper)
+        seen = set()
+        deduped = []
+        for helper in helpers:
+            key = helper.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(helper)
+        return deduped[:6]
+
+    def _string_argument_evidence_snippets(self, evidence_text: str) -> list[str]:
+        cleaned = self._clean_rst_api_roles(evidence_text or "")
+        if not cleaned:
+            return []
+
+        markers = [
+            "passing a string",
+            "raw string",
+            "textual sql",
+            "textual statement",
+            "string statements require",
+            "sql string",
+        ]
+        parts = re.split(r"(?<=[.!?])\s+|\n+", cleaned)
+        snippets = []
+        for index, part in enumerate(parts):
+            normalized = self._normalize_text(part)
+            if not any(marker in normalized for marker in markers):
+                continue
+            window = " ".join(parts[max(0, index - 1):index + 2]).strip()
+            if window:
+                snippets.append(window)
+        return snippets or [cleaned]
+
+    def _clean_rst_api_roles(self, text: str) -> str:
+        cleaned = re.sub(r":[A-Za-z_]+:`~?([^`]+)`", r"\1", text or "")
+        cleaned = cleaned.replace("``", "").replace("`", "")
+        return cleaned
+
+    def _evidence_mentions_context_manager(self, evidence_text: str) -> bool:
+        normalized = self._normalize_text(evidence_text)
+        return any(marker in normalized for marker in [
+            "with ",
+            "context manager",
+            "connect() as",
+            "begin() as",
+            "explicit transaction",
+        ])
+
+    def _normalize_text(self, text: str) -> str:
+        value = (text or "").lower()
+        value = value.replace("``", "")
+        value = value.replace("`", "")
+        return re.sub(r"\s+", " ", value)
+
+    def _string_argument_migration_policy(self, evidence_text: str, target_source: str) -> dict:
+        if not self._string_argument_obligations(evidence_text, target_source):
+            return {"required": False, "call_names": []}
+
+        call_names = self._deprecated_string_argument_call_names(evidence_text)
+        return {
+            "required": bool(call_names),
+            "call_names": sorted(call_names),
+        }
+
+    def _deprecated_string_argument_call_names(self, evidence_text: str) -> set[str]:
+        call_names: set[str] = set()
+        snippets = self._string_argument_evidence_snippets(evidence_text)
+        patterns = [
+            r"\b[Pp]assing\s+a\s+string\s+to\s+(?:the\s+)?([A-Za-z_][\w.]*)(?:\(\))?",
+            r"\b([A-Za-z_][\w.]*\.[A-Za-z_]\w*)(?:\(\))?\s+(?:function/method|method|function)\s+is\s+(?:considered\s+)?(?:legacy|deprecated|removed)",
+        ]
+        for pattern in patterns:
+            for snippet in snippets:
+                for match in re.finditer(pattern, snippet):
+                    dotted_name = self._shortenable_api_name(match.group(1))
+                    if not dotted_name:
+                        continue
+                    call_names.add(dotted_name)
+                    call_names.add(dotted_name.rsplit(".", 1)[-1])
+
+        helpers = {helper.lower() for helper in self._documented_string_argument_helpers(evidence_text)}
+        return {
+            name
+            for name in call_names
+            if name and name.lower() not in helpers
+        }
+
+    def _shortenable_api_name(self, name: str) -> str:
+        value = (name or "").strip().strip(".")
+        value = re.sub(r"\(\)$", "", value)
+        parts = [part for part in value.split(".") if part]
+        while parts and parts[0].startswith("_"):
+            parts.pop(0)
+        return ".".join(parts)
+
+    def _short_api_name(self, name: str) -> str:
+        value = self._shortenable_api_name(name)
+        return value.rsplit(".", 1)[-1] if value else ""
+
+    def _validate_replacements_against_migration_obligations(
+        self,
+        replacements: list[dict],
+        target_blocks: list[dict],
+        scout_context: dict | None,
+        original_content: str = "",
+    ) -> None:
+        if not replacements or not scout_context:
+            return
+
+        evidence_text = self._combined_evidence_text(
+            scout_context.get("api_evidence", []),
+            scout_context.get("evidence_references") or scout_context.get("references", []),
+        )
+        target_source = "\n\n".join(str(block.get("source", "") or "") for block in target_blocks)
+        policy = self._string_argument_migration_policy(evidence_text, target_source)
+        if not policy.get("required"):
+            return
+
+        call_names = set(policy.get("call_names") or [])
+        helpers = self._documented_string_argument_helpers(evidence_text)
+        blocks_by_range = {
+            (block["start_line"], block["end_line"]): block
+            for block in target_blocks
+        }
+        for replacement in replacements:
+            block = blocks_by_range.get((replacement["start_line"], replacement["end_line"]))
+            if not block:
+                continue
+            original_source = str(block.get("source", "") or "")
+            replacement_source = str(replacement.get("replacement", "") or "")
+            if not self._source_has_deprecated_string_call(original_source, call_names):
+                continue
+            if self._source_has_deprecated_string_call(replacement_source, call_names):
+                names = ", ".join(sorted(call_names))
+                helper_text = f" Documented helpers/alternatives: {', '.join(helpers)}." if helpers else ""
+                raise PatchResponseError(
+                    "Replacement leaves a raw string literal passed to a migrated call "
+                    f"({names}) even though the evidence requires a string-argument migration."
+                    f"{helper_text}"
+                )
+            missing_helpers = self._missing_bare_helper_imports(
+                replacement_source,
+                helpers,
+                original_content,
+            )
+            if missing_helpers:
+                helper_text = ", ".join(missing_helpers)
+                raise PatchResponseError(
+                    "Replacement uses documented migration helper(s) as bare function calls without making them available in scope: "
+                    f"{helper_text}. Add an import or definition inside the target block when the existing import section is outside the allowed range."
+                )
+
+    def _source_has_deprecated_string_call(self, source: str, call_names: set[str]) -> bool:
+        if not source or not call_names:
+            return False
+
+        try:
+            tree = ast.parse(textwrap.dedent(source))
+        except SyntaxError:
+            return self._text_has_deprecated_string_call(source, call_names)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            first_arg = node.args[0]
+            if not isinstance(first_arg, ast.Constant) or not isinstance(first_arg.value, str):
+                continue
+            call_name = self._ast_call_name(node.func)
+            if call_name and self._call_name_matches(call_name, call_names):
+                return True
+        return False
+
+    def _text_has_deprecated_string_call(self, source: str, call_names: set[str]) -> bool:
+        for name in call_names:
+            basename = name.rsplit(".", 1)[-1]
+            if re.search(rf"(?:\.|\b){re.escape(basename)}\s*\(\s*['\"]", source):
+                return True
+        return False
+
+    def _ast_call_name(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = self._ast_call_name(node.value)
+            return f"{parent}.{node.attr}" if parent else node.attr
+        return ""
+
+    def _call_name_matches(self, call_name: str, expected_names: set[str]) -> bool:
+        basename = call_name.rsplit(".", 1)[-1]
+        for expected in expected_names:
+            expected_basename = expected.rsplit(".", 1)[-1]
+            if call_name == expected or basename == expected_basename or call_name.endswith(f".{expected}"):
+                return True
+        return False
+
+    def _missing_bare_helper_imports(
+        self,
+        replacement_source: str,
+        helpers: list[str],
+        original_content: str = "",
+    ) -> list[str]:
+        helper_set = {helper for helper in helpers if helper and helper.isidentifier()}
+        if not helper_set:
+            return []
+
+        used_helpers = self._bare_helper_calls(replacement_source, helper_set)
+        if not used_helpers:
+            return []
+
+        available = self._defined_python_names(replacement_source)
+        available.update(self._top_level_python_names(original_content))
+        return sorted(helper for helper in used_helpers if helper not in available)
+
+    def _bare_helper_calls(self, source: str, helpers: set[str]) -> set[str]:
+        try:
+            tree = ast.parse(textwrap.dedent(source or ""))
+        except SyntaxError:
+            return {
+                helper
+                for helper in helpers
+                if re.search(rf"(?<![\w.]){re.escape(helper)}\s*\(", source or "")
+            }
+
+        used = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in helpers:
+                used.add(node.func.id)
+        return used
+
+    def _defined_python_names(self, source: str) -> set[str]:
+        try:
+            tree = ast.parse(textwrap.dedent(source or ""))
+        except SyntaxError:
+            return set()
+        return self._python_names_defined_in_tree(tree, top_level_only=False)
+
+    def _top_level_python_names(self, source: str) -> set[str]:
+        try:
+            tree = ast.parse(source or "")
+        except SyntaxError:
+            return set()
+        return self._python_names_defined_in_tree(tree, top_level_only=True)
+
+    def _python_names_defined_in_tree(self, tree: ast.AST, top_level_only: bool) -> set[str]:
+        names = set()
+        nodes = getattr(tree, "body", []) if top_level_only else ast.walk(tree)
+        for node in nodes:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split(".", 1)[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    names.add(alias.asname or alias.name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    names.update(self._python_assigned_names(target))
+            elif isinstance(node, ast.AnnAssign):
+                names.update(self._python_assigned_names(node.target))
+        return names
+
+    def _python_assigned_names(self, node: ast.AST) -> set[str]:
+        if isinstance(node, ast.Name):
+            return {node.id}
+        if isinstance(node, (ast.Tuple, ast.List)):
+            names = set()
+            for element in node.elts:
+                names.update(self._python_assigned_names(element))
+            return names
+        return set()
 
     def _patch_response_schema(self) -> dict:
         return {
@@ -657,8 +1066,15 @@ class PatchAgent:
         response_text: str,
         original_content: str,
         target_blocks: list[dict],
+        scout_context: dict | None = None,
     ) -> str:
         replacements = self._parse_replacements(response_text)
+        self._validate_replacements_against_migration_obligations(
+            replacements,
+            target_blocks,
+            scout_context,
+            original_content,
+        )
         return self._apply_replacements(original_content, replacements, target_blocks)
 
     def _build_patch_retry_prompt(
@@ -675,6 +1091,17 @@ class PatchAgent:
         previous = response_text.strip()
         if len(previous) > self.retry_response_max_chars:
             previous = previous[:self.retry_response_max_chars] + "\n... previous response truncated ..."
+        obligation_retry_hint = ""
+        if "string-argument migration" in error_message:
+            obligation_retry_hint = (
+                "\n            - The previous patch only changed the call target. "
+                "Also migrate the literal/string argument using the documented helper or alternative named in the parser error."
+            )
+        if "without making them available in scope" in error_message:
+            obligation_retry_hint += (
+                "\n            - If you use a helper as a bare function call, add its import or definition inside the returned target block "
+                "unless it already exists in the shown code context."
+            )
 
         return f"""{original_prompt}
 
@@ -695,6 +1122,7 @@ class PatchAgent:
             - Use status "no_change" with replacements [] if no safe documented code edit is required.
             - Every replacement range must exactly match one allowed range.
             - Do not include markdown or prose.
+            {obligation_retry_hint}
             """
 
     def _absolute_project_file(self, file_path: str) -> str:
@@ -876,7 +1304,12 @@ class PatchAgent:
                 )
                 response_text = response.content
                 llm_info = {"provider": response.provider, "fallback_used": response.fallback_used}
-                patched_content = self._patch_response_to_full_file(response_text, original_content, target_blocks)
+                patched_content = self._patch_response_to_full_file(
+                    response_text,
+                    original_content,
+                    target_blocks,
+                    scout_context,
+                )
 
                 validation_error = self._validate_patched_content(filepath, patched_content)
                 if validation_error:

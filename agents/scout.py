@@ -7,6 +7,7 @@ import inspect
 import logging
 import argparse
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from urllib.parse import quote, urlparse
@@ -320,10 +321,32 @@ class ScoutAgent:
             text = response.text or ""
             if "<html" in text[:200].lower():
                 text = self._html_to_text(text)
+            if self._looks_like_not_found_page(text, url):
+                return ""
             return text[:max_chars]
         except Exception as exc:
             logger.debug("Error fetching text reference %s: %s", url, exc)
             return ""
+
+    def _looks_like_not_found_page(self, text: str, url: str = "") -> bool:
+        normalized = self._normalized_evidence_text(text)
+        if not normalized:
+            return False
+        not_found_markers = [
+            "page not found",
+            "404 not found",
+            "can't find the page",
+            "could not find the page",
+        ]
+        if not any(marker in normalized for marker in not_found_markers):
+            return False
+        docs_markers = [
+            "documentation",
+            "contents index",
+            "search terms",
+            "current documentation",
+        ]
+        return any(marker in normalized for marker in docs_markers) or bool(url)
 
     def _html_to_text(self, text: str) -> str:
         text = re.sub(r"(?is)<(script|style|noscript|svg).*?</\1>", " ", text)
@@ -1032,6 +1055,8 @@ class ScoutAgent:
             elif 0 < high[0] - low[0] <= 12:
                 for major in range(low[0] + 1, high[0] + 1):
                     raw_versions.append(f"{major}.0.0")
+                for minor in range(low[1] + 1, low[1] + 5):
+                    raw_versions.append(f"{low[0]}.{minor}.0")
 
         versions = []
         seen = set()
@@ -1272,6 +1297,10 @@ class ScoutAgent:
                 if value:
                     terms.add(value)
             snippet = str(context.get("code_snippet", "") or "")
+            for receiver, method in re.findall(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\.([A-Za-z_]\w*)\s*\(", snippet):
+                receiver_leaf = receiver.rsplit(".", 1)[-1]
+                if len(receiver_leaf) > 2 and len(method) > 2:
+                    terms.add(f"{receiver_leaf}.{method}")
             for method in re.findall(r"\.([A-Za-z_]\w*)\s*\(", snippet):
                 if len(method) > 2:
                     terms.add(method)
@@ -1318,6 +1347,7 @@ class ScoutAgent:
             "breaking", "backwards incompatible", "migration", "upgrade",
             "changed signature", "signature", "requires", "must", "now named",
             "renamed to", "has been renamed", "has moved", "moved to",
+            "review", "construction", "setup",
         ])
 
     def _normalized_evidence_text(self, text: str) -> str:
@@ -1328,7 +1358,11 @@ class ScoutAgent:
         value = re.sub(r"\s+", " ", value)
         return value
 
-    def _method_api_profiles(self, api_usages: Optional[list[str]]) -> list[dict]:
+    def _method_api_profiles(
+        self,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> list[dict]:
         profiles = []
         for usage in api_usages or []:
             parts = [part for part in re.split(r"[.:/]+", usage or "") if part]
@@ -1344,18 +1378,45 @@ class ScoutAgent:
                 "method": method,
                 "exact": f"{owner}.{method}",
             })
+        for context in api_contexts or []:
+            if not isinstance(context, dict):
+                continue
+            snippet = "\n".join([
+                str(context.get("matched_text", "") or ""),
+                str(context.get("code_snippet", "") or ""),
+            ])
+            for receiver, method in re.findall(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\.([A-Za-z_]\w*)\s*\(", snippet):
+                owner = receiver.rsplit(".", 1)[-1]
+                if not owner or not method:
+                    continue
+                profiles.append({
+                    "api": str(context.get("api", "") or ""),
+                    "owner": owner,
+                    "method": method,
+                    "exact": f"{owner}.{method}",
+                })
         return profiles
 
-    def _method_evidence_score(self, text: str, api_usages: Optional[list[str]]) -> tuple[int, list[str]]:
+    def _method_evidence_score(
+        self,
+        text: str,
+        api_usages: Optional[list[str]],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> tuple[int, list[str]]:
         normalized = self._normalized_evidence_text(text)
         score = 0
         matches = []
-        for profile in self._method_api_profiles(api_usages):
+        seen_profiles = set()
+        for profile in self._method_api_profiles(api_usages, api_contexts):
+            profile_key = (profile["owner"].lower(), profile["method"].lower(), profile["exact"].lower())
+            if profile_key in seen_profiles:
+                continue
+            seen_profiles.add(profile_key)
             owner = profile["owner"].lower()
             method = profile["method"].lower()
             exact = profile["exact"].lower()
             if exact in normalized:
-                score += 90
+                score += 90 + self._migration_replacement_boost(normalized, exact)
                 matches.append(profile["exact"])
                 continue
 
@@ -1368,6 +1429,21 @@ class ScoutAgent:
                 score += 35
                 matches.append(f"{profile['owner']}~{profile['method']}")
         return score, matches
+
+    def _migration_replacement_boost(self, normalized_text: str, exact_api: str) -> int:
+        exact = self._normalized_evidence_text(exact_api)
+        if not exact or exact not in normalized_text:
+            return 0
+        boost = 0
+        if re.search(rf"\buse\b[^.\n]{{0,180}}\bnot\b[^.\n]{{0,80}}{re.escape(exact)}", normalized_text):
+            boost += 70
+        if re.search(rf"\bnot\b[^.\n]{{0,80}}{re.escape(exact)}[^.\n]{{0,180}}\buse\b", normalized_text):
+            boost += 70
+        if re.search(rf"{re.escape(exact)}[^.\n]{{0,160}}\b(?:removed|deprecated|legacy|no longer)\b", normalized_text):
+            boost += 35
+        if re.search(rf"\b(?:removed|deprecated|legacy|no longer)\b[^.\n]{{0,160}}{re.escape(exact)}", normalized_text):
+            boost += 35
+        return boost
 
     def _semantic_evidence_score(self, text: str, api_semantics: Optional[list[dict]]) -> tuple[int, list[str]]:
         normalized = self._normalized_evidence_text(text)
@@ -1443,6 +1519,7 @@ class ScoutAgent:
         chunk: dict,
         terms: list[str],
         api_usages: Optional[list[str]] = None,
+        api_contexts: Optional[list[dict]] = None,
         api_semantics: Optional[list[dict]] = None,
         current_version: str = "",
         latest_version: str = "",
@@ -1471,7 +1548,7 @@ class ScoutAgent:
             "changed signature", "signature", "requires", "must",
         ]
         score += sum(3 for term in change_terms if term in lowered)
-        method_score, method_matches = self._method_evidence_score(text, api_usages)
+        method_score, method_matches = self._method_evidence_score(text, api_usages, api_contexts)
         score += method_score
         matched_terms.extend(method_matches)
         semantic_score, semantic_matches = self._semantic_evidence_score(text, api_semantics)
@@ -1521,6 +1598,7 @@ class ScoutAgent:
                     chunk,
                     terms,
                     api_usages,
+                    api_contexts,
                     api_semantics,
                     current_version,
                     latest_version,
@@ -1538,6 +1616,7 @@ class ScoutAgent:
                     method_score, _method_matches = self._method_evidence_score(
                         str(chunk.get("content", "")),
                         api_usages,
+                        api_contexts,
                     )
                     if method_score < 80 and semantic_score < 36:
                         continue
@@ -1552,6 +1631,7 @@ class ScoutAgent:
                 method_score, method_matches = self._method_evidence_score(
                     str(chunk.get("content", "")),
                     api_usages,
+                    api_contexts,
                 )
                 confidence = "high" if method_score >= 80 else "medium" if semantic_score >= 18 or method_score >= 35 else "low"
                 ranked.append((score, -reference_index, {
@@ -2066,6 +2146,7 @@ class ScoutAgent:
                 api_usages,
                 evidence_references or references,
                 api_semantics,
+                api_contexts,
             )
             result["breaking_changes"] = llm_result.get("breaking_changes", [])
             result["api_evidence"] = llm_result.get("api_evidence", [])
@@ -2086,6 +2167,7 @@ class ScoutAgent:
         api_usages: Optional[list[str]] = None,
         references: Optional[list[dict]] = None,
         api_semantics: Optional[list[dict]] = None,
+        api_contexts: Optional[list[dict]] = None,
     ) -> dict:
         system_prompt = (
             "You are a senior dependency management AI for Python, Rust, Go, JavaScript, TypeScript, Java, "
@@ -2105,6 +2187,8 @@ class ScoutAgent:
             Prefer old_api values that match the exact APIs used by the project when possible.
             Fill new_api only when an evidence chunk documents a replacement, renamed API, changed signature, or clear migration pattern.
             If a referenced change needs review but no replacement is documented, leave new_api empty and explain why.
+            Do not report an API as removed, renamed, or changed unless an evidence chunk directly names that API, its matched code alias, or a documented old/new API pair for it.
+            Do not convert broad compatibility notes into removals for ordinary still-valid APIs.
             Return a JSON object with this exact structure:
             {{
             "breaking_changes": [
@@ -2147,11 +2231,295 @@ class ScoutAgent:
             response = await self.router.complete(system_prompt, prompt, max_tokens=self.analysis_max_tokens, task_type="changelog")
             data = self._extract_json_object(response.content)
             if data:
+                data = self._filter_llm_migrations_by_evidence(
+                    data,
+                    api_usages,
+                    references or [],
+                    api_contexts,
+                )
                 data["llm_provider"] = response.provider
                 return data
         except Exception as e:
             logger.error(f"Error calling LLM: {e}")
         return {"breaking_changes": [], "confidence_score": 0.0, "llm_provider": "none"}
+
+    def _filter_llm_migrations_by_evidence(
+        self,
+        data: dict,
+        api_usages: Optional[list[str]],
+        references: list[dict],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> dict:
+        if not isinstance(data, dict):
+            return {"breaking_changes": [], "api_evidence": [], "confidence_score": 0.0}
+
+        allowed_apis = {str(api or "").strip() for api in api_usages or [] if str(api or "").strip()}
+        api_evidence = [
+            item for item in data.get("api_evidence", []) or []
+            if isinstance(item, dict)
+        ]
+        evidence_by_api: dict[str, list[dict]] = defaultdict(list)
+        for item in api_evidence:
+            api = str(item.get("api", "") or "").strip()
+            if api:
+                evidence_by_api[api].append(item)
+
+        kept_changes = []
+        kept_evidence = []
+        for change in data.get("breaking_changes", []) or []:
+            if not isinstance(change, dict):
+                continue
+            old_api = str(change.get("old_api", "") or "").strip()
+            if not old_api:
+                continue
+            if allowed_apis and not any(
+                old_api == allowed_api or old_api.startswith(f"{allowed_api}.")
+                for allowed_api in allowed_apis
+            ):
+                continue
+
+            related_evidence = [
+                item
+                for api, items in evidence_by_api.items()
+                if old_api == api or old_api.startswith(f"{api}.") or api.startswith(f"{old_api}.")
+                for item in items
+            ]
+            if api_evidence and not related_evidence:
+                logger.debug("Dropping LLM migration for %s: no api_evidence item", old_api)
+                continue
+
+            valid_related_evidence = [
+                item for item in related_evidence
+                if self._evidence_supports_api_change(
+                    old_api,
+                    self._api_evidence_item_text(item),
+                    api_contexts,
+                    change.get("type", ""),
+                )
+            ]
+            generated_evidence = None
+            support_text = "\n".join(
+                self._api_evidence_item_text(item)
+                for item in valid_related_evidence
+            )
+            if not support_text:
+                generated_evidence = self._find_supporting_reference_evidence(
+                    old_api,
+                    change,
+                    references,
+                    api_contexts,
+                )
+                if generated_evidence:
+                    support_text = self._api_evidence_item_text(generated_evidence)
+
+            if not generated_evidence and not self._evidence_supports_api_change(
+                old_api,
+                support_text,
+                api_contexts,
+                change.get("type", ""),
+            ):
+                logger.debug("Dropping LLM migration for %s: no direct evidence support", old_api)
+                continue
+
+            kept_changes.append(change)
+            kept_evidence.extend(valid_related_evidence)
+            if generated_evidence:
+                kept_evidence.append(generated_evidence)
+
+        data["breaking_changes"] = kept_changes
+        if api_evidence:
+            seen = set()
+            deduped_evidence = []
+            for item in kept_evidence:
+                key = json.dumps(item, sort_keys=True, default=str)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped_evidence.append(item)
+            data["api_evidence"] = deduped_evidence
+        if not kept_changes:
+            data["confidence_score"] = 0.0
+        return data
+
+    def _api_evidence_item_text(self, item: dict) -> str:
+        # Validate against quoted/source evidence only; LLM-authored api/reason fields
+        # can repeat the requested API even when the cited quote is unrelated.
+        parts = []
+        for evidence in item.get("evidence", []) or []:
+            if isinstance(evidence, dict):
+                parts.extend([
+                    str(evidence.get("quote", "") or ""),
+                    str(evidence.get("url", "") or ""),
+                    str(evidence.get("source", "") or ""),
+                ])
+        return "\n".join(part for part in parts if part)
+
+    def _find_supporting_reference_evidence(
+        self,
+        old_api: str,
+        change: dict,
+        references: list[dict],
+        api_contexts: Optional[list[dict]] = None,
+    ) -> Optional[dict]:
+        variants = sorted(
+            self._api_evidence_variants(old_api, api_contexts),
+            key=len,
+            reverse=True,
+        )
+        replacement_variants = self._replacement_evidence_variants(str(change.get("new_api", "") or ""))
+        for index, reference in enumerate(references, start=1):
+            if not isinstance(reference, dict):
+                continue
+            raw_text = "\n".join([
+                str(reference.get("title", "") or ""),
+                str(reference.get("url", "") or ""),
+                str(reference.get("content", "") or ""),
+            ])
+            normalized = self._normalized_evidence_text(raw_text)
+            if not normalized or not self._has_migration_language(normalized):
+                continue
+            direct_support = any(
+                self._contains_api_variant(normalized, variant)
+                for variant in variants
+            )
+            semantic_support = (
+                replacement_variants
+                and any(self._contains_api_variant(normalized, variant) for variant in replacement_variants)
+                and self._reference_has_semantic_match(reference)
+            )
+            if not direct_support and not semantic_support:
+                continue
+            if direct_support and not self._evidence_supports_api_change(
+                old_api,
+                raw_text,
+                api_contexts,
+                str(change.get("type", "") or ""),
+            ):
+                continue
+            quote = self._extract_reference_quote(
+                raw_text,
+                variants if direct_support else replacement_variants,
+            )
+            return {
+                "api": old_api,
+                "change_type": str(change.get("type", "") or "migration_review"),
+                "replacement": str(change.get("new_api", "") or ""),
+                "confidence": str(reference.get("evidence_confidence", "") or "medium"),
+                "evidence": [{
+                    "source_index": index,
+                    "source": self._document_kind(reference),
+                    "url": str(reference.get("url", "") or ""),
+                    "quote": quote,
+                }],
+                "reason": f"Retrieved evidence directly mentions {old_api} with migration language.",
+            }
+        return None
+
+    def _replacement_evidence_variants(self, new_api: str) -> list[str]:
+        normalized_api = new_api.replace("::", ".").replace("/", ".").strip()
+        if not normalized_api:
+            return []
+        parts = [part for part in normalized_api.split(".") if part]
+        variants = {normalized_api}
+        if len(parts) >= 2:
+            variants.add(".".join(parts[-2:]))
+            variants.add(parts[-1])
+            variants.add(f"{parts[-1]}()")
+        return sorted(variants, key=len, reverse=True)
+
+    def _reference_has_semantic_match(self, reference: dict) -> bool:
+        try:
+            if float(reference.get("semantic_score", 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        matched_terms = [
+            str(term or "").strip()
+            for term in reference.get("matched_terms", []) or []
+        ]
+        generic_terms = {"project", "package", "breaking-change-section"}
+        return any(
+            len(term) >= 4 and term.lower() not in generic_terms
+            for term in matched_terms
+        )
+
+    def _extract_reference_quote(self, text: str, variants: list[str], max_chars: int = 280) -> str:
+        clean_text = re.sub(r"\s+", " ", text or "").strip()
+        normalized = self._normalized_evidence_text(clean_text)
+        if not clean_text or not normalized:
+            return ""
+        best_pos = -1
+        for variant in variants:
+            normalized_variant = self._normalized_evidence_text(variant)
+            if not normalized_variant:
+                continue
+            match = re.search(rf"(?<![\w.]){re.escape(normalized_variant)}(?![\w.])", normalized)
+            if match:
+                best_pos = match.start()
+                break
+        if best_pos < 0:
+            return clean_text[:max_chars]
+        start = max(0, best_pos - max_chars // 2)
+        end = min(len(clean_text), start + max_chars)
+        snippet = clean_text[start:end].strip()
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(clean_text):
+            snippet += "..."
+        return snippet
+
+    def _evidence_supports_api_change(
+        self,
+        old_api: str,
+        evidence_text: str,
+        api_contexts: Optional[list[dict]] = None,
+        change_type: str = "",
+    ) -> bool:
+        normalized = self._normalized_evidence_text(evidence_text)
+        if not normalized or not self._has_migration_language(normalized):
+            return False
+        if change_type == "removed" and not any(
+            term in normalized
+            for term in ["removed", "remove", "no longer", "deprecated", "deprecation", "expired"]
+        ):
+            return False
+        variants = self._api_evidence_variants(old_api, api_contexts)
+        return any(self._contains_api_variant(normalized, variant) for variant in variants)
+
+    def _api_evidence_variants(
+        self,
+        old_api: str,
+        api_contexts: Optional[list[dict]] = None,
+    ) -> set[str]:
+        variants = {old_api}
+        normalized_api = old_api.replace("::", ".").replace("/", ".")
+        parts = [part for part in normalized_api.split(".") if part]
+        if len(parts) >= 2:
+            variants.add(".".join(parts[-2:]))
+            if len(parts[-1]) >= 8:
+                variants.add(parts[-1])
+        if len(parts) >= 3:
+            variants.add(f"{parts[-1]}()")
+        for context in api_contexts or []:
+            if not isinstance(context, dict):
+                continue
+            context_api = str(context.get("api", "") or context.get("old_api", "") or "").strip()
+            if context_api != old_api:
+                continue
+            for key in ("matched_text", "code_snippet"):
+                value = str(context.get(key, "") or "").strip()
+                if not value:
+                    continue
+                for match in re.findall(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", value):
+                    variants.add(match.rstrip("("))
+        return {variant for variant in variants if variant}
+
+    def _contains_api_variant(self, normalized_text: str, variant: str) -> bool:
+        normalized_variant = self._normalized_evidence_text(variant)
+        if not normalized_variant:
+            return False
+        pattern = rf"(?<![\w.]){re.escape(normalized_variant)}(?![\w.])"
+        return re.search(pattern, normalized_text) is not None
 
     def _extract_json_object(self, text: str) -> dict | None:
         decoder = json.JSONDecoder()

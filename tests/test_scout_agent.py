@@ -678,6 +678,74 @@ def test_scout_considers_intermediate_major_release_note_paths():
     )
 
 
+def test_scout_considers_old_major_minor_releases_before_next_major():
+    scout = ScoutAgent()
+
+    versions = scout._candidate_version_strings("1.23.0", "2.4.5")
+    candidates = scout._common_versioned_doc_candidates("1.23.0", "2.4.5")
+
+    assert "1.24.0" in versions
+    assert "1.25.0" in versions
+    assert "1.26.0" in versions
+    assert "2.0.0" in versions
+    assert "doc/source/release/1.24.0-notes.rst" in candidates
+
+
+def test_scout_filters_llm_changes_without_direct_api_evidence():
+    scout = ScoutAgent()
+    data = {
+        "breaking_changes": [
+            {
+                "type": "removed",
+                "old_api": "numpy.float",
+                "new_api": "numpy.float64",
+                "description": "np.float was removed.",
+            },
+            {
+                "type": "removed",
+                "old_api": "numpy.array",
+                "new_api": "",
+                "description": "array behavior may have changed.",
+            },
+            {
+                "type": "removed",
+                "old_api": "numpy.bool",
+                "new_api": "numpy.bool_",
+                "description": "np.bool was removed.",
+            },
+        ],
+        "api_evidence": [
+            {
+                "api": "numpy.float",
+                "confidence": "high",
+                "evidence": [{"quote": "``np.float`` was a deprecated alias and has been removed. Use ``float`` or ``np.float64``."}],
+            },
+            {
+                "api": "numpy.array",
+                "confidence": "medium",
+                "evidence": [{"quote": "The semantics of the copy keyword in np.array changed."}],
+            },
+            {
+                "api": "numpy.bool",
+                "confidence": "high",
+                "evidence": [{"quote": "Alias ``np.float_`` has been removed. Use ``np.float64`` instead."}],
+            },
+        ],
+        "confidence_score": 0.9,
+    }
+
+    filtered = scout._filter_llm_migrations_by_evidence(
+        data,
+        ["numpy.float", "numpy.array", "numpy.bool"],
+        [],
+        [{"api": "numpy.float", "matched_text": "np.float"}, {"api": "numpy.bool", "matched_text": "np.bool"}],
+    )
+
+    assert [change["old_api"] for change in filtered["breaking_changes"]] == ["numpy.float"]
+    assert "numpy.array" not in {item["api"] for item in filtered["api_evidence"]}
+    assert "numpy.bool" not in {item["api"] for item in filtered["api_evidence"]}
+
+
 def test_scout_builds_compact_ranked_evidence_chunks():
     scout = ScoutAgent()
     scout.evidence_chunk_chars = 700
@@ -809,6 +877,67 @@ def test_scout_uses_code_context_terms_for_retrieval():
 
     assert evidence
     assert "append" in evidence[0]["matched_terms"]
+
+
+def test_scout_prioritizes_receiver_method_migration_evidence():
+    scout = ScoutAgent()
+    references = [
+        {
+            "source": "github",
+            "title": "doc/build/changelog/migration_14.rst",
+            "url": "https://github.com/sqlalchemy/sqlalchemy/blob/main/doc/build/changelog/migration_14.rst",
+            "content": "\n".join([
+                "ORM Session.execute() uses future style Result sets in all cases.",
+                "As noted elsewhere, Result and Row objects now feature named tuple behavior",
+                "when used with an Engine that includes create_engine.future set to True.",
+            ]),
+        },
+        {
+            "source": "github",
+            "title": "doc/build/changelog/migration_20.rst",
+            "url": "https://github.com/sqlalchemy/sqlalchemy/blob/main/doc/build/changelog/migration_20.rst",
+            "content": "\n".join([
+                "engine = create_engine(\"sqlite://\")",
+                "engine.execute(\"CREATE TABLE foo (id integer)\")",
+                "The above program uses several legacy patterns.",
+                "With the above guidance, migrate to use 2.0 styles:",
+                "with engine.connect() as connection:",
+                "    # use connection.execute(), not engine.execute()",
+                "    result = connection.execute(text(\"select id from foo\"))",
+            ]),
+        },
+    ]
+
+    evidence = scout._focused_reference_snippets(
+        references,
+        ["sqlalchemy.create_engine.execute"],
+        api_contexts=[{
+            "api": "sqlalchemy.create_engine.execute",
+            "matched_text": "self.engine.execute(",
+            "code_snippet": "self.engine = create_engine(db_url)\nresult = self.engine.execute(\"SELECT * FROM users\")",
+        }],
+        current_version="1.4.46",
+        latest_version="2.0.49",
+    )
+
+    assert evidence
+    assert evidence[0]["url"].endswith("migration_20.rst")
+    assert "use connection.execute(), not engine.execute()" in evidence[0]["content"]
+    assert "engine.execute" in evidence[0]["matched_terms"]
+    assert evidence[0]["evidence_confidence"] == "high"
+
+
+def test_scout_discards_html_not_found_pages():
+    scout = ScoutAgent()
+
+    assert scout._looks_like_not_found_page(
+        "Page Not Found! Can't find the page you're looking for. SQLAlchemy Documentation Search terms: Contents | Index",
+        "https://docs.example.invalid/missing",
+    )
+    assert not scout._looks_like_not_found_page(
+        "A migration guide explains that legacy APIs are not found by old names after the rename.",
+        "",
+    )
 
 
 def test_scout_falls_back_to_code_context_semantics_when_old_docs_missing():

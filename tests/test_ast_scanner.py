@@ -84,6 +84,77 @@ def test_find_api_usages_tracks_python_constructor_method_dataflow(tmp_path: Pat
     assert "pandas.DataFrame.append" in usages
 
 
+def test_find_api_usages_does_not_treat_function_return_methods_as_package_apis(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "import numpy as np",
+            "",
+            "def process(raw_data):",
+            "    arr = np.array(raw_data, dtype=np.float)",
+            "    mask = np.ones(arr.shape, dtype=np.bool)",
+            "    copied = np.fliplr(arr).copy()",
+            "    return copied.max()",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "numpy")
+
+    assert "numpy.array" in usages
+    assert "numpy.float" in usages
+    assert "numpy.ones" in usages
+    assert "numpy.bool" in usages
+    assert "numpy.fliplr.copy" not in usages
+    assert "numpy.array.max" not in usages
+    assert "numpy.fliplr.max" not in usages
+
+
+def test_find_api_usages_tracks_factory_assigned_to_instance_attribute(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "from sqlalchemy import create_engine",
+            "",
+            "class DatabaseManager:",
+            "    def __init__(self, db_url='sqlite:///:memory:'):",
+            "        self.engine = create_engine(db_url)",
+            "",
+            "    def get_users(self):",
+            "        result = self.engine.execute('SELECT * FROM users')",
+            "        return [row for row in result]",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "SQLAlchemy")
+
+    assert "sqlalchemy.create_engine" in usages
+    assert "sqlalchemy.create_engine.execute" in usages
+
+
+def test_find_api_usages_does_not_propagate_unrelated_lowercase_factory_returns(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "\n".join([
+            "from numpy import array",
+            "",
+            "class Holder:",
+            "    def __init__(self, values):",
+            "        self.arr = array(values)",
+            "",
+            "    def largest(self):",
+            "        return self.arr.max()",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    usages = ASTScanner().find_api_usages(str(tmp_path), "numpy")
+
+    assert "numpy.array" in usages
+    assert "numpy.array.max" not in usages
+
+
 def test_find_api_usage_contexts_for_scout_retrieval(tmp_path: Path):
     (tmp_path / "app.py").write_text(
         "\n".join([
