@@ -38,63 +38,21 @@ All of this is surfaced through a live-streaming IDE-like UI where you can inspe
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    Browser(["🌐 Browser"])
-
-    subgraph FE["Frontend — React 18 + Vite + TailwindCSS 4"]
-        direction TB
-        UI["DashboardView · IdeWorkspaceView\nDiffReviewPanel · PackagesTable"]
-        Graph["ProjectDependencyGraph\n@xyflow/react"]
-    end
-
-    subgraph API["Backend — FastAPI"]
-        direction TB
-        Scan["/scan-stream\nSSE"]
-        Preview["/preview-stream\nSSE"]
-        Apply["/apply\n/rollback"]
-    end
-
-    subgraph Agents["Agent Pipeline"]
-        direction LR
-        Scanner["ScannerAgent\nDiscover deps"]
-        Watchdog["WatchdogAgent\nCVE · Severity"]
-        Scout["ScoutAgent\nBreaking changes"]
-        Patch["PatchAgent\nCode patches"]
-        Checker["ProjectChecker\nBuild · Tests"]
-        Repair["RepairAgent\nError recovery"]
-
-        Scanner --> Watchdog --> Scout --> Patch --> Checker
-        Checker -- "fail" --> Repair --> Checker
-    end
-
-    subgraph Tools["Tools"]
-        AST["ast_scanner.py\nTree-sitter · 30+ langs"]
-        Impact["impact_graph.py\nCall graph"]
-        Router["llm_router.py\nProvider fallback"]
-        Lockfile["lockfile_resolver.py"]
-    end
-
-    subgraph LLM["LLM Providers"]
-        Claude["Claude\nAnthropic"]
-        Gemini["Gemini\nGoogle"]
-        Qwen["Qwen\nOpenRouter"]
-    end
-
-    subgraph External["External APIs"]
-        OSV["OSV\nVulnerability DB"]
-        DepsDev["deps.dev\nLatest versions"]
-        GitHub["GitHub API\nChangelogs"]
-    end
-
-    Browser -- "HTTPS" --> FE
-    FE -- "HTTP / SSE" --> API
-    API --> Agents
-    Agents --> Tools
-    Tools --> Router
-    Router --> Claude & Gemini & Qwen
-    Watchdog --> OSV & DepsDev
-    Scout --> GitHub
+```
+┌─────────────────────────────────────────────────────────┐
+│                        Frontend                          │
+│   React + TypeScript + Vite + TailwindCSS               │
+│   DashboardView · IdeWorkspaceView · DiffReviewPanel    │
+└────────────────────────┬────────────────────────────────┘
+                         │ HTTP / SSE
+┌────────────────────────▼────────────────────────────────┐
+│                   FastAPI Backend                        │
+│   /scan-stream  /preview-stream  /apply  /rollback      │
+└──────┬──────────┬──────────┬───────────┬────────────────┘
+       │          │          │           │
+  ScannerAgent  ScoutAgent  PatchAgent  ProjectChecker
+  WatchdogAgent            ASTScanner   RepairAgent
+                           ImpactGraph
 ```
 
 ### Agents
