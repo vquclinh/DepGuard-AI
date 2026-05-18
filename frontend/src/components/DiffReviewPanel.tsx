@@ -184,10 +184,11 @@ export function DiffReviewPanel({
   };
 
   const goToFile = (index: number) => {
-    const clamped = Math.max(0, Math.min(preview.files.length - 1, index));
-    setCurrentFileIndex(clamped);
+    if (preview.files.length === 0) return;
+    const wrapped = ((index % preview.files.length) + preview.files.length) % preview.files.length;
+    setCurrentFileIndex(wrapped);
     scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
-    onFileChange?.(preview.files[clamped].file_path);
+    onFileChange?.(preview.files[wrapped].file_path);
   };
 
   const content = !currentFile ? (
@@ -466,17 +467,20 @@ function FileNavigator({
   onRejectFile: () => void;
 }) {
   const [isFileListOpen, setIsFileListOpen] = useState(false);
-  const previousFile = files[currentFileIndex - 1] ?? null;
-  const nextFile = files[currentFileIndex + 1] ?? null;
+  const fileCount = files.length;
+  const previousIndex = fileCount > 0 ? (currentFileIndex - 1 + fileCount) % fileCount : 0;
+  const nextIndex = fileCount > 0 ? (currentFileIndex + 1) % fileCount : 0;
+  const previousFile = files[previousIndex] ?? null;
+  const nextFile = files[nextIndex] ?? null;
 
   return (
-    <div className="absolute bottom-4 left-1/2 z-20 w-[min(620px,calc(100%-2rem))] -translate-x-1/2 rounded-xl border bg-card/95 p-2 shadow-2xl backdrop-blur">
+    <div className="absolute bottom-8 left-1/2 z-20 w-[min(480px,calc(100%-2rem))] -translate-x-1/2 rounded-lg border bg-card/95 p-1 shadow-2xl backdrop-blur">
       {isFileListOpen && (
-        <div className="absolute bottom-full left-1/2 mb-2 max-h-64 w-[min(560px,calc(100vw-3rem))] -translate-x-1/2 overflow-auto rounded-xl border bg-card p-2 shadow-2xl">
-          <div className="mb-2 px-2 text-xs font-semibold text-muted-foreground">
+        <div className="absolute bottom-full left-1/2 mb-1.5 max-h-56 w-[min(440px,calc(100vw-3rem))] -translate-x-1/2 overflow-auto rounded-lg border bg-card p-1.5 shadow-2xl">
+          <div className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
             {files.length} changed file{files.length === 1 ? "" : "s"}
           </div>
-          <div className="space-y-1">
+          <div className="space-y-0.5">
             {files.map((file, index) => (
               <button
                 key={file.relative_path}
@@ -485,71 +489,59 @@ function FileNavigator({
                   setIsFileListOpen(false);
                 }}
                 className={cn(
-                  "flex h-8 w-full min-w-0 items-center justify-between gap-2 rounded-md px-2 text-left text-xs transition",
+                  "flex h-7 w-full min-w-0 items-center justify-between gap-2 rounded px-2 text-left text-[11px] transition",
                   index === currentFileIndex ? "bg-primary text-primary-foreground" : "hover:bg-muted"
                 )}
               >
                 <span className="min-w-0 truncate">{file.relative_path}</span>
-                <span className="shrink-0 text-[10px] opacity-80">
-                  +{file.additions} / -{file.deletions}
+                <span className="shrink-0 text-[10px] opacity-70">
+                  +{file.additions}/−{file.deletions}
                 </span>
               </button>
             ))}
           </div>
         </div>
       )}
-      <div className="flex items-start gap-2">
-        <div className="min-w-0 shrink">
-          <button
-            onClick={() => onGoToFile(currentFileIndex - 1)}
-            disabled={currentFileIndex === 0}
-            title={previousFile?.relative_path ?? "No previous file"}
-            className="inline-flex h-8 items-center gap-1 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-40"
-          >
-            <ChevronLeft className="h-4 w-4" />
-            Prev
-          </button>
-          <div className="mt-1 max-w-[88px] truncate text-center text-[10px] text-muted-foreground">
-            {previousFile ? shortFileName(previousFile.relative_path) : "No file"}
-          </div>
-        </div>
+      <div className="flex items-center gap-1">
+        <button
+          onClick={() => onGoToFile(previousIndex)}
+          disabled={fileCount <= 1}
+          title={previousFile ? `Previous: ${previousFile.relative_path}` : "No previous file"}
+          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border bg-background text-xs transition hover:bg-muted disabled:opacity-40"
+        >
+          <ChevronLeft className="h-3.5 w-3.5" />
+        </button>
         <button
           onClick={() => setIsFileListOpen((current) => !current)}
-          className="min-w-0 flex-1 rounded-md bg-muted px-2 py-1.5 text-center text-xs font-semibold transition hover:bg-muted/80"
+          className="min-w-0 flex-1 rounded bg-muted px-2 py-1 text-center text-[11px] font-semibold transition hover:bg-muted/80"
           title={currentFile.relative_path}
         >
           <span>{files.length} file{files.length === 1 ? "" : "s"} changed</span>
-          <span className="mx-2 text-muted-foreground">|</span>
+          <span className="mx-1.5 text-muted-foreground">|</span>
           <span>{currentFileIndex + 1}/{files.length}</span>
         </button>
         <button
           onClick={onAcceptFile}
-          className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md border bg-background px-2 text-xs font-semibold text-emerald-500 transition hover:bg-muted"
+          className="inline-flex h-7 shrink-0 items-center gap-1 rounded border bg-background px-2 text-[11px] font-semibold text-emerald-500 transition hover:bg-muted"
         >
-          <Check className="h-4 w-4" />
+          <Check className="h-3.5 w-3.5" />
           Accept
         </button>
         <button
           onClick={onRejectFile}
-          className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md border bg-background px-2 text-xs font-semibold text-red-500 transition hover:bg-muted"
+          className="inline-flex h-7 shrink-0 items-center gap-1 rounded border bg-background px-2 text-[11px] font-semibold text-red-500 transition hover:bg-muted"
         >
-          <X className="h-4 w-4" />
+          <X className="h-3.5 w-3.5" />
           Reject
         </button>
-        <div className="min-w-0 shrink">
-          <button
-            onClick={() => onGoToFile(currentFileIndex + 1)}
-            disabled={currentFileIndex === files.length - 1}
-            title={nextFile?.relative_path ?? "No next file"}
-            className="inline-flex h-8 items-center gap-1 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-40"
-          >
-            Next
-            <ChevronRight className="h-4 w-4" />
-          </button>
-          <div className="mt-1 max-w-[88px] truncate text-center text-[10px] text-muted-foreground">
-            {nextFile ? shortFileName(nextFile.relative_path) : "No file"}
-          </div>
-        </div>
+        <button
+          onClick={() => onGoToFile(nextIndex)}
+          disabled={fileCount <= 1}
+          title={nextFile ? `Next: ${nextFile.relative_path}` : "No next file"}
+          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border bg-background text-xs transition hover:bg-muted disabled:opacity-40"
+        >
+          <ChevronRight className="h-3.5 w-3.5" />
+        </button>
       </div>
     </div>
   );
@@ -844,12 +836,6 @@ function commandTone(status: string) {
   if (status === "passed" || status === "success") return "bg-emerald-500/10 text-emerald-500";
   if (status === "failed") return "bg-red-500/10 text-red-500";
   return "bg-muted text-muted-foreground";
-}
-
-function shortFileName(path: string) {
-  const parts = path.split(/[\\/]/).filter(Boolean);
-  if (parts.length <= 2) return path;
-  return `${parts.at(-2)}/${parts.at(-1)}`;
 }
 
 function trimOutput(output: string) {
