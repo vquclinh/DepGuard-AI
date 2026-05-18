@@ -7,6 +7,8 @@ import asyncio
 import difflib
 import time
 import uuid
+import shutil
+import tempfile
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -379,6 +381,44 @@ def _preview_response(session: dict) -> dict:
         },
         "files": files,
     }
+
+def _apply_delta(original: str, patched: str, current: str) -> str:
+    """Apply the delta (original→patched) onto current on-disk content.
+
+    Preserves edits already in *current* (from previously-applied sessions) while
+    also applying this session's changes.  Works line-by-line; non-conflicting
+    changes from both sides are kept.  Falls back gracefully for the edge case
+    where line counts have drifted due to another session inserting/removing lines.
+    """
+    if original == current:
+        return patched
+    if original == patched:
+        return current
+
+    orig_lines  = original.splitlines(keepends=True)
+    patch_lines = patched.splitlines(keepends=True)
+    curr_lines  = current.splitlines(keepends=True)
+
+    matcher = difflib.SequenceMatcher(None, orig_lines, patch_lines)
+    result: list[str] = []
+    curr_idx = 0
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        chunk_len = i2 - i1
+        if tag == "equal":
+            # Unchanged in this session — keep whatever is currently on disk
+            result.extend(curr_lines[curr_idx : curr_idx + chunk_len])
+            curr_idx += chunk_len
+        elif tag in {"replace", "delete"}:
+            curr_idx += chunk_len          # skip these lines from current
+            if tag == "replace":
+                result.extend(patch_lines[j1:j2])
+        elif tag == "insert":
+            result.extend(patch_lines[j1:j2])
+
+    result.extend(curr_lines[curr_idx:])
+    return "".join(result)
+
 
 def _apply_partial_hunks(original: str, patched: str, accepted_hunk_ids: set[str]) -> str:
     hunks, _additions, _deletions = _build_hunks(original, patched)
@@ -818,6 +858,12 @@ def apply_preview(req: ApplyPreviewRequest):
                 continue
 
             target = _safe_project_path(folder_path, relative_path)
+            # If another session already wrote this file, apply as a delta so we
+            # don't overwrite changes from previously-applied sessions.
+            if target.exists():
+                current_on_disk = _read_text_if_exists(target)
+                if current_on_disk != original:
+                    final_content = _apply_delta(original, final_content, current_on_disk)
             target.write_text(final_content, encoding="utf-8")
             package_info = session["package_info"]
             try:
@@ -1149,3 +1195,184 @@ def rollback(req: RollbackRequest):
     except Exception as e:
         logger.error(f"Error in /rollback: {e}")
         raise HTTPException(status_code=500, detail=f"Agent Error: {str(e)}")
+
+# ----------------------- Batch Sandbox Check Helpers ----------------------------------
+
+_SOURCE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".kt", ".kts",
+    ".go", ".rs", ".cpp", ".c", ".h", ".cs", ".rb", ".php",
+    ".scala", ".swift", ".m", ".mm",
+}
+
+def _filter_source_files(rel_paths: list[str]) -> list[str]:
+    """Return only source-code file paths (exclude manifests like package.json, etc.)."""
+    return [p for p in rel_paths if Path(p).suffix.lower() in _SOURCE_EXTENSIONS]
+
+
+def _copy_project_to_temp(folder_path: Path, patched_files: dict[str, str]) -> Path:
+    """Copy the project to a fresh temp directory and overlay patched file contents.
+
+    Returns the path to the project root inside the temp directory.
+    """
+    tmp_parent = Path(tempfile.mkdtemp(prefix="depguard_batch_"))
+    project_name = folder_path.name or "project"
+    tmp_root = tmp_parent / project_name
+
+    # Copy project tree (skip common noisy dirs)
+    def _ignore(src: str, names: list[str]) -> list[str]:
+        ignored = set()
+        for n in names:
+            if n in {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache", ".pytest_cache", "dist", "build"}:
+                ignored.add(n)
+        return list(ignored)
+
+    shutil.copytree(str(folder_path), str(tmp_root), ignore=_ignore, symlinks=False)
+
+    # Overlay patched file contents
+    for rel_path, content in patched_files.items():
+        target = tmp_root / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    return tmp_root
+
+
+# ----------------------- Batch Sandbox Check Endpoint ---------------------------------
+
+class BatchSandboxCheckRequest(BaseModel):
+    folder_path: str
+    session_ids: list[str] = []
+
+
+@app.post("/batch-sandbox-check-stream")
+async def batch_sandbox_check_stream(req: BatchSandboxCheckRequest):
+    """Copy project + all session patches to temp dir, run checker+repair, update session patches.
+    Called after all packages have been previewed in Update All mode, before user review."""
+    async def event_generator():
+        def _sse(payload: dict) -> str:
+            return f"data: {json.dumps(payload)}\n\n"
+
+        temp_parent = None
+        try:
+            folder_path = Path(req.folder_path)
+            if not folder_path.exists() or not folder_path.is_dir():
+                yield _sse({"event": "error", "message": "Folder path does not exist"})
+                return
+
+            # Collect all patches from all sessions.
+            # Files touched by multiple sessions are merged with _apply_delta so the
+            # sandbox sees the correct combined state (not just the last writer's version).
+            merged_patches: dict[str, str] = {}
+            file_to_sessions: dict[str, list[str]] = {}  # rel → [sid, ...] in order
+            for sid in req.session_ids:
+                s = PREVIEW_SESSIONS.get(sid)
+                if not s:
+                    continue
+                for rel, content in s.get("files_patched", {}).items():
+                    if rel not in merged_patches:
+                        merged_patches[rel] = content
+                        file_to_sessions[rel] = [sid]
+                    else:
+                        original_on_disk = _read_text_if_exists(folder_path / rel)
+                        merged_patches[rel] = _apply_delta(original_on_disk, content, merged_patches[rel])
+                        file_to_sessions[rel].append(sid)
+
+            # For repair sync-back: map each file to its last touching session.
+            # Only single-session files get synced back — multi-session files keep
+            # their per-session patches intact so each session's diff stays clean.
+            file_to_session: dict[str, str] = {
+                rel: sids[-1] for rel, sids in file_to_sessions.items()
+            }
+            single_session_files: set[str] = {
+                rel for rel, sids in file_to_sessions.items() if len(sids) == 1
+            }
+
+            if not merged_patches:
+                yield _sse({"event": "done", "message": "No file changes to verify."})
+                return
+
+            yield _sse({"event": "phase", "phase": "verify",
+                        "message": f"Sandbox-checking {len(merged_patches)} changed file(s) across all packages…"})
+
+            temp_root = await asyncio.to_thread(_copy_project_to_temp, folder_path, merged_patches)
+            temp_parent = temp_root.parent
+
+            checker = ProjectChecker(str(temp_root), timeout_seconds=120)
+            check_result = await asyncio.to_thread(checker.run)
+
+            if check_result.get("status") in {"passed", "skipped"}:
+                yield _sse({"event": "verify_done",
+                            "message": "Sandbox checks passed — all proposed changes are clean."})
+                yield _sse({"event": "done",
+                            "message": "All changes verified. Review the diffs and apply when ready."})
+                return
+
+            failed_cmds = [c["name"] for c in check_result.get("commands", []) if c.get("status") == "failed"]
+            yield _sse({"event": "verify_fail",
+                        "message": f"Checks failed ({', '.join(failed_cmds)}) — running auto-repair on sandbox…"})
+
+            if not _env_bool("DEPGUARD_AUTO_REPAIR", True):
+                yield _sse({"event": "done",
+                            "message": "Auto-repair disabled. Diffs shown as-is — review carefully."})
+                return
+
+            yield _sse({"event": "phase", "phase": "repair", "message": "Repair Agent reading errors…"})
+            max_attempts = max(1, _env_int("DEPGUARD_REPAIR_MAX_ATTEMPTS", 1))
+            repair_agent = RepairAgent(str(temp_root))
+            temp_changed = [str(temp_root / f) for f in _filter_source_files(list(merged_patches.keys()))]
+
+            repaired = False
+            repair_report: dict = {}
+            for attempt_num in range(1, max_attempts + 1):
+                yield _sse({"event": "repair_attempt",
+                            "message": f"Repair attempt {attempt_num}/{max_attempts}…",
+                            "attempt": attempt_num})
+                repair_report = await asyncio.to_thread(repair_agent.repair_sync, check_result, temp_changed)
+                check_result = await asyncio.to_thread(checker.run)
+                if check_result.get("status") != "failed":
+                    repaired = True
+                    break
+                if repair_report.get("status") not in {"success", "partial"}:
+                    break
+
+            # Sync repaired file contents back into sessions so the diff the user reviews
+            # reflects any fixes.  Only update single-session files — multi-session files
+            # keep their individual patches so each session's diff stays focused on its
+            # own changes (delta application in apply_preview handles merging at write time).
+            for rel_path, sid in file_to_session.items():
+                if rel_path not in single_session_files:
+                    continue
+                s = PREVIEW_SESSIONS.get(sid)
+                if not s:
+                    continue
+                repaired_file = temp_root / rel_path
+                if repaired_file.exists():
+                    try:
+                        s["files_patched"][rel_path] = repaired_file.read_text(encoding="utf-8")
+                    except OSError:
+                        pass
+
+            if repaired:
+                yield _sse({"event": "repair_done",
+                            "message": "Repair succeeded — diffs updated with fixes.",
+                            "files_repaired": repair_report.get("files_repaired", [])})
+                yield _sse({"event": "done",
+                            "message": "All changes verified and repaired. Review the diffs and apply when ready."})
+            else:
+                yield _sse({"event": "repair_fail",
+                            "message": "Repair could not resolve all issues — review diffs carefully."})
+                yield _sse({"event": "done",
+                            "message": "Some issues remain after repair. Review the diffs carefully before applying."})
+
+        except Exception as exc:
+            logger.error("batch-sandbox-check-stream error: %s", exc)
+            yield _sse({"event": "error", "message": str(exc)})
+        finally:
+            if temp_parent:
+                shutil.rmtree(str(temp_parent), ignore_errors=True)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

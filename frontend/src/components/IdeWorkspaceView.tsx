@@ -23,6 +23,7 @@ import {
 import { type PackageData } from "@/components/PackagesTable";
 import {
   applyPreview,
+  batchSandboxCheckStream,
   discardPreview,
   getFileContent,
   getProjectFiles,
@@ -30,6 +31,7 @@ import {
   rollbackPackage,
   type ApplyResponse,
   type ChangedFile,
+  type PreviewFile,
   type PreviewResponse,
   type PreviewStreamEvent,
   type ProjectFile,
@@ -69,6 +71,14 @@ type ExplorerNode = {
   type: "folder" | "file";
   children: ExplorerNode[];
   file?: ProjectFile;
+};
+
+type CombinedDiffEntry = {
+  packageName: string;
+  fromVersion: string;
+  toVersion: string;
+  sessionId: string;
+  files: PreviewFile[];
 };
 
 const EXPLORER_MIN_WIDTH = 220;
@@ -115,7 +125,11 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
   const [isExplorerPeeking, setIsExplorerPeeking] = useState(false);
   const [isResizingExplorer, setIsResizingExplorer] = useState(false);
   const [updateQueue, setUpdateQueue] = useState<PackageData[]>([]);
+  const queueRef = useRef<PackageData[]>([]);
   const [isBatchUpdating, setIsBatchUpdating] = useState(false);
+  const [combinedDiffEntries, setCombinedDiffEntries] = useState<CombinedDiffEntry[] | null>(null);
+  const [isApplyingAll, setIsApplyingAll] = useState(false);
+  const batchCollectedRef = useRef<PreviewResponse[]>([]);
   const explorerDragRef = useRef({ startX: 0, startWidth: EXPLORER_DEFAULT_WIDTH });
 
   const updateAllCandidates = useMemo(() => packages.filter(isUpdateCandidate), [packages]);
@@ -366,7 +380,18 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
         if (options?.fromBatch) {
           startNextQueuedUpdate();
         }
+      } else if (options?.fromBatch) {
+        // Batch mode: collect preview without showing it, continue to next package
+        batchCollectedRef.current = [...batchCollectedRef.current, result];
+        appendProgressLine({
+          message: `${pkg.name}: ${result.summary.total_files_changed} file(s) collected`,
+          status: "success",
+          badge: "Collected",
+          detail: `+${result.summary.total_additions}/−${result.summary.total_deletions} — will be shown for review after all packages and checks finish.`,
+        });
+        startNextQueuedUpdate();
       } else {
+        // Single package: show for immediate review
         setPreviewData(result);
         setPreviewPackageName(pkg.name);
         setPreviewActiveFile(result.files[0]?.file_path ?? "");
@@ -376,9 +401,16 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
       }
       void loadFiles();
     } catch (error) {
-      onLog(`Error previewing ${pkg.name}: ${error instanceof Error ? error.message : "Unknown error"}`, "error");
+      const errMsg = error instanceof Error ? error.message : "Unknown error";
+      onLog(`Error previewing ${pkg.name}: ${errMsg}`, "error");
       if (options?.fromBatch) {
-        cancelUpdateAll("Update All stopped because one package failed to preview.");
+        appendProgressLine({
+          message: `${pkg.name}: preview failed — skipping`,
+          status: "error",
+          badge: "Skipped",
+          detail: errMsg,
+        });
+        startNextQueuedUpdate();
       }
     } finally {
       setUpdatingPackage("");
@@ -386,30 +418,24 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
   };
 
   const startNextQueuedUpdate = () => {
-    setUpdateQueue((currentQueue) => {
-      const [nextPackage, ...remainingQueue] = currentQueue;
-      if (!nextPackage) {
-        setIsBatchUpdating(false);
-        appendProgressLine({
-          message: "Update All queue finished",
-          status: "success",
-          badge: "Batch",
-          detail: "Every queued package has either been previewed or skipped because no file changes were needed.",
-        });
-        return [];
-      }
-
-      window.setTimeout(() => {
-        void handleUpdate(nextPackage, { fromBatch: true });
-      }, 0);
-      return remainingQueue;
-    });
+    const [nextPackage, ...remainingQueue] = queueRef.current;
+    queueRef.current = remainingQueue;
+    setUpdateQueue(remainingQueue);
+    if (!nextPackage) {
+      void runBatchSandboxCheckAndReview();
+    } else {
+      void handleUpdate(nextPackage, { fromBatch: true });
+    }
   };
 
   const cancelUpdateAll = (message = "Update All queue cancelled.") => {
+    queueRef.current = [];
     setUpdateQueue([]);
     setIsBatchUpdating(false);
     setPendingUpdatePkg(null);
+    batchCollectedRef.current = [];
+    setCombinedDiffEntries(null);
+    setIsApplyingAll(false);
     appendProgressLine({
       message,
       status: "info",
@@ -425,6 +451,8 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     }
 
     const [firstPackage, ...remainingPackages] = updateAllCandidates;
+    batchCollectedRef.current = [];
+    queueRef.current = remainingPackages;
     setUpdateQueue(remainingPackages);
     setIsBatchUpdating(true);
     setRightPanelMode("progress");
@@ -436,7 +464,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
       message: `Starting with ${firstPackage.name}`,
       status: "running",
       badge: "Batch",
-      detail: "DepGuard will prepare one preview at a time. You still choose what to apply before the next package starts.",
+      detail: "DepGuard will process all packages automatically, then show all diffs for review.",
     });
 
     if (previewData) {
@@ -445,6 +473,137 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     }
 
     void handleUpdate(firstPackage, { fromBatch: true });
+  };
+
+  const runBatchSandboxCheckAndReview = async () => {
+    setIsBatchUpdating(false);
+    setRightPanelMode("progress");
+
+    const collected = batchCollectedRef.current;
+    batchCollectedRef.current = [];
+
+    if (collected.length === 0) {
+      appendProgressLine({
+        message: "No file changes were needed across all packages.",
+        status: "success",
+        badge: "Batch",
+        detail: "All packages were already at their target versions or required no source edits.",
+      });
+      return;
+    }
+
+    const sessionIds = collected.map((p) => p.session_id);
+
+    appendProgressLine({ message: "", status: "separator" });
+    appendProgressLine({ message: "Post-update verification", status: "header" });
+
+    const onEvent = (event: PreviewStreamEvent) => {
+      const msg = event.message ?? "";
+      let line: Omit<StreamLine, "id"> | null = null;
+      if (event.event === "phase" && event.phase === "verify") {
+        line = { message: msg, status: "running", badge: "Sandbox", detail: "Running your project's build and test commands on all proposed changes in an isolated copy." };
+      } else if (event.event === "phase" && event.phase === "repair") {
+        line = { message: msg, status: "running", badge: "Auto-repair", detail: "The Repair Agent is fixing errors found in the sandbox before showing you the diff." };
+      } else if (event.event === "verify_done") {
+        line = { message: msg, status: "success", badge: "Sandbox ✓", detail: "All changes verified clean in the sandbox." };
+      } else if (event.event === "verify_fail") {
+        line = { message: msg, status: "error", badge: "Sandbox ✗", detail: "Errors detected — the Repair Agent will fix them before showing you the diff." };
+      } else if (event.event === "repair_attempt") {
+        line = { message: msg, status: "running", badge: `Repair #${event.attempt ?? ""}`, detail: "Sending error context and code slices to the LLM for targeted fixes." };
+      } else if (event.event === "repair_done") {
+        line = { message: msg, status: "success", badge: "Repair ✓", detail: "All errors resolved. The diffs you are about to review already include the repair fixes." };
+      } else if (event.event === "repair_fail") {
+        line = { message: msg, status: "error", badge: "Repair ✗", detail: "Repair could not resolve all errors — review the diffs carefully before applying." };
+      } else if (event.event === "done") {
+        line = { message: msg, status: "success", badge: "Ready" };
+      } else if (event.event === "error") {
+        line = { message: msg, status: "error", badge: "Error" };
+      } else if (msg) {
+        line = { message: msg, status: "info" };
+      }
+      if (line) appendProgressLine(line);
+    };
+
+    try {
+      await batchSandboxCheckStream(folderPath, sessionIds, onEvent);
+    } catch (error) {
+      appendProgressLine({
+        message: `Sandbox check failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+        status: "error",
+        badge: "Error",
+      });
+    }
+
+    if (collected.length > 0) {
+      appendProgressLine({ message: "", status: "separator" });
+      appendProgressLine({
+        message: `Review ${collected.length} package change${collected.length !== 1 ? "s" : ""}`,
+        status: "info",
+        badge: "Review",
+        detail: "All diffs are shown below. Accept to write to disk.",
+      });
+      setCombinedDiffEntries(
+        collected.map((p) => ({
+          packageName: p.package,
+          fromVersion: p.from_version,
+          toVersion: p.to_version,
+          sessionId: p.session_id,
+          files: p.files,
+        }))
+      );
+    }
+  };
+
+  const handleApplyAll = async () => {
+    if (!combinedDiffEntries) return;
+    setIsApplyingAll(true);
+    try {
+      for (const entry of combinedDiffEntries) {
+        const decisions = Object.fromEntries(
+          entry.files.map((file) => [
+            file.relative_path,
+            {
+              file_decision: "accept",
+              hunks: Object.fromEntries(file.hunks.map((h) => [h.hunk_id, "accept"])),
+            },
+          ])
+        );
+        await applyPreview(entry.sessionId, decisions);
+        const newVersion = entry.toVersion;
+        const pkgName = entry.packageName;
+        onPackagesUpdated?.((prev) =>
+          prev.map((p) => (p.name === pkgName ? { ...p, current_version: newVersion } : p))
+        );
+        appendProgressLine({
+          message: `Applied ${entry.packageName}: ${entry.files.length} file(s)`,
+          status: "success",
+          badge: "Applied",
+        });
+      }
+      setCombinedDiffEntries(null);
+      setRightPanelMode("progress");
+      appendProgressLine({ message: "All packages applied", status: "success", badge: "Done" });
+      void loadFiles();
+      if (selectedFile) void loadContent(selectedFile);
+    } catch (error) {
+      appendProgressLine({
+        message: `Apply failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+        status: "error",
+        badge: "Error",
+      });
+    } finally {
+      setIsApplyingAll(false);
+    }
+  };
+
+  const handleDiscardAll = async () => {
+    if (!combinedDiffEntries) return;
+    for (const entry of combinedDiffEntries) {
+      await discardPreview(entry.sessionId).catch(() => {});
+    }
+    setCombinedDiffEntries(null);
+    setRightPanelMode("progress");
+    appendProgressLine({ message: "All pending changes discarded", status: "info", badge: "Discarded" });
   };
 
   const handlePreviewApplied = (result: ApplyResponse) => {
@@ -497,9 +656,6 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     if (selectedFile) {
       void loadContent(selectedFile);
     }
-    if (isBatchUpdating) {
-      startNextQueuedUpdate();
-    }
   };
 
   const handlePreviewDiscarded = () => {
@@ -511,10 +667,6 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     setRightPanelMode("dependencies");
     if (selectedFile) {
       void loadContent(selectedFile);
-    }
-    if (isBatchUpdating) {
-      setRightPanelMode("progress");
-      startNextQueuedUpdate();
     }
   };
 
@@ -745,7 +897,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
         </aside>
 
         <section className="relative flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-[#101010] lg:border-b-0 lg:border-r">
-          {!previewData && (
+          {!previewData && !combinedDiffEntries && (
             <div className="flex h-10 shrink-0 items-center justify-between border-b bg-card px-3">
               <div className="flex min-w-0 items-center gap-2">
                 <GitCompareArrows className="h-4 w-4 shrink-0" />
@@ -759,7 +911,14 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
             </div>
           )}
 
-          {previewData ? (
+          {combinedDiffEntries ? (
+            <CombinedDiffPanel
+              entries={combinedDiffEntries}
+              onApplyAll={() => void handleApplyAll()}
+              onDiscardAll={() => void handleDiscardAll()}
+              isApplying={isApplyingAll}
+            />
+          ) : previewData ? (
             <>
               {/* Always mounted — hidden when browsing a non-preview file so decision state is preserved */}
               <div className={cn("flex-1 min-h-0 overflow-hidden", !previewFilePaths.has(selectedFile) && "hidden")}>
@@ -913,6 +1072,129 @@ function buildAllAcceptDecisions(preview: PreviewResponse) {
         hunks: Object.fromEntries(file.hunks.map((h) => [h.hunk_id, "accept"])),
       },
     ])
+  );
+}
+
+function CombinedDiffPanel({
+  entries,
+  onApplyAll,
+  onDiscardAll,
+  isApplying,
+}: {
+  entries: CombinedDiffEntry[];
+  onApplyAll: () => void;
+  onDiscardAll: () => void;
+  isApplying: boolean;
+}) {
+  const totalFiles = entries.reduce((sum, e) => sum + e.files.length, 0);
+  const totalAdditions = entries.reduce(
+    (sum, e) => sum + e.files.reduce((s, f) => s + f.additions, 0),
+    0
+  );
+  const totalDeletions = entries.reduce(
+    (sum, e) => sum + e.files.reduce((s, f) => s + f.deletions, 0),
+    0
+  );
+
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      {/* Sticky header */}
+      <div className="flex h-11 shrink-0 items-center justify-between border-b bg-card px-3">
+        <div className="flex items-center gap-3">
+          <GitCompareArrows className="h-4 w-4 shrink-0 text-sky-400" />
+          <span className="text-xs font-semibold text-zinc-100">
+            {entries.length} package{entries.length !== 1 ? "s" : ""}
+          </span>
+          <span className="text-[11px] text-zinc-500">
+            {totalFiles} file{totalFiles !== 1 ? "s" : ""} &nbsp;·&nbsp;
+            <span className="text-emerald-400">+{totalAdditions}</span>
+            {" / "}
+            <span className="text-red-400">−{totalDeletions}</span>
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onDiscardAll}
+            disabled={isApplying}
+            className="inline-flex h-7 items-center gap-1.5 rounded-md border bg-background px-3 text-xs font-semibold text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-50"
+          >
+            <X className="h-3.5 w-3.5" />
+            Discard All
+          </button>
+          <button
+            onClick={onApplyAll}
+            disabled={isApplying}
+            className="inline-flex h-7 items-center gap-1.5 rounded-md bg-emerald-600 px-3 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
+          >
+            {isApplying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+            Apply All
+          </button>
+        </div>
+      </div>
+
+      {/* Scrollable combined diff */}
+      <div className="min-h-0 flex-1 overflow-auto font-mono text-xs leading-5">
+        {entries.map((entry) => (
+          <div key={entry.sessionId}>
+            {/* Package header */}
+            <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-zinc-700 bg-zinc-900/95 px-3 py-2 backdrop-blur">
+              <span className="text-[10px] font-bold uppercase tracking-widest text-sky-400">
+                {entry.packageName}
+              </span>
+              <span className="text-[11px] text-zinc-500">
+                {entry.fromVersion} → {entry.toVersion}
+              </span>
+              <span className="ml-auto text-[10px] text-zinc-600">
+                {entry.files.length} file{entry.files.length !== 1 ? "s" : ""}
+              </span>
+            </div>
+
+            {entry.files.map((file) => (
+              <div key={file.file_path}>
+                {/* File header */}
+                <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-800/60 px-3 py-1.5">
+                  <FileCode2 className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+                  <span className="flex-1 text-zinc-200">{file.relative_path}</span>
+                  <span className="text-emerald-400 text-[11px]">+{file.additions}</span>
+                  <span className="text-red-400 text-[11px]">−{file.deletions}</span>
+                </div>
+
+                {file.hunks.map((hunk) => (
+                  <div key={hunk.hunk_id}>
+                    {/* Hunk header */}
+                    <div className="border-b border-zinc-800 bg-blue-950/30 px-3 py-0.5 text-[11px] text-blue-400">
+                      @@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},{hunk.new_lines} @@
+                    </div>
+                    {hunk.changes.map((change, idx) => (
+                      <div
+                        key={idx}
+                        className={cn(
+                          "flex min-w-max border-l-2 px-0",
+                          change.type === "addition" && "border-emerald-500 bg-emerald-500/10 text-emerald-100",
+                          change.type === "deletion" && "border-red-500 bg-red-500/10 text-red-200",
+                          change.type === "context"  && "border-transparent text-zinc-500"
+                        )}
+                      >
+                        <span className="w-10 select-none pr-2 text-right text-zinc-600">
+                          {change.line_number_old ?? ""}
+                        </span>
+                        <span className="w-10 select-none pr-2 text-right text-zinc-600">
+                          {change.line_number_new ?? ""}
+                        </span>
+                        <span className="w-4 select-none text-center">
+                          {change.type === "addition" ? "+" : change.type === "deletion" ? "-" : " "}
+                        </span>
+                        <code className="flex-1 whitespace-pre pl-1">{change.content || " "}</code>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 

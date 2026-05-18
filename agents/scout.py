@@ -327,6 +327,10 @@ class ScoutAgent:
 
     async def _fetch_text_url(self, client: httpx.AsyncClient, url: str, max_chars: int) -> str:
         try:
+            parsed = urlparse(url)
+            # httpx rejects URLs where the host looks like an invalid IPv6 literal
+            if "[" in parsed.netloc and not parsed.netloc.startswith("["):
+                return ""
             response = await client.get(url, timeout=10.0, follow_redirects=True)
             if response.status_code != 200:
                 return ""
@@ -3248,6 +3252,8 @@ class ScoutAgent:
                     references,
                     api_contexts,
                 )
+        except Exception as exc:
+            logger.warning("Scout run failed for %s: %s — returning empty result", name, exc)
         finally:
             await self._close_router()
         return result

@@ -46,7 +46,9 @@ class FakeRepairAgent:
         }
 
 
-def test_apply_runs_repair_loop_when_verification_fails(tmp_path: Path, monkeypatch):
+def test_apply_writes_files_and_runs_single_check(tmp_path: Path, monkeypatch):
+    """After the refactor, /apply does ONE checker pass (no repair loop).
+    Repair already happened in the preview-stream sandbox."""
     target = tmp_path / "app.py"
     original = "value = 1\n"
     patched = "value = 2\n"
@@ -54,11 +56,8 @@ def test_apply_runs_repair_loop_when_verification_fails(tmp_path: Path, monkeypa
 
     SequenceChecker.calls = 0
     monkeypatch.setattr(api_main, "ProjectChecker", SequenceChecker)
-    monkeypatch.setattr(api_main, "RepairAgent", FakeRepairAgent)
-    monkeypatch.setenv("DEPGUARD_AUTO_REPAIR", "true")
-    monkeypatch.setenv("DEPGUARD_REPAIR_MAX_ATTEMPTS", "1")
 
-    session_id = "preview_test_repair"
+    session_id = "preview_test_apply_simple"
     api_main.PREVIEW_SESSIONS[session_id] = {
         "session_id": session_id,
         "folder_path": str(tmp_path),
@@ -75,8 +74,10 @@ def test_apply_runs_repair_loop_when_verification_fails(tmp_path: Path, monkeypa
         )
     )
 
-    assert response["verification"]["status"] == "passed"
-    assert response["repair"]["status"] == "success"
-    assert response["repair"]["attempts"][0]["status"] == "success"
-    assert response["repair"]["attempts"][0]["files_repaired"] == ["app.py"]
+    # File was written
     assert target.read_text(encoding="utf-8") == patched
+    # Only ONE checker call (no repair loop)
+    assert SequenceChecker.calls == 1
+    # repair is always skipped — it ran in the sandbox during preview
+    assert response["repair"]["status"] == "skipped"
+    assert response["repair"]["attempts"] == []

@@ -154,7 +154,7 @@ export interface ApplyResponse {
 }
 
 export interface PreviewStreamEvent {
-  event: "phase" | "ast_done" | "scout_done" | "patch_file_start" | "patch_file_done" | "info" | "done" | "error" | "breaking_change" | "file_stats";
+  event: "phase" | "ast_done" | "scout_done" | "patch_file_start" | "patch_file_done" | "info" | "done" | "error" | "breaking_change" | "file_stats" | "verify_done" | "verify_fail" | "repair_attempt" | "repair_done" | "repair_fail";
   phase?: string;
   message: string;
   preview?: PreviewResponse;
@@ -170,6 +170,8 @@ export interface PreviewStreamEvent {
   description?: string;
   additions?: number;
   deletions?: number;
+  attempt?: number;
+  files_repaired?: string[];
 }
 
 export async function previewUpdateStream(
@@ -369,4 +371,38 @@ export async function getImpactGraph(folderPath: string, forceRebuild = false): 
     throw new Error(err.detail || 'Failed to fetch impact graph');
   }
   return response.json();
+}
+
+export async function batchSandboxCheckStream(
+  folderPath: string,
+  sessionIds: string[],
+  onEvent: (event: PreviewStreamEvent) => void,
+): Promise<void> {
+  const response = await fetch('/api/batch-sandbox-check-stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder_path: folderPath, session_ids: sessionIds }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || 'Batch sandbox check failed');
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return;
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const event = JSON.parse(line.slice(6)) as PreviewStreamEvent;
+        onEvent(event);
+      } catch { /* ignore malformed frames */ }
+    }
+  }
 }

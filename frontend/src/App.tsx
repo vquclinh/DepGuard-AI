@@ -114,7 +114,7 @@ function App() {
     >
       <header className="border-b bg-card shadow-sm sticky top-0 z-10 shrink-0">
         <div className="container mx-auto px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+          <div className="-ml-6 flex items-center gap-3">
             <DepGuardLogo />
             <div>
               <h1 className="text-xl font-bold tracking-tight">DepGuard AI</h1>
