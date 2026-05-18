@@ -65,12 +65,21 @@ class PatchAgent:
         except ValueError:
             return default
 
+    def _match_line_number(self, match: object) -> int | None:
+        if not isinstance(match, dict):
+            return None
+        line = match.get("line")
+        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+            return None
+        return line
+
     def _get_changed_lines(self, matches: list) -> list[int]:
-        return sorted({
-            match.get("line")
+        lines = {
+            line
             for match in matches
-            if isinstance(match.get("line"), int) and match.get("line") > 0
-        })
+            if (line := self._match_line_number(match)) is not None
+        }
+        return sorted(lines)
 
     def _get_impact_result(self, filepath: str, matches: list):
         if ImpactFinder is None:
@@ -1215,9 +1224,9 @@ class PatchAgent:
             for block in target_blocks
         }
         matched_lines = {
-            int(match.get("line"))
+            line
             for match in matches or []
-            if isinstance(match, dict) and isinstance(match.get("line"), int)
+            if (line := self._match_line_number(match)) is not None
         }
 
         for replacement in replacements:
@@ -1659,13 +1668,9 @@ class PatchAgent:
         start = int(block.get("start_line", 1) or 1)
         end = int(block.get("end_line", start) or start)
         return {
-            int(match.get("line"))
+            line
             for match in matches or []
-            if (
-                isinstance(match, dict)
-                and isinstance(match.get("line"), int)
-                and start <= int(match.get("line")) <= end
-            )
+            if (line := self._match_line_number(match)) is not None and start <= line <= end
         }
 
     def _relevant_call_names_for_block(self, block: dict, matches: list | None) -> set[str]:
@@ -1675,7 +1680,10 @@ class PatchAgent:
 
         call_names: set[str] = set()
         for match in matches or []:
-            if not isinstance(match, dict) or match.get("line") not in matched_lines:
+            if not isinstance(match, dict):
+                continue
+            line = self._match_line_number(match)
+            if line not in matched_lines:
                 continue
             call_names.update(self._api_call_name_variants(str(match.get("old_api", "") or "")))
             call_names.update(self._api_call_name_variants(str(match.get("new_api", "") or "")))
