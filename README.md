@@ -38,7 +38,7 @@ All of this is surfaced through a live-streaming IDE-like UI where you can inspe
 
 ## Architecture
 
-![DepGuard AI Architecture](frontend/src/assets/architecture.svg)
+![DepGuard AI Architecture](frontend/src/assets/architecture.png)
 
 ### Agents
 
