@@ -1180,17 +1180,23 @@ class PatchAgent:
                 break
         return expanded
 
-    def _allowed_keywords_from_breaking_changes(self, scout_context) -> set:
+    def _allowed_keywords_from_breaking_changes(self, scout_context, target_source: str = "") -> set:
         if not scout_context:
             return set()
         allowed: set = set()
         for bc in scout_context.get("breaking_changes", []):
-            for text in [
-                str(bc.get("new_api", "") or ""),
-                str(bc.get("description", "") or ""),
-                *[str(p.get("replacement", "") or "") for p in (bc.get("parameters_changed") or [])],
-            ]:
+            for text in [str(bc.get("new_api", "") or ""), str(bc.get("description", "") or "")]:
                 for token in re.findall(r'\b([a-zA-Z_]\w*)\b', text):
+                    if len(token) > 2:
+                        allowed.add(token.lower())
+            # Only allow replacement tokens for parameters that are actually present in the target code
+            for p in (bc.get("parameters_changed") or []):
+                old_param = str(p.get("old_param", "") or "")
+                if not old_param:
+                    continue
+                if target_source and not re.search(rf'\b{re.escape(old_param)}\s*=', target_source):
+                    continue
+                for token in re.findall(r'\b([a-zA-Z_]\w*)\b', str(p.get("replacement", "") or "")):
                     if len(token) > 2:
                         allowed.add(token.lower())
         return allowed
@@ -1499,7 +1505,8 @@ class PatchAgent:
             (block["start_line"], block["end_line"]): block
             for block in target_blocks
         }
-        allowed_from_new_api = self._allowed_keywords_from_breaking_changes(scout_context)
+        target_source = "\n".join(str(b.get("source", "") or "") for b in target_blocks)
+        allowed_from_new_api = self._allowed_keywords_from_breaking_changes(scout_context, target_source)
         undocumented = set()
         for replacement in replacements:
             block = blocks_by_range.get((replacement["start_line"], replacement["end_line"]))
