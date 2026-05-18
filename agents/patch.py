@@ -1596,6 +1596,81 @@ class PatchAgent:
             or scout_context.get("migration_review_fallback")
         )
 
+
+    def _strip_kwarg_from_source(self, source: str, kwarg: str) -> str:
+        """Remove kwarg=<value> from every function/decorator call in source.
+
+        Handles the three positions a kwarg can occupy:
+          foo(a, kwarg=val, b)  ->  foo(a, b)
+          foo(kwarg=val, b)     ->  foo(b)
+          foo(a, kwarg=val)     ->  foo(a)
+          foo(kwarg=val)        ->  foo()
+        Value is matched as a simple token (name, dotted name, string literal,
+        or boolean/None) so nested-call values are left untouched rather than
+        mangled.
+        """
+        # Match simple values: True/False/None, quoted strings, dotted names
+        val_pat = r"""(?:"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|[\w.]+)"""
+        escaped = re.escape(kwarg)
+        # trailing comma form: kwarg=val, (possibly followed by space)
+        source = re.sub(rf"\b{escaped}\s*=\s*{val_pat}\s*,\s*", "", source)
+        # leading comma form: , kwarg=val
+        source = re.sub(rf",\s*\b{escaped}\s*=\s*{val_pat}", "", source)
+        # standalone form: kwarg=val (no surrounding commas left)
+        source = re.sub(rf"\b{escaped}\s*=\s*{val_pat}", "", source)
+        return source
+
+    def _prune_deprecated_kwargs(
+        self,
+        replacements: list[dict],
+        target_blocks: list[dict],
+        scout_context: dict | None,
+    ) -> list[dict]:
+        """Deterministically strip kwargs listed in parameters_changed.
+
+        Runs before any validator so that even if the LLM keeps a deprecated
+        kwarg, the Python backend removes it first.  Only strips a kwarg when
+        the corresponding old_param= was actually present in the original target
+        block, so the cleaner never touches unrelated code.
+        """
+        if not replacements or not scout_context:
+            return replacements
+
+        blocks_by_range = {
+            (b["start_line"], b["end_line"]): b
+            for b in target_blocks
+        }
+        deprecated_params: list[str] = []
+        for bc in scout_context.get("breaking_changes", []):
+            for p in (bc.get("parameters_changed") or []):
+                old_param = str(p.get("old_param", "") or "").strip()
+                if old_param and old_param not in deprecated_params:
+                    deprecated_params.append(old_param)
+
+        if not deprecated_params:
+            return replacements
+
+        pruned = []
+        for repl in replacements:
+            block = blocks_by_range.get((repl["start_line"], repl["end_line"]))
+            block_source = str(block.get("source", "") or "") if block else ""
+            repl_text = str(repl.get("replacement", "") or "")
+
+            for old_param in deprecated_params:
+                # Only clean if the kwarg was actually in the original block
+                if not re.search(rf"\b{re.escape(old_param)}\s*=", block_source):
+                    continue
+                cleaned = self._strip_kwarg_from_source(repl_text, old_param)
+                if cleaned != repl_text:
+                    logger.debug(
+                        "Pruned deprecated kwarg '%s=' from replacement (line %s-%s)",
+                        old_param, repl.get("start_line"), repl.get("end_line"),
+                    )
+                    repl_text = cleaned
+
+            pruned.append({**repl, "replacement": repl_text})
+        return pruned
+
     def _patch_response_to_full_file(
         self,
         response_text: str,
@@ -1605,6 +1680,7 @@ class PatchAgent:
         matches: list | None = None,
     ) -> str:
         replacements = self._parse_replacements(response_text)
+        replacements = self._prune_deprecated_kwargs(replacements, target_blocks, scout_context)
         self._validate_replacements_preserve_unchanged_code(
             replacements,
             target_blocks,
