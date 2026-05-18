@@ -1527,6 +1527,30 @@ class PatchAgent:
                 f"{names}. Only add keyword arguments that appear in Scout evidence."
             )
 
+        # Also check that parameters_changed[].old_param were actually removed from the call
+        for bc in scout_context.get("breaking_changes", []):
+            for p in (bc.get("parameters_changed") or []):
+                old_param = str(p.get("old_param", "") or "")
+                if not old_param:
+                    continue
+                for replacement in replacements:
+                    block = blocks_by_range.get((replacement["start_line"], replacement["end_line"]))
+                    if not block:
+                        continue
+                    block_source = str(block.get("source", "") or "")
+                    repl_source = str(replacement.get("replacement", "") or "")
+                    param_present_in_original = re.search(rf'\b{re.escape(old_param)}\s*=', block_source)
+                    param_still_in_replacement = re.search(rf'\b{re.escape(old_param)}\s*=', repl_source)
+                    if param_present_in_original and param_still_in_replacement:
+                        workaround = str(p.get("replacement", "") or "nothing")
+                        raise PatchResponseError(
+                            f"Replacement still contains deprecated keyword argument '{old_param}='. "
+                            f"This argument was removed in the new version. "
+                            f"Remove it from the call"
+                            + (f" and use '{workaround}' instead" if workaround and workaround != "nothing" else "")
+                            + "."
+                        )
+
     def _bare_call_names(self, source: str) -> set[str]:
         try:
             tree = ast.parse(textwrap.dedent(source or ""))
