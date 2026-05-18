@@ -296,7 +296,7 @@ class PatchAgent:
                 **bc,
                 "parameters_changed": [
                     p for p in (bc.get("parameters_changed") or [])
-                    if re.search(rf'\\b{re.escape(str(p.get("old_param", "") or ""))}\\s*=', target_source)
+                    if re.search(rf'\b{re.escape(str(p.get("old_param", "") or ""))}\s*=', target_source)
                 ] or None,
             }
             for bc in scout_context.get("breaking_changes", [])[:16]
