@@ -354,7 +354,7 @@ class PatchAgent:
             "Example: if replacing engine.execute(\"SELECT 1\") with connection.execute(text(\"SELECT 1\")) and top-level imports are blocked, write `def get_user_count(db_url):\\n    from sqlalchemy import text\\n    ...`.\n"
             "IMPORTANT — when renaming a decorator or function call, also migrate its keyword arguments if they changed in the new version. "
             "Do not carry forward keyword arguments that no longer exist in the new API — they will cause a TypeError at runtime. "
-            "Check the DepGuard API Evidence replacement examples for the correct new signature.\n"
+            "Check the Breaking Changes description field for 'Note: <kwarg> argument removed' hints, and check the DepGuard API Evidence replacement examples for the correct new signature without deprecated kwargs.\n"
             "IMPORTANT — never insert a bare `import` or `from X import Y` statement at an indented level (inside a function or class body). "
             "If a new import is needed and the module-level import block is outside the target range, either (a) add a local import at the start of the enclosing function body, or (b) if the symbol is already imported at module level per the Import Context, do not add it again.\n"
             "If you migrate an API call that binds its return value to a variable, and evidence or the package migration context shows the library shifted from dictionaries to Pydantic/object models, audit the entire target block for downstream uses of that variable and convert dictionary lookups like `response['choices'][0]['message']['content']` into attribute access like `response.choices[0].message.content`.\n"

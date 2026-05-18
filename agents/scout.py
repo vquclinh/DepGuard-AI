@@ -2744,6 +2744,13 @@ class ScoutAgent:
             If a referenced change needs review but no replacement is documented, leave new_api empty and explain why.
             Do not report an API as removed, renamed, or changed unless an evidence chunk directly names that API, its matched code alias, or a documented old/new API pair for it.
             Do not convert broad compatibility notes into removals for ordinary still-valid APIs.
+
+            IMPORTANT — keyword argument and parameter changes:
+            When an evidence chunk documents that a keyword argument or parameter was removed, renamed, or deprecated (e.g. "always=True is no longer supported", "use validate_default instead of always"), you MUST:
+            1. Include the kwarg migration detail in the description of the related breaking_changes entry. Format: "Note: <old_kwarg>=<value> argument removed; use <replacement> instead."
+            2. Set api_evidence.replacement to a COMPLETE code example of the new call — NEVER include the deprecated/removed kwargs in the replacement example.
+            For example, if evidence says "@validator(always=True) is deprecated and validate_default=True in Field() should be used instead", the breaking_change for pydantic.validator must have description: "@validator renamed to @field_validator. Note: always=True argument removed; use Field(validate_default=True) on the field definition instead." And the api_evidence replacement must NOT include always=True.
+
             Return a JSON object with this exact structure:
             {{
             "breaking_changes": [
@@ -2751,14 +2758,14 @@ class ScoutAgent:
                 "type": "removed|renamed|changed_signature",
                 "old_api": "fully qualified or clear name",
                 "new_api": "new name or workaround if applicable",
-                "description": "short description"
+                "description": "migration description — MUST include any keyword arguments that were removed/renamed and their replacements (format: 'Note: <kwarg> argument removed; use <replacement> instead.')"
                 }}
             ],
             "api_evidence": [
                 {{
                 "api": "API affected",
                 "change_type": "removed|renamed|changed_signature|behavior_change|migration_review",
-                "replacement": "replacement/workaround or empty string",
+                "replacement": "COMPLETE code example of the new call with correct kwargs — NEVER include deprecated/removed kwargs in this example",
                 "confidence": "high|medium|low",
                 "evidence": [
                     {{
