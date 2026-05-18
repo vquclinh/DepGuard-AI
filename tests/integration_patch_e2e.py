@@ -735,7 +735,7 @@ PATCH_CASES: list[PatchTestCase] = [
                     age: int
                     email: str
 
-                    @validator('age')
+                    @validator('age', always=True)
                     @classmethod
                     def validate_age(cls, v):
                         if v < 0 or v > 150:
@@ -769,7 +769,7 @@ PATCH_CASES: list[PatchTestCase] = [
                     from pydantic import BaseModel, validator
 
                     class UserProfile(BaseModel):
-                        @validator('age')
+                        @validator('age', always=True)
                         @classmethod
                         def validate_age(cls, v):
                             if v < 0 or v > 150:
@@ -781,6 +781,7 @@ PATCH_CASES: list[PatchTestCase] = [
         assertions={
             "models/user.py": [
                 ("field_validator", True),
+                ("always=True", False),  # always= kwarg must be removed in pydantic v2
             ],
         },
     ),
