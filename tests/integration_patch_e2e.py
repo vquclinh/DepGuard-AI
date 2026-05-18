@@ -147,7 +147,12 @@ PATCH_CASES: list[PatchTestCase] = [
                     "type": "renamed",
                     "old_api": "pydantic.validator",
                     "new_api": "pydantic.field_validator",
-                    "description": "@validator decorator has been deprecated in Pydantic V2 and should be replaced with @field_validator. The new decorator requires @classmethod and uses mode= instead of always=.",
+                    "description": "@validator decorator has been deprecated in Pydantic V2 and should be replaced with @field_validator. The new decorator requires @classmethod.",
+                    "parameters_changed": [
+                        {"old_param": "always", "replacement": "Field(validate_default=True)"},
+                        {"old_param": "pre", "replacement": "mode='before'"},
+                        {"old_param": "each_item", "replacement": ""},
+                    ],
                 }
             ],
             "api_evidence": [

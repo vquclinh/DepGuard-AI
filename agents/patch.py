@@ -1168,10 +1168,14 @@ class PatchAgent:
             return set()
         allowed: set = set()
         for bc in scout_context.get("breaking_changes", []):
-            new_api = str(bc.get("new_api", "") or "")
-            for token in re.findall(r'\b([a-zA-Z_]\w*)\b', new_api):
-                if len(token) > 2:
-                    allowed.add(token.lower())
+            for text in [
+                str(bc.get("new_api", "") or ""),
+                str(bc.get("description", "") or ""),
+                *[str(p.get("replacement", "") or "") for p in (bc.get("parameters_changed") or [])],
+            ]:
+                for token in re.findall(r'\b([a-zA-Z_]\w*)\b', text):
+                    if len(token) > 2:
+                        allowed.add(token.lower())
         return allowed
 
     def _validate_replacements_preserve_unchanged_code(
