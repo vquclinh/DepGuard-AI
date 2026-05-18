@@ -1,15 +1,8 @@
-import { Activity, Code2, FolderSearch } from "lucide-react";
+import { Code2, FolderSearch } from "lucide-react";
 import { HealthScore } from "@/components/HealthScore";
 import { PackagesTable, type PackageData } from "@/components/PackagesTable";
 import { ProjectDependencyGraph } from "@/components/ProjectDependencyGraph";
 import { UpdateLog, type LogEntry } from "@/components/UpdateLog";
-
-export interface ScanProgress {
-  phase: string;
-  message?: string;
-  package?: string;
-  total_packages?: number;
-}
 
 export interface HealthData {
   score: number;
@@ -20,7 +13,6 @@ interface DashboardViewProps {
   folderPath: string;
   setFolderPath: (path: string) => void;
   isScanning: boolean;
-  scanProgress: ScanProgress | null;
   healthData: HealthData | null;
   packages: PackageData[];
   logs: LogEntry[];
@@ -34,7 +26,6 @@ export function DashboardView({
   folderPath,
   setFolderPath,
   isScanning,
-  scanProgress,
   healthData,
   packages,
   logs,
@@ -87,31 +78,6 @@ export function DashboardView({
           </button>
         </div>
 
-        {isScanning && scanProgress && (
-          <div className="mt-6 border-t border-border/50 pt-6 duration-300 animate-in fade-in slide-in-from-top-2">
-            <div className="mb-2 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Activity className="h-4 w-4 animate-pulse text-primary" />
-                <span className="text-sm font-semibold">{scanProgress.phase}</span>
-              </div>
-              {scanProgress.total_packages && (
-                <span className="font-mono text-xs text-muted-foreground">
-                  Total Packages: {scanProgress.total_packages}
-                </span>
-              )}
-            </div>
-            {scanProgress.message && (
-              <p className="truncate rounded border border-border/40 bg-muted/30 px-3 py-1.5 font-mono text-sm text-muted-foreground">
-                {scanProgress.message}
-              </p>
-            )}
-            {scanProgress.package && (
-              <p className="truncate rounded border border-border/40 bg-muted/30 px-3 py-1.5 font-mono text-sm text-muted-foreground">
-                Analyzing: <span className="text-foreground">{scanProgress.package}</span>
-              </p>
-            )}
-          </div>
-        )}
       </section>
 
       <div className="grid gap-4 lg:grid-cols-[1fr_320px]">

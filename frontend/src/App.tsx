@@ -3,7 +3,7 @@ import { ShieldCheck, Activity } from "lucide-react";
 import { scanProjectStream, getProviders, browseProject } from "@/hooks/useDepGuard";
 import type { PackageData } from "@/components/PackagesTable";
 import type { LogEntry } from "@/components/UpdateLog";
-import { DashboardView, type HealthData, type ScanProgress } from "@/components/DashboardView";
+import { DashboardView, type HealthData } from "@/components/DashboardView";
 import { IdeWorkspaceView } from "@/components/IdeWorkspaceView";
 import { cn } from "@/lib/utils";
 
@@ -14,7 +14,6 @@ function App() {
   const [folderPath, setFolderPath] = useState("/mnt/vquclinh/PROJECT-CMAKE/DEPGUARD-AI/DepGuard-AI");
   const [isScanning, setIsScanning] = useState(false);
   const [providerStatuses, setProviderStatuses] = useState<any[]>([]);
-  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   
   const [healthData, setHealthData] = useState<HealthData | null>(null);
   
@@ -46,7 +45,6 @@ function App() {
   const resetProjectScanState = () => {
     setHealthData(null);
     setPackages([]);
-    setScanProgress(null);
     setIsScanning(false);
   };
 
@@ -73,7 +71,6 @@ function App() {
     if (!folderPath) return;
     
     setIsScanning(true);
-    setScanProgress({ phase: "Initializing..." });
     addLog(`Initiating scan for: ${folderPath}`, "info");
     
     scanProjectStream(
@@ -94,15 +91,15 @@ function App() {
           setPackages(data.packages);
           addLog(`Scan complete. Found ${data.total_packages} packages.`, "success");
           setIsScanning(false);
-          setScanProgress(null);
         } else {
-          setScanProgress(data);
+          // Route every phase/message to the activity log instead of an inline block
+          if (data.phase) addLog(data.phase, "info");
+          if (data.message) addLog(data.message, "info");
         }
       },
       (error) => {
         addLog(`Scan failed: ${error}`, "error");
         setIsScanning(false);
-        setScanProgress(null);
       }
     );
   };
@@ -166,7 +163,6 @@ function App() {
             folderPath={folderPath}
             setFolderPath={handleFolderPathChange}
             isScanning={isScanning}
-            scanProgress={scanProgress}
             healthData={healthData}
             packages={packages}
             logs={logs}
@@ -191,6 +187,7 @@ function App() {
             packages={packages}
             onLog={addLog}
             onBack={() => setViewMode("dashboard")}
+            onPackagesUpdated={(updater) => setPackages(updater)}
           />
         </div>
       </div>

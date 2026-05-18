@@ -150,10 +150,11 @@ export interface ApplyResponse {
   dependency_file_updated: string;
   verification?: VerificationReport | null;
   repair?: RepairReport | null;
+  checkpoint_id?: string;
 }
 
 export interface PreviewStreamEvent {
-  event: "phase" | "ast_done" | "scout_done" | "patch_file_start" | "patch_file_done" | "info" | "done" | "error";
+  event: "phase" | "ast_done" | "scout_done" | "patch_file_start" | "patch_file_done" | "info" | "done" | "error" | "breaking_change" | "file_stats";
   phase?: string;
   message: string;
   preview?: PreviewResponse;

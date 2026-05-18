@@ -646,6 +646,21 @@ async def preview_update_stream(req: UpdateRequest):
                         "message": f"Identified {bc_count} breaking change(s)",
                         "breaking_changes_count": bc_count})
 
+            # Emit individual breaking change summaries (up to 6)
+            for bc in scout_output.get("breaking_changes", [])[:6]:
+                old_api = str(bc.get("old_api", "") or "").strip()
+                new_api = str(bc.get("new_api", "") or "").strip()
+                desc    = str(bc.get("description", "") or "").strip()
+                if old_api and new_api:
+                    label = f"{old_api} → {new_api}"
+                elif old_api:
+                    label = old_api
+                elif desc:
+                    label = desc[:70]
+                else:
+                    continue
+                yield _sse({"event": "breaking_change", "message": label[:80]})
+
             # ── Dependency file diff ───────────────────────────────────────
             files_original: dict[str, str] = {}
             files_patched:  dict[str, str] = {}
@@ -654,6 +669,8 @@ async def preview_update_stream(req: UpdateRequest):
             if dep_original != dep_patched:
                 files_original[dep_relative] = dep_original
                 files_patched[dep_relative]  = dep_patched
+                yield _sse({"event": "info",
+                            "message": f"Version pin: {package} {from_v} → {to_v} in {dep_relative}"})
 
             # ── Phase 3: Patch generation ──────────────────────────────────
             if ast_output.get("matches_by_file"):
@@ -697,11 +714,19 @@ async def preview_update_stream(req: UpdateRequest):
                         if fp.get("status") != "success":
                             continue
                         rel = _relative_path(folder_path, fp.get("file", ""))
-                        orig   = fp.get("original", "")
+                        orig    = fp.get("original", "")
                         patched = fp.get("patched", orig)
                         if orig != patched:
                             files_original[rel] = orig
                             files_patched[rel]  = patched
+                            diffs = list(difflib.ndiff(orig.splitlines(), patched.splitlines()))
+                            adds  = sum(1 for ln in diffs if ln.startswith("+ "))
+                            dels  = sum(1 for ln in diffs if ln.startswith("- "))
+                            yield _sse({"event": "file_stats",
+                                        "message": f"{rel}  +{adds}/−{dels}",
+                                        "file": fp.get("file"),
+                                        "additions": adds,
+                                        "deletions": dels})
             else:
                 yield _sse({"event": "info", "phase": "patch",
                             "message": "No code changes needed — only updating the version pin."})
@@ -748,6 +773,21 @@ def apply_preview(req: ApplyPreviewRequest):
     dependency_file_updated = ""
 
     try:
+        # Create a git checkpoint before touching any files so users can undo
+        package_name = session.get("package_info", {}).get("name", "unknown")
+        checkpoint_id = f"depguard_checkpoint_{uuid.uuid4().hex[:8]}"
+        checkpoint_made = False
+        try:
+            subprocess.run(["git", "add", "."], capture_output=True, check=False, cwd=str(folder_path))
+            res = subprocess.run(
+                ["git", "commit", "-m",
+                 f"depguard: checkpoint before patching {package_name} {checkpoint_id}"],
+                capture_output=True, check=False, cwd=str(folder_path)
+            )
+            checkpoint_made = res.returncode == 0
+        except Exception:
+            pass
+
         for relative_path, original in session["files_original"].items():
             patched = session["files_patched"].get(relative_path, original)
             file_decision = req.decisions.get(relative_path, {})
@@ -825,6 +865,7 @@ def apply_preview(req: ApplyPreviewRequest):
             "dependency_file_updated": dependency_file_updated,
             "verification": verification,
             "repair": repair,
+            "checkpoint_id": checkpoint_id if checkpoint_made else "",
         }
     except Exception as e:
         logger.error(f"Error applying preview: {e}")

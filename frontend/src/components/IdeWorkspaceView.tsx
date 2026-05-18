@@ -17,9 +17,12 @@ import {
 } from "lucide-react";
 import { type PackageData } from "@/components/PackagesTable";
 import {
+  applyPreview,
+  discardPreview,
   getFileContent,
   getProjectFiles,
   previewUpdateStream,
+  rollbackPackage,
   type ApplyResponse,
   type ChangedFile,
   type PreviewResponse,
@@ -28,7 +31,6 @@ import {
 } from "@/hooks/useDepGuard";
 import { cn } from "@/lib/utils";
 import {
-  DiffReviewActivityPanel,
   DiffReviewPanel,
   type DiffReviewActivityState,
 } from "@/components/DiffReviewPanel";
@@ -38,6 +40,7 @@ interface IdeWorkspaceViewProps {
   packages: PackageData[];
   onBack: () => void;
   onLog: (message: string, type: "info" | "success" | "error") => void;
+  onPackagesUpdated?: (updater: (prev: PackageData[]) => PackageData[]) => void;
 }
 
 type DiffLine = {
@@ -50,7 +53,7 @@ type DiffLine = {
 type StreamLine = {
   id: number;
   message: string;
-  status: "running" | "success" | "error" | "info" | "sub";
+  status: "running" | "success" | "error" | "info" | "sub" | "separator" | "header";
 };
 
 type ExplorerNode = {
@@ -61,7 +64,7 @@ type ExplorerNode = {
   file?: ProjectFile;
 };
 
-export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWorkspaceViewProps) {
+export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackagesUpdated }: IdeWorkspaceViewProps) {
   const [files, setFiles] = useState<ProjectFile[]>([]);
   const [fileQuery, setFileQuery] = useState("");
   const [selectedFile, setSelectedFile] = useState("");
@@ -77,6 +80,10 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
   const [previewActiveFile, setPreviewActiveFile] = useState("");
   const [reviewActivity, setReviewActivity] = useState<DiffReviewActivityState | null>(null);
   const [streamLines, setStreamLines] = useState<StreamLine[]>([]);
+  const [pendingUpdatePkg, setPendingUpdatePkg] = useState<PackageData | null>(null);
+  const [isApplyingForModal, setIsApplyingForModal] = useState(false);
+  const [lastCheckpointId, setLastCheckpointId] = useState("");
+  const [isRollingBack, setIsRollingBack] = useState(false);
   const [rightPanelMode, setRightPanelMode] = useState<"dependencies" | "progress">("dependencies");
 
   const resetWorkspaceState = () => {
@@ -166,11 +173,17 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
     setUpdatingPackage(pkg.name);
     setRightPanelMode("progress");
     setReviewActivity(null);
-    setStreamLines([]);
     onLog(`Preparing IDE preview for ${pkg.name}.`, "info");
 
     const appendLine = (line: Omit<StreamLine, "id">) =>
       setStreamLines((prev) => [...prev, { ...line, id: prev.length }]);
+
+    // Append a visual separator + header instead of clearing the log
+    setStreamLines((prev) => [
+      ...prev,
+      ...(prev.length > 0 ? [{ id: prev.length, message: "", status: "separator" as const }] : []),
+      { id: prev.length + (prev.length > 0 ? 1 : 0), message: pkg.name, status: "header" as const },
+    ]);
 
     const onEvent = (event: PreviewStreamEvent) => {
       if (event.event === "patch_file_start") return;
@@ -181,6 +194,8 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
         appendLine({ message: msg, status: "success" });
       } else if (event.event === "patch_file_done") {
         appendLine({ message: msg, status: event.success ? "sub" : "error" });
+      } else if (event.event === "breaking_change" || event.event === "file_stats") {
+        appendLine({ message: msg, status: "sub" });
       } else if (event.event === "error") {
         appendLine({ message: msg, status: "error" });
       } else {
@@ -217,11 +232,43 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
     } else if (result.verification?.status === "failed") {
       onLog(`Checker still reports errors for ${previewPackageName}. Review the pipeline output.`, "error");
     }
+
+    // Append apply result to the persistent log
+    const accepted = result.files_accepted.length;
+    const rejected = result.files_rejected.length;
+    setStreamLines((prev) => [
+      ...prev,
+      { id: prev.length,     message: `Applied — ${accepted} accepted, ${rejected} rejected`, status: "success" as const },
+      ...(result.verification?.status === "passed"
+        ? [{ id: prev.length + 1, message: "Project checker passed ✓", status: "success" as const }]
+        : result.verification?.status === "failed"
+        ? [{ id: prev.length + 1, message: `Checker: ${result.verification.message ?? "errors found"}`, status: "error" as const }]
+        : []),
+      ...(result.repair?.status === "success"
+        ? [{ id: prev.length + 2, message: "Repair Agent fixed remaining issues ✓", status: "success" as const }]
+        : []),
+    ]);
+
+    if (result.checkpoint_id) setLastCheckpointId(result.checkpoint_id);
+
+    // Immediately update the version in the packages list so the dashboard reflects the change
+    if (result.files_accepted.length > 0 && previewData) {
+      const newVersion = previewData.to_version;
+      const pkgName = previewPackageName;
+      onPackagesUpdated?.((prev) =>
+        prev.map((p) =>
+          p.name === pkgName
+            ? { ...p, current_version: newVersion }
+            : p
+        )
+      );
+    }
+
     setPreviewData(null);
     setPreviewPackageName("");
     setPreviewActiveFile("");
     setReviewActivity(null);
-    setRightPanelMode("dependencies");
+    setRightPanelMode("progress");
     void loadFiles();
     if (selectedFile) {
       void loadContent(selectedFile);
@@ -237,6 +284,82 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
     setRightPanelMode("dependencies");
     if (selectedFile) {
       void loadContent(selectedFile);
+    }
+  };
+
+  const handleRollback = async () => {
+    if (!lastCheckpointId || isRollingBack) return;
+    setIsRollingBack(true);
+    setStreamLines((prev) => [
+      ...prev,
+      { id: prev.length, message: `Rolling back to checkpoint ${lastCheckpointId}…`, status: "running" as const },
+    ]);
+    try {
+      await rollbackPackage(lastCheckpointId, folderPath);
+      setLastCheckpointId("");
+      setStreamLines((prev) => [
+        ...prev,
+        { id: prev.length, message: "Rollback successful — code restored", status: "success" as const },
+      ]);
+      onLog("Rollback successful.", "success");
+      void loadFiles();
+      if (selectedFile) void loadContent(selectedFile);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Rollback failed";
+      setStreamLines((prev) => [
+        ...prev,
+        { id: prev.length, message: `Rollback failed: ${msg}`, status: "error" as const },
+      ]);
+      onLog(`Rollback failed: ${msg}`, "error");
+    } finally {
+      setIsRollingBack(false);
+    }
+  };
+
+  const requestUpdate = (pkg: PackageData) => {
+    if (previewData && !pendingUpdatePkg) {
+      setPendingUpdatePkg(pkg);
+      setRightPanelMode("progress");
+      return;
+    }
+    void handleUpdate(pkg);
+  };
+
+  const handleModalApplyAndContinue = async () => {
+    if (!previewData || !pendingUpdatePkg) return;
+    setIsApplyingForModal(true);
+    try {
+      await applyPreview(previewData.session_id, buildAllAcceptDecisions(previewData));
+      setPreviewData(null);
+      setPreviewPackageName("");
+      setPreviewActiveFile("");
+      setReviewActivity(null);
+      const pkg = pendingUpdatePkg;
+      setPendingUpdatePkg(null);
+      void handleUpdate(pkg);
+    } catch (error) {
+      onLog(`Error applying preview: ${error instanceof Error ? error.message : "Unknown error"}`, "error");
+    } finally {
+      setIsApplyingForModal(false);
+    }
+  };
+
+  const handleModalDiscard = async () => {
+    if (!previewData || !pendingUpdatePkg) return;
+    setIsApplyingForModal(true);
+    try {
+      await discardPreview(previewData.session_id);
+      setPreviewData(null);
+      setPreviewPackageName("");
+      setPreviewActiveFile("");
+      setReviewActivity(null);
+      const pkg = pendingUpdatePkg;
+      setPendingUpdatePkg(null);
+      void handleUpdate(pkg);
+    } catch (error) {
+      onLog(`Error discarding preview: ${error instanceof Error ? error.message : "Unknown error"}`, "error");
+    } finally {
+      setIsApplyingForModal(false);
     }
   };
 
@@ -370,6 +493,17 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
                   onApplied={handlePreviewApplied}
                   onDiscarded={handlePreviewDiscarded}
                   onError={(message) => onLog(message, "error")}
+                  onDecision={(file, scope, decision) => {
+                    const shortFile = file.split("/").pop() ?? file;
+                    const label = scope === "file"
+                      ? `${decision === "accepted" ? "Accepted" : "Rejected"} all hunks — ${shortFile}`
+                      : `Hunk ${decision === "accepted" ? "accepted" : "rejected"} in ${shortFile}`;
+                    setStreamLines((prev) => [
+                      ...prev,
+                      { id: prev.length, message: label, status: (decision === "accepted" ? "sub" : "error") as const },
+                    ]);
+                    setRightPanelMode("progress");
+                  }}
                 />
               </div>
               {/* Regular file view while preview is active */}
@@ -453,45 +587,125 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
             </div>
           </div>
           {rightPanelMode === "progress" ? (
-            updatingPackage && !previewData ? (
-              <StreamingProgressPanel lines={streamLines} packageName={updatingPackage} />
-            ) : (
-              <DiffReviewActivityPanel activity={reviewActivity} />
-            )
+            <StreamingProgressPanel
+              lines={streamLines}
+              packageName={updatingPackage || previewPackageName}
+              isStreaming={Boolean(updatingPackage)}
+              pendingPackage={pendingUpdatePkg && previewData ? pendingUpdatePkg.name : undefined}
+              currentPackage={previewPackageName}
+              isApplyingForPending={isApplyingForModal}
+              onApplyAndContinue={() => void handleModalApplyAndContinue()}
+              onDiscard={() => void handleModalDiscard()}
+              onCancel={() => setPendingUpdatePkg(null)}
+              checkpointId={lastCheckpointId}
+              isRollingBack={isRollingBack}
+              onRollback={() => void handleRollback()}
+            />
           ) : (
             <DependenciesPanel
               packages={packages}
               updatingPackage={updatingPackage}
-              onUpdate={(pkg) => void handleUpdate(pkg)}
+              onUpdate={requestUpdate}
             />
           )}
         </aside>
       </div>
+
     </main>
   );
 }
 
-function StreamingProgressPanel({ lines, packageName }: { lines: StreamLine[]; packageName: string }) {
+function buildAllAcceptDecisions(preview: PreviewResponse) {
+  return Object.fromEntries(
+    preview.files.map((file) => [
+      file.relative_path,
+      {
+        file_decision: "accept",
+        hunks: Object.fromEntries(file.hunks.map((h) => [h.hunk_id, "accept"])),
+      },
+    ])
+  );
+}
+
+function StreamingProgressPanel({
+  lines,
+  packageName,
+  isStreaming,
+  pendingPackage,
+  currentPackage,
+  isApplyingForPending,
+  onApplyAndContinue,
+  onDiscard,
+  onCancel,
+  checkpointId,
+  isRollingBack,
+  onRollback,
+}: {
+  lines: StreamLine[];
+  packageName: string;
+  isStreaming: boolean;
+  pendingPackage?: string;
+  currentPackage?: string;
+  isApplyingForPending?: boolean;
+  onApplyAndContinue?: () => void;
+  onDiscard?: () => void;
+  onCancel?: () => void;
+  checkpointId?: string;
+  isRollingBack?: boolean;
+  onRollback?: () => void;
+}) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [lines.length]);
+  }, [lines.length, pendingPackage]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex h-9 shrink-0 items-center gap-2 border-b px-3">
-        <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-400" />
-        <span className="text-xs font-semibold text-zinc-200">Preparing — {packageName}</span>
+        {isStreaming
+          ? <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-400" />
+          : pendingPackage
+          ? <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
+          : <span className="text-emerald-400">✓</span>
+        }
+        <span className="text-xs font-semibold text-zinc-200">
+          {isStreaming ? "Preparing" : pendingPackage ? "Action required" : "Preview ready"}
+          {packageName ? ` — ${packageName}` : ""}
+        </span>
+        {checkpointId && !isStreaming && !pendingPackage && (
+          <button
+            onClick={onRollback}
+            disabled={isRollingBack}
+            title="Undo applied changes and restore code to before this update"
+            className="ml-auto inline-flex h-6 items-center gap-1 rounded border border-zinc-600 bg-zinc-800 px-2 text-[10px] font-semibold text-zinc-300 transition hover:border-red-500/60 hover:bg-red-950/40 hover:text-red-300 disabled:opacity-50"
+          >
+            {isRollingBack
+              ? <Loader2 className="h-3 w-3 animate-spin" />
+              : <X className="h-3 w-3" />
+            }
+            Undo
+          </button>
+        )}
       </div>
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto p-3 font-mono text-xs">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto p-3 pb-6 font-mono text-xs">
         <div className="space-y-1">
           {lines.length === 0 && (
             <p className="text-zinc-500">Starting pipeline…</p>
           )}
           {lines.map((line, idx) => {
-            const isActiveLast = line.status === "running" && idx === lines.length - 1;
+            if (line.status === "separator") {
+              return <div key={line.id} className="my-2 border-t border-zinc-800" />;
+            }
+            if (line.status === "header") {
+              return (
+                <div key={line.id} className="mb-1 flex items-center gap-2 pt-1">
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-sky-400">{line.message}</span>
+                </div>
+              );
+            }
+            const isActiveLast = line.status === "running" && idx === lines.length - 1 && !pendingPackage;
             return (
               <div key={line.id} className={cn("flex items-start gap-2", line.status === "sub" && "pl-4")}>
                 <span className="mt-px shrink-0 w-4 text-center">
@@ -515,6 +729,53 @@ function StreamingProgressPanel({ lines, packageName }: { lines: StreamLine[]; p
             );
           })}
         </div>
+
+        {/* Inline confirmation — plain terminal text, no box/border */}
+        {pendingPackage && (
+          <div className="mt-1 space-y-0.5">
+            <div className="flex items-start gap-2">
+              <span className="mt-px shrink-0 w-4 text-center">
+                <AlertTriangle className="h-3 w-3 text-amber-400" />
+              </span>
+              <span className="min-w-0 break-all leading-5 text-amber-200">
+                Unsaved preview for <span className="font-semibold">{currentPackage}</span> — starting{" "}
+                <span className="font-semibold">{pendingPackage}</span> will replace it.
+              </span>
+            </div>
+            <div className="flex items-center gap-0 pl-6 leading-5 text-zinc-500">
+              <span>[</span>
+              <button
+                onClick={onApplyAndContinue}
+                disabled={isApplyingForPending}
+                className="inline-flex items-center gap-1 px-0.5 text-zinc-400 transition hover:text-white disabled:opacity-40"
+              >
+                {isApplyingForPending ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                Apply &amp; Continue
+              </button>
+              <span>]</span>
+              <span className="mx-1">|</span>
+              <span>[</span>
+              <button
+                onClick={onDiscard}
+                disabled={isApplyingForPending}
+                className="px-0.5 text-zinc-400 transition hover:text-white disabled:opacity-40"
+              >
+                Discard
+              </button>
+              <span>]</span>
+              <span className="mx-1">|</span>
+              <span>[</span>
+              <button
+                onClick={onCancel}
+                disabled={isApplyingForPending}
+                className="px-0.5 text-zinc-400 transition hover:text-white disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <span>]</span>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

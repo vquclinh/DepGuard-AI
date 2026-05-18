@@ -64,6 +64,7 @@ interface DiffReviewPanelProps {
   folderPath?: string;
   activeFilePath?: string;
   onFileChange?: (filePath: string) => void;
+  onDecision?: (file: string, scope: "file" | "hunk", decision: "accepted" | "rejected") => void;
 }
 
 export function DiffReviewPanel({
@@ -76,6 +77,7 @@ export function DiffReviewPanel({
   folderPath,
   activeFilePath,
   onFileChange,
+  onDecision,
 }: DiffReviewPanelProps) {
   const [currentFileIndex, setCurrentFileIndex] = useState(0);
   const [decisions, setDecisions] = useState<Record<string, FileDecision>>(() => initializeDecisions(preview));
@@ -129,6 +131,9 @@ export function DiffReviewPanel({
         },
       },
     }));
+    if (decision !== "pending") {
+      onDecision?.(file.relative_path, "hunk", decision);
+    }
   };
 
   const setFileDecision = (file: PreviewFile, decision: HunkDecisionState) => {
@@ -143,6 +148,9 @@ export function DiffReviewPanel({
         ),
       },
     }));
+    if (decision !== "pending") {
+      onDecision?.(file.relative_path, "file", decision);
+    }
   };
 
   const handleApply = async () => {
@@ -271,7 +279,7 @@ function ReviewContent({
             className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {isApplying ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-            Apply Accepted
+            Apply
           </button>
           {!applyResult && (
             <button
