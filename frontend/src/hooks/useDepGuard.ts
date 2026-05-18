@@ -164,6 +164,12 @@ export interface PreviewStreamEvent {
   total_files?: number;
   file?: string;
   success?: boolean;
+  old_api?: string;
+  new_api?: string;
+  change_type?: string;
+  description?: string;
+  additions?: number;
+  deletions?: number;
 }
 
 export async function previewUpdateStream(

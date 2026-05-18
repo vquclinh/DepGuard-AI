@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
   FileCode2,
@@ -9,8 +10,12 @@ import {
   FolderOpen,
   FolderTree,
   GitCompareArrows,
+  GripVertical,
+  ListTodo,
   Loader2,
   PackageOpen,
+  PanelLeftClose,
+  PanelLeftOpen,
   RefreshCw,
   Search,
   X,
@@ -53,6 +58,8 @@ type DiffLine = {
 type StreamLine = {
   id: number;
   message: string;
+  detail?: string;
+  badge?: string;
   status: "running" | "success" | "error" | "info" | "sub" | "separator" | "header";
 };
 
@@ -63,6 +70,24 @@ type ExplorerNode = {
   children: ExplorerNode[];
   file?: ProjectFile;
 };
+
+const EXPLORER_MIN_WIDTH = 220;
+const EXPLORER_DEFAULT_WIDTH = 300;
+const EXPLORER_MAX_WIDTH = 520;
+
+function clampExplorerWidth(width: number) {
+  return Math.min(EXPLORER_MAX_WIDTH, Math.max(EXPLORER_MIN_WIDTH, width));
+}
+
+function normalizeDependencyVersion(version?: string) {
+  return (version || "").replace(/^[\^~=<>v\s]+/i, "");
+}
+
+function isUpdateCandidate(pkg: PackageData) {
+  const current = normalizeDependencyVersion(pkg.current_version);
+  const latest = normalizeDependencyVersion(pkg.latest_version);
+  return Boolean(pkg.name && current && latest && current !== latest);
+}
 
 export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackagesUpdated }: IdeWorkspaceViewProps) {
   const [files, setFiles] = useState<ProjectFile[]>([]);
@@ -85,6 +110,17 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
   const [lastCheckpointId, setLastCheckpointId] = useState("");
   const [isRollingBack, setIsRollingBack] = useState(false);
   const [rightPanelMode, setRightPanelMode] = useState<"dependencies" | "progress">("dependencies");
+  const [explorerWidth, setExplorerWidth] = useState(EXPLORER_DEFAULT_WIDTH);
+  const [isExplorerHidden, setIsExplorerHidden] = useState(false);
+  const [isResizingExplorer, setIsResizingExplorer] = useState(false);
+  const [updateQueue, setUpdateQueue] = useState<PackageData[]>([]);
+  const [isBatchUpdating, setIsBatchUpdating] = useState(false);
+  const explorerDragRef = useRef({ startX: 0, startWidth: EXPLORER_DEFAULT_WIDTH });
+
+  const updateAllCandidates = useMemo(() => packages.filter(isUpdateCandidate), [packages]);
+
+  const appendProgressLine = (line: Omit<StreamLine, "id">) =>
+    setStreamLines((prev) => [...prev, { ...line, id: prev.length }]);
 
   const resetWorkspaceState = () => {
     setFiles([]);
@@ -158,25 +194,156 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     return s;
   }, [previewData]);
 
+  const refreshWorkspace = async () => {
+    await loadFiles();
+    if (selectedFile && (!previewData || !previewFilePaths.has(selectedFile))) {
+      await loadContent(selectedFile);
+    }
+  };
+
   useEffect(() => {
     if (fileQuery.trim()) {
       setExpandedFolders(getFolderPaths(filteredFiles));
     }
   }, [fileQuery, filteredFiles]);
 
+  useEffect(() => {
+    if (!isResizingExplorer) return;
+
+    const handleMouseMove = (event: MouseEvent) => {
+      const delta = event.clientX - explorerDragRef.current.startX;
+      setExplorerWidth(clampExplorerWidth(explorerDragRef.current.startWidth + delta));
+    };
+    const handleMouseUp = () => setIsResizingExplorer(false);
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isResizingExplorer]);
+
   const currentChangedFile = useMemo(
     () => changedFiles.find((file) => file.file === activeChangedFile) ?? null,
     [activeChangedFile, changedFiles]
   );
 
-  const handleUpdate = async (pkg: PackageData) => {
+  const startExplorerResize = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    explorerDragRef.current = { startX: event.clientX, startWidth: explorerWidth };
+    setIsResizingExplorer(true);
+  };
+
+  const handleUpdate = async (pkg: PackageData, options?: { fromBatch?: boolean }) => {
     setUpdatingPackage(pkg.name);
     setRightPanelMode("progress");
     setReviewActivity(null);
     onLog(`Preparing IDE preview for ${pkg.name}.`, "info");
 
-    const appendLine = (line: Omit<StreamLine, "id">) =>
-      setStreamLines((prev) => [...prev, { ...line, id: prev.length }]);
+    const assistantLineForEvent = (event: PreviewStreamEvent): Omit<StreamLine, "id"> | null => {
+      const msg = event.message ?? "";
+      const versionRange = `${pkg.current_version || "current"} → ${pkg.latest_version || "target"}`;
+
+      if (event.event === "phase" && event.phase === "ast_scan") {
+        return {
+          message: msg,
+          status: "running",
+          badge: "Finding usage",
+          detail: `I am locating real ${pkg.name} calls in this project first, so DepGuard only patches code that actually uses the migration surface.`,
+        };
+      }
+      if (event.event === "ast_done") {
+        return {
+          message: msg,
+          status: "success",
+          badge: "Usage map",
+          detail: event.usage_count
+            ? `These matches become the patch scope. Files outside this map are left alone unless a dependency version pin needs updating.`
+            : `No direct API usage was found, so the update is likely limited to dependency metadata unless Scout finds a review-only migration.`,
+        };
+      }
+      if (event.event === "phase" && event.phase === "scout") {
+        return {
+          message: msg,
+          status: "running",
+          badge: "Evidence",
+          detail: `I am comparing ${pkg.name} ${versionRange} against migration docs and changelogs, then filtering for APIs used by this project.`,
+        };
+      }
+      if (event.event === "scout_done") {
+        return {
+          message: msg,
+          status: "success",
+          badge: "Breaking changes",
+          detail: event.breaking_changes_count
+            ? `Scout found migration rules that may make existing code fail on the target version. Next, DepGuard will connect those rules to matched code.`
+            : `Scout did not find a concrete breaking API match. DepGuard will avoid speculative source edits and only update safe metadata if needed.`,
+        };
+      }
+      if (event.event === "breaking_change") {
+        const target = event.new_api ? `Replacement candidate: ${event.new_api}.` : "No automatic replacement was documented, so this may require review.";
+        return {
+          message: msg,
+          status: "sub",
+          badge: event.change_type ? event.change_type.replace("_", " ") : "breaking",
+          detail: `${event.description || "This API changed between the selected versions."} ${target}`,
+        };
+      }
+      if (event.event === "phase" && event.phase === "patch") {
+        return {
+          message: msg,
+          status: "running",
+          badge: "Patch plan",
+          detail: `The patch agent will edit only matched target blocks, preserve unrelated lines, and apply documented coupled obligations such as removed kwargs or changed call targets.`,
+        };
+      }
+      if (event.event === "patch_file_done") {
+        return {
+          message: msg,
+          status: event.success ? "sub" : "error",
+          badge: event.success ? "Patched file" : "Needs attention",
+          detail: event.success
+            ? `Generated a preview for this file. Review the diff to see exactly what changed and why before applying.`
+            : `The patch agent could not produce a safe edit for this file. DepGuard keeps it out of the preview instead of applying a risky change.`,
+        };
+      }
+      if (event.event === "file_stats") {
+        return {
+          message: msg,
+          status: "sub",
+          badge: "Diff size",
+          detail: `This preview changes ${event.additions ?? 0} added and ${event.deletions ?? 0} removed line(s). Small diffs are easier to audit before applying.`,
+        };
+      }
+      if (event.event === "done") {
+        return {
+          message: msg,
+          status: "success",
+          badge: "Ready to review",
+          detail: `The preview is not applied yet. Check the diff, accept or reject hunks, then the checker can validate the project after write.`,
+        };
+      }
+      if (event.event === "error") {
+        return {
+          message: msg,
+          status: "error",
+          badge: "Stopped",
+          detail: `DepGuard stopped before applying changes. Use this error text as the next debugging clue.`,
+        };
+      }
+      if (event.event === "info") {
+        return {
+          message: msg,
+          status: "info",
+          badge: "Note",
+          detail: msg.startsWith("Version pin:")
+            ? `The dependency manifest must move to the target version so runtime and source changes stay in sync.`
+            : undefined,
+        };
+      }
+      return msg ? { message: msg, status: "info" } : null;
+    };
 
     // Append a visual separator + header instead of clearing the log
     setStreamLines((prev) => [
@@ -187,26 +354,17 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
 
     const onEvent = (event: PreviewStreamEvent) => {
       if (event.event === "patch_file_start") return;
-      const msg = event.message ?? "";
-      if (event.event === "phase") {
-        appendLine({ message: msg, status: "running" });
-      } else if (event.event === "ast_done" || event.event === "scout_done" || event.event === "done") {
-        appendLine({ message: msg, status: "success" });
-      } else if (event.event === "patch_file_done") {
-        appendLine({ message: msg, status: event.success ? "sub" : "error" });
-      } else if (event.event === "breaking_change" || event.event === "file_stats") {
-        appendLine({ message: msg, status: "sub" });
-      } else if (event.event === "error") {
-        appendLine({ message: msg, status: "error" });
-      } else {
-        appendLine({ message: msg, status: "info" });
-      }
+      const line = assistantLineForEvent(event);
+      if (line) appendProgressLine(line);
     };
 
     try {
       const result = await previewUpdateStream(folderPath, pkg, onEvent);
       if (result.files.length === 0) {
         onLog(`No file changes needed for ${pkg.name}.`, "success");
+        if (options?.fromBatch) {
+          startNextQueuedUpdate();
+        }
       } else {
         setPreviewData(result);
         setPreviewPackageName(pkg.name);
@@ -218,9 +376,74 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
       void loadFiles();
     } catch (error) {
       onLog(`Error previewing ${pkg.name}: ${error instanceof Error ? error.message : "Unknown error"}`, "error");
+      if (options?.fromBatch) {
+        cancelUpdateAll("Update All stopped because one package failed to preview.");
+      }
     } finally {
       setUpdatingPackage("");
     }
+  };
+
+  const startNextQueuedUpdate = () => {
+    setUpdateQueue((currentQueue) => {
+      const [nextPackage, ...remainingQueue] = currentQueue;
+      if (!nextPackage) {
+        setIsBatchUpdating(false);
+        appendProgressLine({
+          message: "Update All queue finished",
+          status: "success",
+          badge: "Batch",
+          detail: "Every queued package has either been previewed or skipped because no file changes were needed.",
+        });
+        return [];
+      }
+
+      window.setTimeout(() => {
+        void handleUpdate(nextPackage, { fromBatch: true });
+      }, 0);
+      return remainingQueue;
+    });
+  };
+
+  const cancelUpdateAll = (message = "Update All queue cancelled.") => {
+    setUpdateQueue([]);
+    setIsBatchUpdating(false);
+    setPendingUpdatePkg(null);
+    appendProgressLine({
+      message,
+      status: "info",
+      badge: "Batch",
+      detail: "The current preview is left untouched; only the remaining queued package updates were cleared.",
+    });
+  };
+
+  const requestUpdateAll = () => {
+    if (updateAllCandidates.length === 0) {
+      onLog("No outdated packages are available for Update All.", "info");
+      return;
+    }
+
+    const [firstPackage, ...remainingPackages] = updateAllCandidates;
+    setUpdateQueue(remainingPackages);
+    setIsBatchUpdating(true);
+    setRightPanelMode("progress");
+    appendProgressLine({
+      message: `Update All queued ${updateAllCandidates.length} package${updateAllCandidates.length === 1 ? "" : "s"}`,
+      status: "header",
+    });
+    appendProgressLine({
+      message: `Starting with ${firstPackage.name}`,
+      status: "running",
+      badge: "Batch",
+      detail: "DepGuard will prepare one preview at a time. You still choose what to apply before the next package starts.",
+    });
+
+    if (previewData) {
+      setPendingUpdatePkg(firstPackage);
+      return;
+    }
+
+    void handleUpdate(firstPackage, { fromBatch: true });
   };
 
   const handlePreviewApplied = (result: ApplyResponse) => {
@@ -273,6 +496,9 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     if (selectedFile) {
       void loadContent(selectedFile);
     }
+    if (isBatchUpdating) {
+      startNextQueuedUpdate();
+    }
   };
 
   const handlePreviewDiscarded = () => {
@@ -284,6 +510,10 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     setRightPanelMode("dependencies");
     if (selectedFile) {
       void loadContent(selectedFile);
+    }
+    if (isBatchUpdating) {
+      setRightPanelMode("progress");
+      startNextQueuedUpdate();
     }
   };
 
@@ -336,7 +566,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
       setReviewActivity(null);
       const pkg = pendingUpdatePkg;
       setPendingUpdatePkg(null);
-      void handleUpdate(pkg);
+      void handleUpdate(pkg, { fromBatch: isBatchUpdating });
     } catch (error) {
       onLog(`Error applying preview: ${error instanceof Error ? error.message : "Unknown error"}`, "error");
     } finally {
@@ -355,7 +585,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
       setReviewActivity(null);
       const pkg = pendingUpdatePkg;
       setPendingUpdatePkg(null);
-      void handleUpdate(pkg);
+      void handleUpdate(pkg, { fromBatch: isBatchUpdating });
     } catch (error) {
       onLog(`Error discarding preview: ${error instanceof Error ? error.message : "Unknown error"}`, "error");
     } finally {
@@ -395,17 +625,36 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
         </div>
       </div>
 
-      <div className="grid min-h-0 flex-1 overflow-hidden lg:grid-cols-[20%_55%_25%]">
-        <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-card/70 lg:border-b-0 lg:border-r">
+      <div
+        className={cn("grid min-h-0 flex-1 overflow-hidden", isResizingExplorer && "cursor-col-resize select-none")}
+        style={{
+          gridTemplateColumns: isExplorerHidden
+            ? "0 minmax(0, 1fr) minmax(280px, 25%)"
+            : `${explorerWidth}px minmax(0, 1fr) minmax(280px, 25%)`,
+        }}
+      >
+        <aside
+          className={cn(
+            "relative flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-card/70 transition-opacity lg:border-b-0 lg:border-r",
+            isExplorerHidden && "pointer-events-none opacity-0"
+          )}
+        >
           <div className="flex h-10 shrink-0 items-center gap-2 border-b px-3">
             <FolderTree className="h-4 w-4" />
             <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-100">Explorer</h2>
             <button
-              onClick={() => void loadFiles()}
+              onClick={() => void refreshWorkspace()}
               className="ml-auto rounded-md p-1 text-muted-foreground transition hover:bg-muted hover:text-foreground"
-              title="Refresh files"
+              title="Refresh Explorer and editor"
             >
-              {isLoadingFiles ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              {isLoadingFiles || isLoadingContent ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            </button>
+            <button
+              onClick={() => setIsExplorerHidden(true)}
+              className="rounded-md p-1 text-muted-foreground transition hover:bg-muted hover:text-foreground"
+              title="Hide Explorer"
+            >
+              <PanelLeftClose className="h-4 w-4" />
             </button>
           </div>
           <div className="shrink-0 border-b p-2">
@@ -454,9 +703,30 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
               ))
             )}
           </div>
+          <div
+            role="separator"
+            aria-label="Resize Explorer"
+            aria-orientation="vertical"
+            title="Drag to resize Explorer. Double-click to reset."
+            onMouseDown={startExplorerResize}
+            onDoubleClick={() => setExplorerWidth(EXPLORER_DEFAULT_WIDTH)}
+            className="absolute right-0 top-0 z-20 flex h-full w-2 translate-x-1 cursor-col-resize items-center justify-center text-transparent transition hover:bg-sky-500/20 hover:text-sky-300"
+          >
+            <GripVertical className="h-4 w-4" />
+          </div>
         </aside>
 
         <section className="relative flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-[#101010] lg:border-b-0 lg:border-r">
+          {isExplorerHidden && (
+            <button
+              onClick={() => setIsExplorerHidden(false)}
+              className="absolute left-2 top-2 z-30 inline-flex h-7 items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-950/90 px-2 text-[11px] font-semibold text-zinc-200 shadow-lg transition hover:border-sky-500/60 hover:text-white"
+              title="Show Explorer"
+            >
+              <PanelLeftOpen className="h-3.5 w-3.5" />
+              Explorer
+            </button>
+          )}
           {!previewData && (
             <div className="flex h-10 shrink-0 items-center justify-between border-b bg-card px-3">
               <div className="flex min-w-0 items-center gap-2">
@@ -468,14 +738,6 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
                   <p className="truncate text-xs text-zinc-300">{selectedFile || "Select a file"}</p>
                 </div>
               </div>
-              <button
-                onClick={() => selectedFile && loadContent(selectedFile)}
-                disabled={!selectedFile || isLoadingContent}
-                className="inline-flex h-7 items-center gap-2 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted disabled:opacity-50"
-              >
-                {isLoadingContent ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-                Reload
-              </button>
             </div>
           )}
 
@@ -498,9 +760,10 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
                     const label = scope === "file"
                       ? `${decision === "accepted" ? "Accepted" : "Rejected"} all hunks — ${shortFile}`
                       : `Hunk ${decision === "accepted" ? "accepted" : "rejected"} in ${shortFile}`;
+                    const status: StreamLine["status"] = decision === "accepted" ? "sub" : "error";
                     setStreamLines((prev) => [
                       ...prev,
-                      { id: prev.length, message: label, status: (decision === "accepted" ? "sub" : "error") as const },
+                      { id: prev.length, message: label, status },
                     ]);
                     setRightPanelMode("progress");
                   }}
@@ -590,13 +853,17 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
             <StreamingProgressPanel
               lines={streamLines}
               packageName={updatingPackage || previewPackageName}
+              reviewActivity={reviewActivity}
               isStreaming={Boolean(updatingPackage)}
               pendingPackage={pendingUpdatePkg && previewData ? pendingUpdatePkg.name : undefined}
               currentPackage={previewPackageName}
               isApplyingForPending={isApplyingForModal}
               onApplyAndContinue={() => void handleModalApplyAndContinue()}
               onDiscard={() => void handleModalDiscard()}
-              onCancel={() => setPendingUpdatePkg(null)}
+              onCancel={() => (isBatchUpdating ? cancelUpdateAll() : setPendingUpdatePkg(null))}
+              queuedPackageCount={updateQueue.length}
+              isBatchUpdating={isBatchUpdating}
+              onCancelBatch={() => cancelUpdateAll()}
               checkpointId={lastCheckpointId}
               isRollingBack={isRollingBack}
               onRollback={() => void handleRollback()}
@@ -605,6 +872,10 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
             <DependenciesPanel
               packages={packages}
               updatingPackage={updatingPackage}
+              updateAllCount={updateAllCandidates.length}
+              isBatchUpdating={isBatchUpdating}
+              onUpdateAll={requestUpdateAll}
+              onCancelUpdateAll={() => cancelUpdateAll()}
               onUpdate={requestUpdate}
             />
           )}
@@ -630,6 +901,7 @@ function buildAllAcceptDecisions(preview: PreviewResponse) {
 function StreamingProgressPanel({
   lines,
   packageName,
+  reviewActivity,
   isStreaming,
   pendingPackage,
   currentPackage,
@@ -637,12 +909,16 @@ function StreamingProgressPanel({
   onApplyAndContinue,
   onDiscard,
   onCancel,
+  queuedPackageCount,
+  isBatchUpdating,
+  onCancelBatch,
   checkpointId,
   isRollingBack,
   onRollback,
 }: {
   lines: StreamLine[];
   packageName: string;
+  reviewActivity?: DiffReviewActivityState | null;
   isStreaming: boolean;
   pendingPackage?: string;
   currentPackage?: string;
@@ -650,6 +926,9 @@ function StreamingProgressPanel({
   onApplyAndContinue?: () => void;
   onDiscard?: () => void;
   onCancel?: () => void;
+  queuedPackageCount?: number;
+  isBatchUpdating?: boolean;
+  onCancelBatch?: () => void;
   checkpointId?: string;
   isRollingBack?: boolean;
   onRollback?: () => void;
@@ -674,12 +953,25 @@ function StreamingProgressPanel({
           {isStreaming ? "Preparing" : pendingPackage ? "Action required" : "Preview ready"}
           {packageName ? ` — ${packageName}` : ""}
         </span>
+        {isBatchUpdating && !pendingPackage && (
+          <button
+            onClick={onCancelBatch}
+            title="Cancel the remaining Update All queue"
+            className="ml-auto inline-flex h-6 items-center gap-1 rounded border border-zinc-600 bg-zinc-800 px-2 text-[10px] font-semibold text-zinc-300 transition hover:border-red-500/60 hover:bg-red-950/40 hover:text-red-300"
+          >
+            <X className="h-3 w-3" />
+            Stop queue
+          </button>
+        )}
         {checkpointId && !isStreaming && !pendingPackage && (
           <button
             onClick={onRollback}
             disabled={isRollingBack}
             title="Undo applied changes and restore code to before this update"
-            className="ml-auto inline-flex h-6 items-center gap-1 rounded border border-zinc-600 bg-zinc-800 px-2 text-[10px] font-semibold text-zinc-300 transition hover:border-red-500/60 hover:bg-red-950/40 hover:text-red-300 disabled:opacity-50"
+            className={cn(
+              "inline-flex h-6 items-center gap-1 rounded border border-zinc-600 bg-zinc-800 px-2 text-[10px] font-semibold text-zinc-300 transition hover:border-red-500/60 hover:bg-red-950/40 hover:text-red-300 disabled:opacity-50",
+              !isBatchUpdating && "ml-auto"
+            )}
           >
             {isRollingBack
               ? <Loader2 className="h-3 w-3 animate-spin" />
@@ -691,8 +983,25 @@ function StreamingProgressPanel({
       </div>
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto p-3 pb-6 font-mono text-xs">
         <div className="space-y-1">
+          {reviewActivity?.preview && (
+            <div className="mb-2 border-l border-sky-500/40 bg-sky-950/10 px-3 py-2 font-sans text-[11px] leading-5 text-zinc-400">
+              <div className="font-semibold text-sky-300">Review context</div>
+              <div>
+                {reviewActivity.preview.summary.total_files_changed} file(s), +{reviewActivity.preview.summary.total_additions}/-
+                {reviewActivity.preview.summary.total_deletions}. Accept the safe hunks, reject anything suspicious, then apply to let the checker verify.
+              </div>
+            </div>
+          )}
           {lines.length === 0 && (
             <p className="text-zinc-500">Starting pipeline…</p>
+          )}
+          {isBatchUpdating && (
+            <div className="mb-2 border-l border-emerald-500/40 bg-emerald-950/10 px-3 py-2 font-sans text-[11px] leading-5 text-zinc-400">
+              <div className="font-semibold text-emerald-300">Update All queue</div>
+              <div>
+                {queuedPackageCount ?? 0} package{(queuedPackageCount ?? 0) === 1 ? "" : "s"} waiting. DepGuard pauses after each preview so you can inspect and apply the diff.
+              </div>
+            </div>
           )}
           {lines.map((line, idx) => {
             if (line.status === "separator") {
@@ -716,14 +1025,26 @@ function StreamingProgressPanel({
                   {line.status === "sub"     && <span className="text-zinc-500">↳</span>}
                   {line.status === "info"    && <span className="text-zinc-600">·</span>}
                 </span>
-                <span className={cn(
-                  "min-w-0 break-all leading-5",
-                  isActiveLast ? "text-zinc-100" : "text-zinc-400",
-                  line.status === "success" && "text-zinc-300",
-                  line.status === "error"   && "text-red-400",
-                  line.status === "sub"     && "text-zinc-400",
-                )}>
-                  {line.message}
+                <span className="min-w-0 flex-1">
+                  <span className={cn(
+                    "block min-w-0 break-all leading-5",
+                    isActiveLast ? "text-zinc-100" : "text-zinc-400",
+                    line.status === "success" && "text-zinc-300",
+                    line.status === "error"   && "text-red-400",
+                    line.status === "sub"     && "text-zinc-400",
+                  )}>
+                    {line.badge && (
+                      <span className="mr-2 inline-flex rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-300">
+                        {line.badge}
+                      </span>
+                    )}
+                    {line.message}
+                  </span>
+                  {line.detail && (
+                    <span className="mt-1 block max-w-full whitespace-normal break-words border-l border-zinc-800 pl-3 font-sans text-[11px] leading-5 text-zinc-500">
+                      {line.detail}
+                    </span>
+                  )}
                 </span>
               </div>
             );
@@ -784,10 +1105,18 @@ function StreamingProgressPanel({
 function DependenciesPanel({
   packages,
   updatingPackage,
+  updateAllCount,
+  isBatchUpdating,
+  onUpdateAll,
+  onCancelUpdateAll,
   onUpdate,
 }: {
   packages: PackageData[];
   updatingPackage: string;
+  updateAllCount: number;
+  isBatchUpdating: boolean;
+  onUpdateAll: () => void;
+  onCancelUpdateAll: () => void;
   onUpdate: (pkg: PackageData) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -806,11 +1135,7 @@ function DependenciesPanel({
 
         if (filterMode === "vulnerable") return Boolean(pkg.cves?.length);
         if (filterMode === "unpinned") return pkg.severity === "UNPINNED";
-        if (filterMode === "outdated") {
-          const current = (pkg.current_version || "").replace(/^[\^~=<>v\s]+/i, "");
-          const latest = (pkg.latest_version || "").replace(/^[\^~=<>v\s]+/i, "");
-          return Boolean(current && latest && current !== latest);
-        }
+        if (filterMode === "outdated") return isUpdateCandidate(pkg);
         return true;
       })
       .sort((left, right) => {
@@ -834,6 +1159,27 @@ function DependenciesPanel({
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="shrink-0 space-y-2 border-b p-3">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onUpdateAll}
+            disabled={Boolean(updatingPackage) || isBatchUpdating || updateAllCount === 0}
+            title="Queue every outdated package and review one preview at a time"
+            className="inline-flex h-8 min-w-0 flex-1 items-center justify-center gap-2 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition hover:bg-primary/90 disabled:opacity-50"
+          >
+            {isBatchUpdating || updatingPackage ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ListTodo className="h-3.5 w-3.5" />}
+            Update All
+            <span className="rounded bg-primary-foreground/20 px-1.5 py-0.5 text-[10px]">{updateAllCount}</span>
+          </button>
+          {isBatchUpdating && (
+            <button
+              onClick={onCancelUpdateAll}
+              title="Cancel remaining queued updates"
+              className="inline-flex h-8 items-center justify-center rounded-md border bg-background px-2 text-xs font-semibold text-muted-foreground transition hover:bg-muted hover:text-foreground"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
@@ -875,26 +1221,45 @@ function DependenciesPanel({
               <span>{ecosystem}</span>
               <span>{ecosystemPackages.length}</span>
             </div>
-            {ecosystemPackages.map((pkg) => (
-              <div key={`${pkg.ecosystem}-${pkg.name}-${pkg.file_path}`} className="rounded-lg border bg-background p-3">
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold" title={pkg.name}>{pkg.name}</div>
-                  <div className="mt-1 truncate text-xs text-muted-foreground" title={`${pkg.current_version} -> ${pkg.latest_version}`}>
-                    {pkg.current_version} → {pkg.latest_version}
+            {ecosystemPackages.map((pkg) => {
+              const canUpdatePackage = isUpdateCandidate(pkg) && pkg.severity !== "OK";
+              const isUpdateDisabled = Boolean(updatingPackage) || isBatchUpdating || !canUpdatePackage;
+              return (
+                <div
+                  key={`${pkg.ecosystem}-${pkg.name}-${pkg.file_path}`}
+                  className={cn("rounded-lg border bg-background p-3", pkg.severity === "OK" && "opacity-70")}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold" title={pkg.name}>{pkg.name}</div>
+                    <div className="mt-1 truncate text-xs text-muted-foreground" title={`${pkg.current_version} -> ${pkg.latest_version}`}>
+                      {pkg.current_version} → {pkg.latest_version}
+                    </div>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-2">
+                    <span className="rounded-md border px-2 py-1 text-xs text-muted-foreground">{pkg.severity}</span>
+                    <button
+                      onClick={() => canUpdatePackage && onUpdate(pkg)}
+                      disabled={isUpdateDisabled}
+                      title={canUpdatePackage ? `Preview update for ${pkg.name}` : `${pkg.name} is already OK`}
+                      className={cn(
+                        "inline-flex h-8 items-center rounded-md px-3 text-xs font-semibold transition disabled:cursor-not-allowed",
+                        canUpdatePackage
+                          ? "bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
+                          : "border bg-muted/40 text-muted-foreground opacity-50 blur-[0.3px]"
+                      )}
+                    >
+                      {updatingPackage === pkg.name ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : canUpdatePackage ? (
+                        "Update"
+                      ) : (
+                        "OK"
+                      )}
+                    </button>
                   </div>
                 </div>
-                <div className="mt-3 flex items-center justify-between gap-2">
-                  <span className="rounded-md border px-2 py-1 text-xs text-muted-foreground">{pkg.severity}</span>
-                  <button
-                    onClick={() => onUpdate(pkg)}
-                    disabled={Boolean(updatingPackage)}
-                    className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition hover:bg-primary/90 disabled:opacity-60"
-                  >
-                    {updatingPackage === pkg.name ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Update"}
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         ))
       )}

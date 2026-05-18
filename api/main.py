@@ -659,7 +659,14 @@ async def preview_update_stream(req: UpdateRequest):
                     label = desc[:70]
                 else:
                     continue
-                yield _sse({"event": "breaking_change", "message": label[:80]})
+                yield _sse({
+                    "event": "breaking_change",
+                    "message": label[:80],
+                    "old_api": old_api,
+                    "new_api": new_api,
+                    "change_type": str(bc.get("type", "") or "").strip(),
+                    "description": desc,
+                })
 
             # ── Dependency file diff ───────────────────────────────────────
             files_original: dict[str, str] = {}
