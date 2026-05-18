@@ -176,9 +176,10 @@ PATCH_CASES: list[PatchTestCase] = [
         },
         assertions={
             "models/user.py": [
-                ("field_validator", True),    # import updated
-                ("from pydantic import", True), # import still there
-                # @validator should be gone or at least @field_validator present
+                ("field_validator", True),
+                ("from pydantic import", True),
+                ("always=True", False),       # always= kwarg must be removed
+                ("mode='before'", False),     # pre= was not in original; must not be added
             ],
             "models/admin.py": [
                 ("field_validator", True),
