@@ -73,7 +73,9 @@ class RepairAgent:
             try:
                 original = Path(file_path).read_text(encoding="utf-8")
             except UnicodeDecodeError:
-                original = Path(file_path).read_text(encoding="utf-8", errors="ignore")
+                logger.warning("Skipping %s — cannot decode as UTF-8; repair skipped", file_path)
+                errors.append({"file": file_path, "error": "Cannot decode file as UTF-8"})
+                continue
             except OSError as exc:
                 errors.append({"file": file_path, "error": str(exc)})
                 continue
@@ -250,13 +252,31 @@ class RepairAgent:
         fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
         if fenced:
             text = fenced.group(1).strip()
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            return []
+        # Try parsing the text directly first (common when fenced block was extracted cleanly)
         try:
-            data = json.loads(match.group(0))
+            data = json.loads(text)
         except json.JSONDecodeError:
-            return []
+            # Fall back: find the first balanced JSON object using a brace counter so we
+            # don't accidentally capture unrelated JSON fragments via a greedy regex.
+            start = text.find("{")
+            if start == -1:
+                return []
+            depth = 0
+            end = start
+            for i, ch in enumerate(text[start:], start):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            else:
+                return []
+            try:
+                data = json.loads(text[start:end])
+            except json.JSONDecodeError:
+                return []
         replacements = data.get("replacements")
         if not isinstance(replacements, list):
             return []
