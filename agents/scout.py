@@ -2746,10 +2746,9 @@ class ScoutAgent:
             Do not convert broad compatibility notes into removals for ordinary still-valid APIs.
 
             IMPORTANT — keyword argument and parameter changes:
-            When an evidence chunk documents that a keyword argument or parameter was removed, renamed, or deprecated (e.g. "always=True is no longer supported", "use validate_default instead of always"), you MUST:
-            1. Include the kwarg migration detail in the description of the related breaking_changes entry. Format: "Note: <old_kwarg>=<value> argument removed; use <replacement> instead."
-            2. Set api_evidence.replacement to a COMPLETE code example of the new call — NEVER include the deprecated/removed kwargs in the replacement example.
-            For example, if evidence says "@validator(always=True) is deprecated and validate_default=True in Field() should be used instead", the breaking_change for pydantic.validator must have description: "@validator renamed to @field_validator. Note: always=True argument removed; use Field(validate_default=True) on the field definition instead." And the api_evidence replacement must NOT include always=True.
+            When an evidence chunk documents that a keyword argument or parameter was removed, renamed, or deprecated, you MUST:
+            1. Include the kwarg migration detail in the description of the related breaking_changes entry. Format: "Note: <old_kwarg> argument removed; use <replacement> instead."
+            2. Set api_evidence.replacement to a COMPLETE code example of the new call — NEVER include deprecated/removed kwargs in the replacement example.
 
             Return a JSON object with this exact structure:
             {{
