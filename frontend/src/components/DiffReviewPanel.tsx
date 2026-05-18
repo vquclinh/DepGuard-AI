@@ -16,6 +16,7 @@ import {
 import {
   applyPreview,
   discardPreview,
+  getFileContent,
   type ApplyResponse,
   type PreviewFile,
   type PreviewHunk,
@@ -60,6 +61,9 @@ interface DiffReviewPanelProps {
   onError: (message: string) => void;
   layout?: DiffReviewLayout;
   onActivityChange?: (activity: DiffReviewActivityState) => void;
+  folderPath?: string;
+  activeFilePath?: string;
+  onFileChange?: (filePath: string) => void;
 }
 
 export function DiffReviewPanel({
@@ -69,6 +73,9 @@ export function DiffReviewPanel({
   onError,
   layout = "overlay",
   onActivityChange,
+  folderPath,
+  activeFilePath,
+  onFileChange,
 }: DiffReviewPanelProps) {
   const [currentFileIndex, setCurrentFileIndex] = useState(0);
   const [decisions, setDecisions] = useState<Record<string, FileDecision>>(() => initializeDecisions(preview));
@@ -87,6 +94,17 @@ export function DiffReviewPanel({
     setApplyResult(null);
     setApplyError("");
   }, [preview]);
+
+  useEffect(() => {
+    if (!activeFilePath) return;
+    const idx = preview.files.findIndex(
+      (f) => f.file_path === activeFilePath || f.relative_path === activeFilePath
+    );
+    if (idx >= 0 && idx !== currentFileIndex) {
+      setCurrentFileIndex(idx);
+      scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }, [activeFilePath, preview.files]);
 
   useEffect(() => {
     onActivityChange?.({
@@ -158,8 +176,10 @@ export function DiffReviewPanel({
   };
 
   const goToFile = (index: number) => {
-    setCurrentFileIndex(Math.max(0, Math.min(preview.files.length - 1, index)));
+    const clamped = Math.max(0, Math.min(preview.files.length - 1, index));
+    setCurrentFileIndex(clamped);
     scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+    onFileChange?.(preview.files[clamped].file_path);
   };
 
   const content = !currentFile ? (
@@ -173,6 +193,7 @@ export function DiffReviewPanel({
       isApplying={isApplying}
       applyResult={applyResult}
       scrollRef={scrollRef}
+      folderPath={folderPath}
       onApply={handleApply}
       onClose={handleClose}
       onGoToFile={goToFile}
@@ -205,6 +226,7 @@ function ReviewContent({
   isApplying,
   applyResult,
   scrollRef,
+  folderPath,
   onApply,
   onClose,
   onGoToFile,
@@ -218,6 +240,7 @@ function ReviewContent({
   isApplying: boolean;
   applyResult: ApplyResponse | null;
   scrollRef: RefObject<HTMLDivElement>;
+  folderPath?: string;
   onApply: () => void;
   onClose: () => void;
   onGoToFile: (index: number) => void;
@@ -275,18 +298,13 @@ function ReviewContent({
         </div>
       </div>
 
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto px-4 pb-24 pt-4 font-mono text-xs">
-        <div className="space-y-5">
-          {currentFile.hunks.map((hunk) => (
-            <HunkBlock
-              key={hunk.hunk_id}
-              hunk={hunk}
-              decision={decisions[currentFile.relative_path]?.hunks[hunk.hunk_id]?.decision ?? "pending"}
-              onAccept={() => onSetHunkDecision(currentFile, hunk.hunk_id, "accepted")}
-              onReject={() => onSetHunkDecision(currentFile, hunk.hunk_id, "rejected")}
-            />
-          ))}
-        </div>
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto font-mono text-xs">
+        <FullFileDiffViewer
+          file={currentFile}
+          folderPath={folderPath ?? ""}
+          decisions={decisions}
+          onSetHunkDecision={onSetHunkDecision}
+        />
       </div>
 
       <FileNavigator
@@ -529,64 +547,148 @@ function FileNavigator({
   );
 }
 
-function HunkBlock({
-  hunk,
-  decision,
-  onAccept,
-  onReject,
+interface UnifiedRow {
+  type: "gap" | "context" | "deletion" | "addition";
+  oldLine: number | null;
+  newLine: number | null;
+  content: string;
+  hunkId: string | null;
+}
+
+function buildUnifiedRows(originalLines: string[], hunks: PreviewHunk[]): UnifiedRow[] {
+  const rows: UnifiedRow[] = [];
+  let oldCursor = 1;
+  let newOffset = 0;
+  const sorted = [...hunks].sort((a, b) => a.old_start - b.old_start);
+
+  for (const hunk of sorted) {
+    // gap lines before this hunk
+    for (let ln = oldCursor; ln < hunk.old_start; ln++) {
+      rows.push({ type: "gap", oldLine: ln, newLine: ln + newOffset, content: originalLines[ln - 1] ?? "", hunkId: null });
+    }
+    // hunk changes
+    for (const c of hunk.changes) {
+      rows.push({ type: c.type, oldLine: c.line_number_old, newLine: c.line_number_new, content: c.content, hunkId: hunk.hunk_id });
+    }
+    newOffset += hunk.new_lines - hunk.old_lines;
+    oldCursor = hunk.old_start + hunk.old_lines;
+  }
+  // trailing gap lines
+  for (let ln = oldCursor; ln <= originalLines.length; ln++) {
+    rows.push({ type: "gap", oldLine: ln, newLine: ln + newOffset, content: originalLines[ln - 1] ?? "", hunkId: null });
+  }
+  return rows;
+}
+
+function FullFileDiffViewer({
+  file,
+  folderPath,
+  decisions,
+  onSetHunkDecision,
 }: {
-  hunk: PreviewHunk;
-  decision: HunkDecisionState;
-  onAccept: () => void;
-  onReject: () => void;
+  file: PreviewFile;
+  folderPath: string;
+  decisions: Record<string, FileDecision>;
+  onSetHunkDecision: (file: PreviewFile, hunkId: string, decision: HunkDecisionState) => void;
 }) {
+  const [originalLines, setOriginalLines] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    setOriginalLines([]);
+    getFileContent(folderPath, file.file_path)
+      .then((result) => {
+        setOriginalLines(result.content.split("\n"));
+      })
+      .catch(() => {
+        setOriginalLines([]);
+      })
+      .finally(() => {
+        setLoading(false);
+      });
+  }, [file.file_path, folderPath]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-16">
+        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  const rows = buildUnifiedRows(originalLines, file.hunks);
+
+  // Build a lookup map: hunkId -> PreviewHunk
+  const hunkMap = new Map<string, PreviewHunk>(file.hunks.map((h) => [h.hunk_id, h]));
+
   return (
-    <section
-      className={cn(
-        "overflow-hidden rounded-lg border bg-background transition",
-        decision === "accepted" && "border-emerald-500/40 bg-emerald-500/5",
-        decision === "rejected" && "opacity-50 grayscale"
-      )}
-    >
-      <div className="flex items-center justify-between border-b border-dashed px-3 py-2 font-sans">
-        <div className="text-xs text-muted-foreground">
-          @@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},{hunk.new_lines} @@
-        </div>
-        <div className="flex items-center gap-2">
-          <button onClick={onAccept} className="inline-flex h-7 items-center gap-1 rounded border bg-background px-2 text-xs font-semibold text-emerald-500 transition hover:bg-muted">
-            <Check className="h-3.5 w-3.5" />
-            Accept
-          </button>
-          <button onClick={onReject} className="inline-flex h-7 items-center gap-1 rounded border bg-background px-2 text-xs font-semibold text-red-500 transition hover:bg-muted">
-            <X className="h-3.5 w-3.5" />
-            Reject
-          </button>
-        </div>
-      </div>
-      <div className="overflow-x-auto py-2">
-        {hunk.changes.map((change, index) => (
-          <div
-            key={`${index}-${change.type}-${change.content}`}
-            className={cn(
-              "grid min-w-max grid-cols-[64px_24px_1fr] px-3 py-0.5 leading-6",
-              change.type === "context" && "text-zinc-400",
-              change.type === "deletion" && "bg-red-500/15 text-red-200",
-              change.type === "addition" && "bg-emerald-500/15 text-emerald-100"
+    <div className="overflow-x-auto pb-24">
+      {rows.map((row, index) => {
+        const prevRow = index > 0 ? rows[index - 1] : null;
+        const isHunkStart = row.hunkId !== null && prevRow?.hunkId !== row.hunkId;
+        const hunk = row.hunkId !== null ? hunkMap.get(row.hunkId) ?? null : null;
+        const decision: HunkDecisionState =
+          row.hunkId !== null
+            ? (decisions[file.relative_path]?.hunks[row.hunkId]?.decision ?? "pending")
+            : "pending";
+        const isRejected = decision === "rejected";
+
+        return (
+          <div key={`row-${index}`}>
+            {isHunkStart && hunk !== null && (
+              <div
+                className={cn(
+                  "sticky top-0 z-10 flex items-center justify-between border-y border-dashed px-3 py-1 backdrop-blur-sm",
+                  decision === "accepted" && "border-emerald-500/30 bg-emerald-950/30",
+                  decision === "rejected" && "border-red-500/20 bg-red-950/20 opacity-60",
+                  decision === "pending" && "border-zinc-700 bg-[#0d1117]/95"
+                )}
+              >
+                <span className="font-sans text-[10px] text-zinc-500">
+                  @@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},{hunk.new_lines} @@
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => onSetHunkDecision(file, hunk.hunk_id, "accepted")}
+                    className="inline-flex h-6 items-center gap-1 rounded border border-emerald-700/40 bg-emerald-950/50 px-2 font-sans text-[10px] font-semibold text-emerald-400 transition hover:bg-emerald-900/50"
+                  >
+                    <Check className="h-3 w-3" /> Accept
+                  </button>
+                  <button
+                    onClick={() => onSetHunkDecision(file, hunk.hunk_id, "rejected")}
+                    className="inline-flex h-6 items-center gap-1 rounded border border-red-700/40 bg-red-950/50 px-2 font-sans text-[10px] font-semibold text-red-400 transition hover:bg-red-900/50"
+                  >
+                    <X className="h-3 w-3" /> Reject
+                  </button>
+                </div>
+              </div>
             )}
-          >
-            <span className="select-none text-right text-zinc-600">
-              {change.line_number_new ?? change.line_number_old ?? ""}
-            </span>
-            <span className="select-none text-center">
-              {change.type === "addition" ? "+" : change.type === "deletion" ? "-" : " "}
-            </span>
-            <code className={cn(decision === "rejected" && change.type !== "context" && "line-through")}>
-              {change.content || " "}
-            </code>
+            <div
+              className={cn(
+                "grid min-w-max grid-cols-[3rem_3rem_1.25rem_1fr] leading-5",
+                (row.type === "gap" || row.type === "context") && "text-zinc-100",
+                row.type === "deletion" && "bg-red-950/50 text-red-300",
+                row.type === "addition" && "bg-emerald-950/50 text-emerald-200"
+              )}
+            >
+              <span className="select-none pr-2 text-right text-[10px] text-zinc-500">
+                {(row.type === "gap" || row.type === "context" || row.type === "deletion") && (row.oldLine ?? "")}
+              </span>
+              <span className="select-none pr-2 text-right text-[10px] text-zinc-500">
+                {(row.type === "gap" || row.type === "context" || row.type === "addition") && (row.newLine ?? "")}
+              </span>
+              <span className="select-none text-center">
+                {row.type === "deletion" ? "-" : row.type === "addition" ? "+" : " "}
+              </span>
+              <code className={cn(isRejected && row.type !== "context" && row.type !== "gap" && "opacity-50 line-through")}>
+                {row.content || " "}
+              </code>
+            </div>
           </div>
-        ))}
-      </div>
-    </section>
+        );
+      })}
+    </div>
   );
 }
 

@@ -152,6 +152,77 @@ export interface ApplyResponse {
   repair?: RepairReport | null;
 }
 
+export interface PreviewStreamEvent {
+  event: "phase" | "ast_done" | "scout_done" | "patch_file_start" | "patch_file_done" | "info" | "done" | "error";
+  phase?: string;
+  message: string;
+  preview?: PreviewResponse;
+  usage_count?: number;
+  file_count?: number;
+  breaking_changes_count?: number;
+  total_files?: number;
+  file?: string;
+  success?: boolean;
+}
+
+export async function previewUpdateStream(
+  folderPath: string,
+  packageInfo: object,
+  onEvent: (event: PreviewStreamEvent) => void,
+): Promise<PreviewResponse> {
+  const response = await fetch('/api/preview-stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder_path: folderPath, package_info: packageInfo }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || 'Failed to start preview stream');
+  }
+  if (!response.body) throw new Error('Response has no body');
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE frames are separated by double newline
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop() ?? '';
+
+      for (const frame of frames) {
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          let event: PreviewStreamEvent;
+          try {
+            event = JSON.parse(line.slice(6)) as PreviewStreamEvent;
+          } catch {
+            continue;
+          }
+          onEvent(event);
+          if (event.event === 'done' && event.preview) {
+            reader.cancel().catch(() => {});
+            return event.preview;
+          }
+          if (event.event === 'error') {
+            reader.cancel().catch(() => {});
+            throw new Error(event.message || 'Preview failed');
+          }
+        }
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+
+  throw new Error('Preview stream ended without a result');
+}
+
 export async function previewUpdate(folderPath: string, packageInfo: object): Promise<PreviewResponse> {
   const response = await fetch('/api/preview', {
     method: 'POST',

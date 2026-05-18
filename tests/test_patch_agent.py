@@ -1143,6 +1143,233 @@ def test_patch_rejects_keyword_not_documented_by_scout_evidence(tmp_path: Path):
         )
 
 
+def test_patch_prunes_deprecated_kwarg_from_raw_reference_evidence(tmp_path: Path):
+    original = "\n".join([
+        "from pydantic import BaseModel, validator",
+        "",
+        "class UserRegistration(BaseModel):",
+        "    age: int",
+        "",
+        "    @validator('age', always=True)",
+        "    def check_age(cls, v):",
+        "        return v",
+        "",
+    ])
+    target_blocks = [
+        {
+            "start_line": 1,
+            "end_line": 1,
+            "source": original.splitlines()[0],
+        },
+        {
+            "start_line": 6,
+            "end_line": 8,
+            "source": "\n".join(original.splitlines()[5:8]),
+        },
+    ]
+    matches = [
+        {"line": 1, "old_api": "pydantic.validator", "new_api": "pydantic.field_validator", "type": "changed_signature"},
+        {"line": 6, "old_api": "pydantic.validator", "new_api": "pydantic.field_validator", "type": "changed_signature"},
+    ]
+    response = json.dumps({
+        "schema_version": "depguard.patch.v1",
+        "status": "patched",
+        "replacements": [
+            {
+                "start_line": 1,
+                "end_line": 1,
+                "replacement": "from pydantic import BaseModel, field_validator",
+            },
+            {
+                "start_line": 6,
+                "end_line": 8,
+                "replacement": "\n".join([
+                    "    @field_validator('age', always=True)",
+                    "    def check_age(cls, v):",
+                    "        return v",
+                ]),
+            },
+        ],
+    })
+    scout_context = {
+        "package": "pydantic",
+        "from_version": "1.10.12",
+        "to_version": "2.13.4",
+        "breaking_changes": [{
+            "type": "changed_signature",
+            "old_api": "pydantic.validator",
+            "new_api": "pydantic.field_validator",
+            "description": "@validator has been deprecated and replaced with @field_validator.",
+        }],
+        "api_evidence": [{
+            "api": "pydantic.validator",
+            "change_type": "changed_signature",
+            "replacement": "pydantic.field_validator",
+            "evidence": [{
+                "source": "migration_guide",
+                "quote": "@validator has been deprecated and should be replaced with @field_validator.",
+            }],
+        }],
+        "evidence_references": [{
+            "source": "github",
+            "title": "docs/migration.md",
+            "url": "https://github.com/pydantic/pydantic/blob/main/docs/migration.md",
+            "content": (
+                "If you use the `always=True` keyword argument to a validator function, note that standard validators "
+                "for the annotated type will also be applied even to defaults. To avoid this, you can use the "
+                "`validate_default` argument in the `Field` function. When set to `True`, it mimics the behavior of "
+                "`always=True` in Pydantic v1."
+            ),
+        }],
+    }
+
+    patched = PatchAgent(project_root=str(tmp_path))._patch_response_to_full_file(
+        response,
+        original,
+        target_blocks,
+        scout_context,
+        matches,
+    )
+
+    assert "@field_validator('age')" in patched
+    assert "always=True" not in patched
+
+
+def test_patch_prunes_pyjwt_verify_from_raw_reference_evidence(tmp_path: Path):
+    original = "\n".join([
+        "import jwt",
+        "",
+        "def verify_token(token, secret):",
+        "    data = jwt.decode(token, secret, verify=True)",
+        "    return data",
+        "",
+    ])
+    target_blocks = [{
+        "start_line": 3,
+        "end_line": 5,
+        "source": "\n".join(original.splitlines()[2:5]),
+    }]
+    matches = [{
+        "line": 4,
+        "old_api": "jwt.decode",
+        "new_api": "jwt.decode",
+        "type": "changed_signature",
+    }]
+    response = json.dumps({
+        "schema_version": "depguard.patch.v1",
+        "status": "patched",
+        "replacements": [{
+            "start_line": 3,
+            "end_line": 5,
+            "replacement": "\n".join([
+                "def verify_token(token, secret):",
+                "    data = jwt.decode(token, secret, algorithms=[\"HS256\"], verify=True)",
+                "    return data",
+            ]),
+        }],
+    })
+    scout_context = {
+        "package": "PyJWT",
+        "from_version": "1.7.1",
+        "to_version": "2.12.1",
+        "breaking_changes": [{
+            "type": "changed_signature",
+            "old_api": "jwt.decode",
+            "new_api": "jwt.decode",
+            "description": "jwt.decode now requires algorithms.",
+        }],
+        "evidence_references": [{
+            "source": "github",
+            "title": "CHANGELOG.md",
+            "content": "The verify parameter was removed from jwt.decode. The algorithms parameter is now required.",
+        }],
+    }
+
+    patched = PatchAgent(project_root=str(tmp_path))._patch_response_to_full_file(
+        response,
+        original,
+        target_blocks,
+        scout_context,
+        matches,
+    )
+
+    assert 'jwt.decode(token, secret, algorithms=["HS256"])' in patched
+    assert "verify=True" not in patched
+
+
+def test_patch_prunes_deprecated_kwarg_only_from_matched_call(tmp_path: Path):
+    original = "\n".join([
+        "import jwt",
+        "",
+        "def verify_token(token, secret):",
+        "    data = jwt.decode(token, secret, verify=True)",
+        "    audit(verify=True)",
+        "    return data",
+        "",
+    ])
+    target_blocks = [{
+        "start_line": 3,
+        "end_line": 6,
+        "source": "\n".join(original.splitlines()[2:6]),
+    }]
+    matches = [{
+        "line": 4,
+        "old_api": "jwt.decode",
+        "new_api": "jwt.decode",
+        "type": "changed_signature",
+    }]
+    response = json.dumps({
+        "schema_version": "depguard.patch.v1",
+        "status": "patched",
+        "replacements": [{
+            "start_line": 3,
+            "end_line": 6,
+            "replacement": "\n".join([
+                "def verify_token(token, secret):",
+                "    data = jwt.decode(token, secret, algorithms=[\"HS256\"], verify=True)",
+                "    audit(verify=True)",
+                "    return data",
+            ]),
+        }],
+    })
+    scout_context = {
+        "package": "PyJWT",
+        "from_version": "1.7.1",
+        "to_version": "2.12.1",
+        "breaking_changes": [{
+            "type": "changed_signature",
+            "old_api": "jwt.decode",
+            "new_api": "jwt.decode",
+            "description": "jwt.decode now requires algorithms.",
+        }],
+        "evidence_references": [{
+            "source": "github",
+            "title": "CHANGELOG.md",
+            "content": "The verify parameter was removed from jwt.decode. The algorithms parameter is now required.",
+        }],
+    }
+
+    patched = PatchAgent(project_root=str(tmp_path))._patch_response_to_full_file(
+        response,
+        original,
+        target_blocks,
+        scout_context,
+        matches,
+    )
+
+    assert 'jwt.decode(token, secret, algorithms=["HS256"])' in patched
+    assert "audit(verify=True)" in patched
+
+
+def test_patch_kwarg_evidence_detection_ignores_plain_language_mentions(tmp_path: Path):
+    agent = PatchAgent(project_root=str(tmp_path))
+
+    assert agent._evidence_marks_kwarg_migration(
+        "Most of the time input data is a dictionary. However, this is not always the case.",
+        "always",
+    ) is False
+
+
 def test_patch_preview_retries_when_string_argument_migration_is_incomplete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     py_file = tmp_path / "db.py"
     original = "\n".join([

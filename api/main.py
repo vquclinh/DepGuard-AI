@@ -595,6 +595,146 @@ def preview_update(req: UpdateRequest):
         logger.error(f"Error creating preview: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create preview: {e}")
 
+@app.post("/preview-stream")
+async def preview_update_stream(req: UpdateRequest):
+    _cleanup_preview_sessions()
+
+    async def event_generator():
+        def _sse(payload: dict) -> str:
+            return f"data: {json.dumps(payload)}\n\n"
+
+        try:
+            folder_path = Path(req.folder_path)
+            if not folder_path.exists() or not folder_path.is_dir():
+                yield _sse({"event": "error", "message": "Folder path does not exist or is not a directory"})
+                return
+
+            pkg_info_dict = req.package_info.dict()
+            pkg = req.package_info
+            package = pkg.name
+            from_v = pkg.current_version
+            to_v = pkg.latest_version
+
+            # ── Phase 1: AST scan ──────────────────────────────────────────
+            yield _sse({"event": "phase", "phase": "ast_scan",
+                        "message": f"Scanning codebase for {package} API usages…"})
+
+            ast_scanner = ASTScanner()
+            raw_usages = await asyncio.to_thread(ast_scanner.find_api_usages, str(folder_path), package)
+            api_usages = _prefer_specific_api_usages(raw_usages)
+            api_contexts = await asyncio.to_thread(ast_scanner.find_api_usage_contexts, str(folder_path), package)
+
+            usage_count = sum(len(v) for v in api_usages.values()) if isinstance(api_usages, dict) else len(api_usages)
+            file_count  = len(api_usages) if isinstance(api_usages, dict) else 0
+            yield _sse({"event": "ast_done", "phase": "ast_scan",
+                        "message": f"Found {usage_count} API usage(s) across {file_count} file(s)",
+                        "usage_count": usage_count, "file_count": file_count})
+
+            # ── Phase 2: Scout analysis ────────────────────────────────────
+            yield _sse({"event": "phase", "phase": "scout",
+                        "message": f"Fetching changelog and analyzing breaking changes for {package} {from_v} → {to_v}…"})
+
+            scout = ScoutAgent()
+            scout_output = await asyncio.to_thread(scout.run_sync, pkg_info_dict, api_usages, api_contexts)
+            scout_output, ast_output = await asyncio.to_thread(
+                _scan_breaking_changes_with_review_fallback,
+                ast_scanner, folder_path, scout_output, package, from_v, to_v, api_usages,
+            )
+
+            bc_count = len(scout_output.get("breaking_changes", []))
+            yield _sse({"event": "scout_done", "phase": "scout",
+                        "message": f"Identified {bc_count} breaking change(s)",
+                        "breaking_changes_count": bc_count})
+
+            # ── Dependency file diff ───────────────────────────────────────
+            files_original: dict[str, str] = {}
+            files_patched:  dict[str, str] = {}
+            dep_relative = _relative_path(folder_path, pkg.file_path)
+            dep_original, dep_patched = _dependency_preview_content(pkg.file_path, package, from_v, to_v)
+            if dep_original != dep_patched:
+                files_original[dep_relative] = dep_original
+                files_patched[dep_relative]  = dep_patched
+
+            # ── Phase 3: Patch generation ──────────────────────────────────
+            if ast_output.get("matches_by_file"):
+                total_patch_files = len(ast_output["matches_by_file"])
+                yield _sse({"event": "phase", "phase": "patch",
+                            "message": f"Generating patches for {total_patch_files} file(s)…",
+                            "total_files": total_patch_files})
+
+                queue: asyncio.Queue = asyncio.Queue()
+
+                async def on_file_progress(msg: dict):
+                    await queue.put(msg)
+
+                async def run_patch():
+                    try:
+                        patch_agent = PatchAgent(project_root=str(folder_path))
+                        result = await patch_agent.preview(scout_output, ast_output,
+                                                           on_file_progress=on_file_progress)
+                        await patch_agent._close_router()
+                        await queue.put({"event": "patch_complete", "result": result})
+                    except Exception as exc:
+                        await queue.put({"event": "error", "message": str(exc)})
+
+                asyncio.create_task(run_patch())
+
+                patch_result = None
+                while True:
+                    msg = await queue.get()
+                    ev = msg.get("event", "")
+                    if ev == "patch_complete":
+                        patch_result = msg["result"]
+                        break
+                    if ev == "error":
+                        yield _sse({"event": "error", "message": msg.get("message", "Patch failed")})
+                        return
+                    # forward patch_file_start / patch_file_done to client
+                    yield _sse(msg)
+
+                if patch_result:
+                    for fp in patch_result.get("files", []):
+                        if fp.get("status") != "success":
+                            continue
+                        rel = _relative_path(folder_path, fp.get("file", ""))
+                        orig   = fp.get("original", "")
+                        patched = fp.get("patched", orig)
+                        if orig != patched:
+                            files_original[rel] = orig
+                            files_patched[rel]  = patched
+            else:
+                yield _sse({"event": "info", "phase": "patch",
+                            "message": "No code changes needed — only updating the version pin."})
+
+            # ── Store session and emit final result ────────────────────────
+            session_id = f"preview_{uuid.uuid4().hex[:10]}"
+            session = {
+                "session_id":   session_id,
+                "folder_path":  str(folder_path.resolve()),
+                "package_info": pkg_info_dict,
+                "files_original": files_original,
+                "files_patched":  files_patched,
+                "created_at": time.time(),
+            }
+            PREVIEW_SESSIONS[session_id] = session
+            preview_resp = _preview_response(session)
+            n_files = preview_resp["summary"]["total_files_changed"]
+            n_add   = preview_resp["summary"]["total_additions"]
+            n_del   = preview_resp["summary"]["total_deletions"]
+            yield _sse({"event": "done",
+                        "message": f"Preview ready — {n_files} file(s) changed  +{n_add} / −{n_del}",
+                        "preview": preview_resp})
+
+        except Exception as exc:
+            logger.error(f"Preview stream error: {exc}")
+            yield _sse({"event": "error", "message": str(exc)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
 @app.post("/apply")
 def apply_preview(req: ApplyPreviewRequest):
     _cleanup_preview_sessions()

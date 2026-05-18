@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowLeft,
   ChevronDown,
   ChevronRight,
-  CheckCircle2,
   FileCode2,
   Folder,
   FolderOpen,
@@ -19,10 +19,11 @@ import { type PackageData } from "@/components/PackagesTable";
 import {
   getFileContent,
   getProjectFiles,
-  previewUpdate,
+  previewUpdateStream,
   type ApplyResponse,
   type ChangedFile,
   type PreviewResponse,
+  type PreviewStreamEvent,
   type ProjectFile,
 } from "@/hooks/useDepGuard";
 import { cn } from "@/lib/utils";
@@ -46,6 +47,12 @@ type DiffLine = {
   newLine?: number;
 };
 
+type StreamLine = {
+  id: number;
+  message: string;
+  status: "running" | "success" | "error" | "info" | "sub";
+};
+
 type ExplorerNode = {
   name: string;
   path: string;
@@ -67,7 +74,9 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => new Set([""]));
   const [previewData, setPreviewData] = useState<PreviewResponse | null>(null);
   const [previewPackageName, setPreviewPackageName] = useState("");
+  const [previewActiveFile, setPreviewActiveFile] = useState("");
   const [reviewActivity, setReviewActivity] = useState<DiffReviewActivityState | null>(null);
+  const [streamLines, setStreamLines] = useState<StreamLine[]>([]);
   const [rightPanelMode, setRightPanelMode] = useState<"dependencies" | "progress">("dependencies");
 
   const resetWorkspaceState = () => {
@@ -132,6 +141,16 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
 
   const explorerTree = useMemo(() => buildExplorerTree(filteredFiles), [filteredFiles]);
 
+  const previewFilePaths = useMemo(() => {
+    if (!previewData) return new Set<string>();
+    const s = new Set<string>();
+    for (const f of previewData.files) {
+      s.add(f.file_path);
+      s.add(f.relative_path);
+    }
+    return s;
+  }, [previewData]);
+
   useEffect(() => {
     if (fileQuery.trim()) {
       setExpandedFolders(getFolderPaths(filteredFiles));
@@ -147,14 +166,37 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
     setUpdatingPackage(pkg.name);
     setRightPanelMode("progress");
     setReviewActivity(null);
+    setStreamLines([]);
     onLog(`Preparing IDE preview for ${pkg.name}.`, "info");
+
+    const appendLine = (line: Omit<StreamLine, "id">) =>
+      setStreamLines((prev) => [...prev, { ...line, id: prev.length }]);
+
+    const onEvent = (event: PreviewStreamEvent) => {
+      if (event.event === "patch_file_start") return;
+      const msg = event.message ?? "";
+      if (event.event === "phase") {
+        appendLine({ message: msg, status: "running" });
+      } else if (event.event === "ast_done" || event.event === "scout_done" || event.event === "done") {
+        appendLine({ message: msg, status: "success" });
+      } else if (event.event === "patch_file_done") {
+        appendLine({ message: msg, status: event.success ? "sub" : "error" });
+      } else if (event.event === "error") {
+        appendLine({ message: msg, status: "error" });
+      } else {
+        appendLine({ message: msg, status: "info" });
+      }
+    };
+
     try {
-      const result = await previewUpdate(folderPath, pkg);
+      const result = await previewUpdateStream(folderPath, pkg, onEvent);
       if (result.files.length === 0) {
         onLog(`No file changes needed for ${pkg.name}.`, "success");
       } else {
         setPreviewData(result);
         setPreviewPackageName(pkg.name);
+        setPreviewActiveFile(result.files[0]?.file_path ?? "");
+        setSelectedFile(result.files[0]?.file_path ?? "");
         setRightPanelMode("progress");
         onLog(`Preview ready for ${pkg.name}: ${result.summary.total_files_changed} file(s) changed.`, "info");
       }
@@ -177,6 +219,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
     }
     setPreviewData(null);
     setPreviewPackageName("");
+    setPreviewActiveFile("");
     setReviewActivity(null);
     setRightPanelMode("dependencies");
     void loadFiles();
@@ -189,8 +232,12 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
     onLog(`Discarded preview for ${previewPackageName}.`, "info");
     setPreviewData(null);
     setPreviewPackageName("");
+    setPreviewActiveFile("");
     setReviewActivity(null);
     setRightPanelMode("dependencies");
+    if (selectedFile) {
+      void loadContent(selectedFile);
+    }
   };
 
   const openChangedFile = (file: ChangedFile) => {
@@ -229,7 +276,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
         <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-card/70 lg:border-b-0 lg:border-r">
           <div className="flex h-10 shrink-0 items-center gap-2 border-b px-3">
             <FolderTree className="h-4 w-4" />
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Explorer</h2>
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-100">Explorer</h2>
             <button
               onClick={() => void loadFiles()}
               className="ml-auto rounded-md p-1 text-muted-foreground transition hover:bg-muted hover:text-foreground"
@@ -265,8 +312,18 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
                   depth={0}
                   selectedFile={selectedFile}
                   expandedFolders={expandedFolders}
+                  previewFilePaths={previewFilePaths}
                   onToggleFolder={toggleFolder}
                   onSelectFile={(file) => {
+                    if (previewData) {
+                      setSelectedFile(file.path);
+                      if (previewFilePaths.has(file.path)) {
+                        setPreviewActiveFile(file.path);
+                      } else {
+                        void loadContent(file.path);
+                      }
+                      return;
+                    }
                     setActiveChangedFile("");
                     setSelectedFile(file.path);
                   }}
@@ -282,10 +339,10 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
               <div className="flex min-w-0 items-center gap-2">
                 <GitCompareArrows className="h-4 w-4 shrink-0" />
                 <div className="min-w-0">
-                  <h2 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-100">
                     {currentChangedFile ? "Diff Viewer" : "Editor"}
                   </h2>
-                  <p className="truncate text-xs text-muted-foreground">{selectedFile || "Select a file"}</p>
+                  <p className="truncate text-xs text-zinc-300">{selectedFile || "Select a file"}</p>
                 </div>
               </div>
               <button
@@ -300,14 +357,50 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
           )}
 
           {previewData ? (
-            <DiffReviewPanel
-              preview={previewData}
-              layout="embedded"
-              onActivityChange={setReviewActivity}
-              onApplied={handlePreviewApplied}
-              onDiscarded={handlePreviewDiscarded}
-              onError={(message) => onLog(message, "error")}
-            />
+            <>
+              {/* Always mounted — hidden when browsing a non-preview file so decision state is preserved */}
+              <div className={cn("flex-1 min-h-0 overflow-hidden", !previewFilePaths.has(selectedFile) && "hidden")}>
+                <DiffReviewPanel
+                  preview={previewData}
+                  layout="embedded"
+                  folderPath={folderPath}
+                  activeFilePath={previewActiveFile}
+                  onFileChange={(fp) => { setPreviewActiveFile(fp); setSelectedFile(fp); }}
+                  onActivityChange={setReviewActivity}
+                  onApplied={handlePreviewApplied}
+                  onDiscarded={handlePreviewDiscarded}
+                  onError={(message) => onLog(message, "error")}
+                />
+              </div>
+              {/* Regular file view while preview is active */}
+              {!previewFilePaths.has(selectedFile) && (
+                <div className="flex flex-1 min-h-0 flex-col overflow-hidden">
+                  <div className="flex h-10 shrink-0 items-center justify-between border-b bg-card px-3">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <FileCode2 className="h-4 w-4 shrink-0 text-zinc-400" />
+                      <p className="min-w-0 truncate text-xs text-zinc-200">{selectedFile || "Select a file"}</p>
+                    </div>
+                    {previewActiveFile && (
+                      <button
+                        onClick={() => setSelectedFile(previewActiveFile)}
+                        className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted"
+                      >
+                        <GitCompareArrows className="h-3.5 w-3.5" />
+                        Back to diff
+                      </button>
+                    )}
+                  </div>
+                  {isLoadingContent ? (
+                    <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Loading file
+                    </div>
+                  ) : (
+                    <CodeViewer content={fileContent} />
+                  )}
+                </div>
+              )}
+            </>
           ) : isLoadingFiles && !selectedFile ? (
             <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -337,7 +430,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
         <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-card/70">
           <div className="flex h-10 shrink-0 items-center gap-2 border-b px-3">
             <PackageOpen className="h-4 w-4" />
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Right Panel</h2>
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-100">Right Panel</h2>
             <div className="ml-auto flex rounded-md border bg-background p-0.5">
               <button
                 onClick={() => setRightPanelMode("dependencies")}
@@ -361,7 +454,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
           </div>
           {rightPanelMode === "progress" ? (
             updatingPackage && !previewData ? (
-              <PreparingPreviewPanel packageName={updatingPackage} />
+              <StreamingProgressPanel lines={streamLines} packageName={updatingPackage} />
             ) : (
               <DiffReviewActivityPanel activity={reviewActivity} />
             )
@@ -378,17 +471,50 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog }: IdeWor
   );
 }
 
-function PreparingPreviewPanel({ packageName }: { packageName: string }) {
+function StreamingProgressPanel({ lines, packageName }: { lines: StreamLine[]; packageName: string }) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [lines.length]);
+
   return (
-    <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
-      <div className="rounded-lg border bg-background p-4">
-        <div className="flex items-center gap-2 text-sm font-semibold">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          Preparing preview
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="flex h-9 shrink-0 items-center gap-2 border-b px-3">
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-400" />
+        <span className="text-xs font-semibold text-zinc-200">Preparing — {packageName}</span>
+      </div>
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto p-3 font-mono text-xs">
+        <div className="space-y-1">
+          {lines.length === 0 && (
+            <p className="text-zinc-500">Starting pipeline…</p>
+          )}
+          {lines.map((line, idx) => {
+            const isActiveLast = line.status === "running" && idx === lines.length - 1;
+            return (
+              <div key={line.id} className={cn("flex items-start gap-2", line.status === "sub" && "pl-4")}>
+                <span className="mt-px shrink-0 w-4 text-center">
+                  {isActiveLast && <Loader2 className="h-3 w-3 animate-spin text-sky-400" />}
+                  {!isActiveLast && line.status === "running" && <span className="text-zinc-500">●</span>}
+                  {line.status === "success" && <span className="text-emerald-400">✓</span>}
+                  {line.status === "error"   && <span className="text-red-400">✗</span>}
+                  {line.status === "sub"     && <span className="text-zinc-500">↳</span>}
+                  {line.status === "info"    && <span className="text-zinc-600">·</span>}
+                </span>
+                <span className={cn(
+                  "min-w-0 break-all leading-5",
+                  isActiveLast ? "text-zinc-100" : "text-zinc-400",
+                  line.status === "success" && "text-zinc-300",
+                  line.status === "error"   && "text-red-400",
+                  line.status === "sub"     && "text-zinc-400",
+                )}>
+                  {line.message}
+                </span>
+              </div>
+            );
+          })}
         </div>
-        <p className="mt-2 text-xs leading-5 text-muted-foreground">
-          DepGuard is finding related files, asking the LLM for changes, and building the review diff for {packageName}.
-        </p>
       </div>
     </div>
   );
@@ -520,10 +646,10 @@ function CodeViewer({ content }: { content: string }) {
   const lines = content ? content.split("\n") : ["Select a file from the explorer."];
 
   return (
-    <pre className="min-h-0 flex-1 overflow-auto p-4 font-mono text-xs leading-6 text-zinc-300">
+    <pre className="min-h-0 flex-1 overflow-auto p-4 font-mono text-xs leading-6 text-zinc-100">
       {lines.map((line, index) => (
         <div key={`${index}-${line}`} className="flex min-w-max">
-          <span className="mr-4 w-10 select-none text-right text-zinc-600">{index + 1}</span>
+          <span className="mr-4 w-10 select-none text-right text-zinc-500">{index + 1}</span>
           <code>{line || " "}</code>
         </div>
       ))}
@@ -536,6 +662,7 @@ function ExplorerTreeNode({
   depth,
   selectedFile,
   expandedFolders,
+  previewFilePaths,
   onToggleFolder,
   onSelectFile,
 }: {
@@ -543,19 +670,21 @@ function ExplorerTreeNode({
   depth: number;
   selectedFile: string;
   expandedFolders: Set<string>;
+  previewFilePaths?: Set<string>;
   onToggleFolder: (path: string) => void;
   onSelectFile: (file: ProjectFile) => void;
 }) {
   const isFolder = node.type === "folder";
   const isExpanded = expandedFolders.has(node.path);
   const isSelected = node.file?.path === selectedFile;
+  const hasPreviewChange = Boolean(node.file && previewFilePaths?.has(node.file.path));
 
   if (isFolder) {
     return (
       <div>
         <button
           onClick={() => onToggleFolder(node.path)}
-          className="flex h-8 w-full min-w-0 items-center gap-1.5 rounded-md pr-2 text-left text-sm text-muted-foreground transition hover:bg-muted hover:text-foreground"
+          className="flex h-8 w-full min-w-0 items-center gap-1.5 rounded-md pr-2 text-left text-sm text-zinc-300 transition hover:bg-muted hover:text-zinc-100"
           style={{ paddingLeft: depth * 14 + 6 }}
           title={node.path || node.name}
         >
@@ -572,6 +701,7 @@ function ExplorerTreeNode({
                 depth={depth + 1}
                 selectedFile={selectedFile}
                 expandedFolders={expandedFolders}
+                previewFilePaths={previewFilePaths}
                 onToggleFolder={onToggleFolder}
                 onSelectFile={onSelectFile}
               />
@@ -587,13 +717,20 @@ function ExplorerTreeNode({
       onClick={() => node.file && onSelectFile(node.file)}
       className={cn(
         "flex h-8 w-full min-w-0 items-center gap-1.5 rounded-md pr-2 text-left text-sm transition",
-        isSelected ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground"
+        isSelected
+          ? "bg-primary text-primary-foreground"
+          : hasPreviewChange
+            ? "text-amber-300 hover:bg-muted hover:text-amber-200"
+            : "text-zinc-300 hover:bg-muted hover:text-zinc-100"
       )}
       style={{ paddingLeft: depth * 14 + 24 }}
       title={node.path}
     >
       <FileCode2 className="h-4 w-4 shrink-0" />
-      <span className="truncate">{node.name}</span>
+      <span className="min-w-0 flex-1 truncate">{node.name}</span>
+      {hasPreviewChange && !isSelected && (
+        <span className="ml-1 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
+      )}
     </button>
   );
 }
@@ -602,7 +739,7 @@ function DiffViewer({ before, after }: { before: string; after: string }) {
   const diff = useMemo(() => buildLineDiff(before, after), [after, before]);
 
   return (
-    <pre className="min-h-0 flex-1 overflow-auto p-4 font-mono text-xs leading-6 text-zinc-300">
+    <pre className="min-h-0 flex-1 overflow-auto p-4 font-mono text-xs leading-6 text-zinc-100">
       {diff.map((line, index) => (
         <div
           key={`${index}-${line.type}-${line.text}`}
@@ -613,8 +750,8 @@ function DiffViewer({ before, after }: { before: string; after: string }) {
             line.type === "same" && "border-transparent"
           )}
         >
-          <span className="mr-3 w-9 select-none text-right text-zinc-600">{line.oldLine ?? ""}</span>
-          <span className="mr-3 w-9 select-none text-right text-zinc-600">{line.newLine ?? ""}</span>
+          <span className="mr-3 w-9 select-none text-right text-zinc-500">{line.oldLine ?? ""}</span>
+          <span className="mr-3 w-9 select-none text-right text-zinc-500">{line.newLine ?? ""}</span>
           <span className="mr-3 select-none">{line.type === "added" ? "+" : line.type === "removed" ? "-" : " "}</span>
           <code>{line.text || " "}</code>
         </div>

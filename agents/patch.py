@@ -1493,6 +1493,7 @@ class PatchAgent:
         replacements: list[dict],
         target_blocks: list[dict],
         scout_context: dict | None,
+        matches: list | None = None,
     ) -> None:
         if not replacements or not scout_context or self._allows_llm_prior_fallback(scout_context):
             return
@@ -1527,29 +1528,49 @@ class PatchAgent:
                 f"{names}. Only add keyword arguments that appear in Scout evidence."
             )
 
-        # Also check that parameters_changed[].old_param were actually removed from the call
-        for bc in scout_context.get("breaking_changes", []):
-            for p in (bc.get("parameters_changed") or []):
-                old_param = str(p.get("old_param", "") or "")
-                if not old_param:
-                    continue
-                for replacement in replacements:
-                    block = blocks_by_range.get((replacement["start_line"], replacement["end_line"]))
-                    if not block:
+        # Also check that parameters_changed[].old_param were removed from
+        # relevant migrated calls. Do not reject unrelated calls in the same
+        # target block that happen to use the same keyword name.
+        for replacement in replacements:
+            block = blocks_by_range.get((replacement["start_line"], replacement["end_line"]))
+            if not block:
+                continue
+            relevant_call_names = self._relevant_call_names_for_block(block, matches)
+            repl_source = str(replacement.get("replacement", "") or "")
+            for bc in scout_context.get("breaking_changes", []):
+                for p in (bc.get("parameters_changed") or []):
+                    old_param = str(p.get("old_param", "") or "")
+                    if not old_param or not re.search(rf'\b{re.escape(old_param)}\s*=', str(block.get("source", "") or "")):
                         continue
-                    block_source = str(block.get("source", "") or "")
-                    repl_source = str(replacement.get("replacement", "") or "")
-                    param_present_in_original = re.search(rf'\b{re.escape(old_param)}\s*=', block_source)
-                    param_still_in_replacement = re.search(rf'\b{re.escape(old_param)}\s*=', repl_source)
-                    if param_present_in_original and param_still_in_replacement:
+                    if self._relevant_calls_contain_kwarg(repl_source, old_param, relevant_call_names):
                         workaround = str(p.get("replacement", "") or "nothing")
                         raise PatchResponseError(
-                            f"Replacement still contains deprecated keyword argument '{old_param}='. "
+                            f"Replacement still contains deprecated keyword argument '{old_param}'. "
                             f"This argument was removed in the new version. "
-                            f"Remove it from the call"
+                            f"Remove it from the migrated call"
                             + (f" and use '{workaround}' instead" if workaround and workaround != "nothing" else "")
                             + "."
                         )
+
+    def _relevant_calls_contain_kwarg(
+        self,
+        source: str,
+        kwarg: str,
+        relevant_call_names: set[str],
+    ) -> bool:
+        try:
+            tree = ast.parse(textwrap.dedent(source or ""))
+        except SyntaxError:
+            return bool(re.search(rf"\b{re.escape(kwarg)}\s*=", source or ""))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not any(keyword.arg == kwarg for keyword in node.keywords):
+                continue
+            call_name = self._ast_call_name(node.func)
+            if not relevant_call_names or self._call_name_matches(call_name, relevant_call_names):
+                return True
+        return False
 
     def _bare_call_names(self, source: str) -> set[str]:
         try:
@@ -1620,18 +1641,243 @@ class PatchAgent:
         source = re.sub(rf"\b{escaped}\s*=\s*{val_pat}", "", source)
         return source
 
+    def _api_call_name_variants(self, api_name: str) -> set[str]:
+        value = str(api_name or "").strip()
+        if not value:
+            return set()
+        value = value.replace("::", ".").replace("/", ".")
+        value = re.sub(r"\(\)$", "", value)
+        parts = [part for part in value.split(".") if part]
+        if not parts:
+            return set()
+        variants = {value, parts[-1]}
+        if len(parts) >= 2:
+            variants.add(".".join(parts[-2:]))
+        return variants
+
+    def _matched_lines_for_block(self, block: dict, matches: list | None) -> set[int]:
+        start = int(block.get("start_line", 1) or 1)
+        end = int(block.get("end_line", start) or start)
+        return {
+            int(match.get("line"))
+            for match in matches or []
+            if (
+                isinstance(match, dict)
+                and isinstance(match.get("line"), int)
+                and start <= int(match.get("line")) <= end
+            )
+        }
+
+    def _relevant_call_names_for_block(self, block: dict, matches: list | None) -> set[str]:
+        matched_lines = self._matched_lines_for_block(block, matches)
+        if not matched_lines:
+            return set()
+
+        call_names: set[str] = set()
+        for match in matches or []:
+            if not isinstance(match, dict) or match.get("line") not in matched_lines:
+                continue
+            call_names.update(self._api_call_name_variants(str(match.get("old_api", "") or "")))
+            call_names.update(self._api_call_name_variants(str(match.get("new_api", "") or "")))
+
+        block_start = int(block.get("start_line", 1) or 1)
+        try:
+            tree = ast.parse(textwrap.dedent(str(block.get("source", "") or "")))
+        except SyntaxError:
+            return call_names
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            lineno = getattr(node, "lineno", 0)
+            end_lineno = getattr(node, "end_lineno", lineno)
+            absolute_lines = set(range(block_start + lineno - 1, block_start + end_lineno))
+            if not absolute_lines & matched_lines:
+                continue
+            call_name = self._ast_call_name(node.func)
+            if call_name:
+                call_names.add(call_name)
+                call_names.add(call_name.rsplit(".", 1)[-1])
+        return {name for name in call_names if name}
+
+    def _keyword_names_on_relevant_original_calls(self, block: dict, matches: list | None) -> set[str]:
+        matched_lines = self._matched_lines_for_block(block, matches)
+        if not matched_lines:
+            return set()
+        try:
+            tree = ast.parse(textwrap.dedent(str(block.get("source", "") or "")))
+        except SyntaxError:
+            return set()
+
+        block_start = int(block.get("start_line", 1) or 1)
+        keywords: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            lineno = getattr(node, "lineno", 0)
+            end_lineno = getattr(node, "end_lineno", lineno)
+            absolute_lines = set(range(block_start + lineno - 1, block_start + end_lineno))
+            if not absolute_lines & matched_lines:
+                continue
+            for keyword in node.keywords:
+                if keyword.arg:
+                    keywords.add(keyword.arg)
+        return keywords
+
+    def _evidence_marks_kwarg_migration(self, evidence_text: str, kwarg: str) -> bool:
+        if not evidence_text or not kwarg:
+            return False
+        normalized = self._normalize_text(self._clean_rst_api_roles(evidence_text))
+        if not normalized:
+            return False
+
+        kw = re.escape(kwarg.lower())
+        occurrences = [match.start() for match in re.finditer(rf"\b{kw}\b", normalized)]
+        if not occurrences:
+            return False
+
+        keyword_context_patterns = [
+            rf"\b{kw}\s*=",
+            rf"\b{kw}\b[^.\n]{{0,80}}\b(?:keyword|argument|parameter|param|option|kwarg)\b",
+            rf"\b(?:keyword|argument|parameter|param|option|kwarg)\b[^.\n]{{0,100}}\b{kw}\b",
+        ]
+        migration_markers = [
+            "does not have",
+            "removed",
+            "remove",
+            "deprecated",
+            "deprecation",
+            "no longer",
+            "not accepted",
+            "not supported",
+            "unexpected keyword",
+            "got an unexpected keyword",
+            "renamed",
+            "replacement",
+            "replaced",
+            "instead",
+            "to avoid",
+            "mimics the behavior",
+            "mimics behavior",
+            "should be replaced",
+            "requires",
+            "required",
+        ]
+        for index in occurrences:
+            window = normalized[max(0, index - 250): index + 400]
+            if not any(re.search(pattern, window) for pattern in keyword_context_patterns):
+                continue
+            if any(marker in window for marker in migration_markers):
+                return True
+        return False
+
+    def _evidence_deprecated_kwargs_for_block(
+        self,
+        block: dict,
+        scout_context: dict | None,
+        matches: list | None,
+    ) -> list[str]:
+        if not scout_context:
+            return []
+
+        block_source = str(block.get("source", "") or "")
+        params: list[str] = []
+        for bc in scout_context.get("breaking_changes", []) or []:
+            for param_change in (bc.get("parameters_changed") or []):
+                old_param = str(param_change.get("old_param", "") or "").strip()
+                if old_param and re.search(rf"\b{re.escape(old_param)}\s*=", block_source):
+                    params.append(old_param)
+
+        evidence_text = self._combined_evidence_text(
+            scout_context.get("api_evidence", []),
+            scout_context.get("evidence_references") or scout_context.get("references", []),
+        )
+        for keyword in sorted(self._keyword_names_on_relevant_original_calls(block, matches)):
+            if self._evidence_marks_kwarg_migration(evidence_text, keyword):
+                params.append(keyword)
+
+        deduped: list[str] = []
+        seen = set()
+        for param in params:
+            key = param.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(param)
+        return deduped
+
+    def _strip_kwarg_from_relevant_calls(
+        self,
+        source: str,
+        kwarg: str,
+        relevant_call_names: set[str],
+        block: dict,
+        matches: list | None,
+    ) -> str:
+        if not source or not kwarg:
+            return source
+        try:
+            tree = ast.parse(textwrap.dedent(source))
+        except SyntaxError:
+            return self._strip_kwarg_from_matched_lines(source, kwarg, block, matches)
+
+        line_ranges: list[tuple[int, int]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not any(keyword.arg == kwarg for keyword in node.keywords):
+                continue
+            call_name = self._ast_call_name(node.func)
+            if relevant_call_names and not self._call_name_matches(call_name, relevant_call_names):
+                continue
+            lineno = getattr(node, "lineno", 0)
+            end_lineno = getattr(node, "end_lineno", lineno)
+            if lineno:
+                line_ranges.append((lineno, end_lineno or lineno))
+
+        if not line_ranges:
+            return source
+
+        lines = source.splitlines()
+        for lineno, end_lineno in sorted(line_ranges, reverse=True):
+            start_index = max(0, lineno - 1)
+            end_index = min(len(lines), end_lineno)
+            segment = "\n".join(lines[start_index:end_index])
+            cleaned = self._strip_kwarg_from_source(segment, kwarg)
+            lines[start_index:end_index] = cleaned.splitlines()
+        return "\n".join(lines)
+
+    def _strip_kwarg_from_matched_lines(
+        self,
+        source: str,
+        kwarg: str,
+        block: dict,
+        matches: list | None,
+    ) -> str:
+        matched_lines = self._matched_lines_for_block(block, matches)
+        if not matched_lines:
+            return source
+        start = int(block.get("start_line", 1) or 1)
+        lines = source.splitlines()
+        for absolute_line in sorted(matched_lines, reverse=True):
+            offset = absolute_line - start
+            if 0 <= offset < len(lines):
+                lines[offset] = self._strip_kwarg_from_source(lines[offset], kwarg)
+        return "\n".join(lines)
+
     def _prune_deprecated_kwargs(
         self,
         replacements: list[dict],
         target_blocks: list[dict],
         scout_context: dict | None,
+        matches: list | None = None,
     ) -> list[dict]:
-        """Deterministically strip kwargs listed in parameters_changed.
+        """Deterministically strip kwargs documented as migration-sensitive.
 
         Runs before any validator so that even if the LLM keeps a deprecated
-        kwarg, the Python backend removes it first.  Only strips a kwarg when
-        the corresponding old_param= was actually present in the original target
-        block, so the cleaner never touches unrelated code.
+        kwarg, the Python backend removes it first. It uses structured
+        parameters_changed when available, and also scans raw Scout evidence for
+        keyword migration language. Removal is scoped to matched migrated calls.
         """
         if not replacements or not scout_context:
             return replacements
@@ -1640,27 +1886,27 @@ class PatchAgent:
             (b["start_line"], b["end_line"]): b
             for b in target_blocks
         }
-        deprecated_params: list[str] = []
-        for bc in scout_context.get("breaking_changes", []):
-            for p in (bc.get("parameters_changed") or []):
-                old_param = str(p.get("old_param", "") or "").strip()
-                if old_param and old_param not in deprecated_params:
-                    deprecated_params.append(old_param)
-
-        if not deprecated_params:
-            return replacements
-
         pruned = []
         for repl in replacements:
             block = blocks_by_range.get((repl["start_line"], repl["end_line"]))
             block_source = str(block.get("source", "") or "") if block else ""
             repl_text = str(repl.get("replacement", "") or "")
+            if not block:
+                pruned.append(repl)
+                continue
 
+            relevant_call_names = self._relevant_call_names_for_block(block, matches)
+            deprecated_params = self._evidence_deprecated_kwargs_for_block(block, scout_context, matches)
             for old_param in deprecated_params:
-                # Only clean if the kwarg was actually in the original block
                 if not re.search(rf"\b{re.escape(old_param)}\s*=", block_source):
                     continue
-                cleaned = self._strip_kwarg_from_source(repl_text, old_param)
+                cleaned = self._strip_kwarg_from_relevant_calls(
+                    repl_text,
+                    old_param,
+                    relevant_call_names,
+                    block,
+                    matches,
+                )
                 if cleaned != repl_text:
                     logger.debug(
                         "Pruned deprecated kwarg '%s=' from replacement (line %s-%s)",
@@ -1680,7 +1926,12 @@ class PatchAgent:
         matches: list | None = None,
     ) -> str:
         replacements = self._parse_replacements(response_text)
-        replacements = self._prune_deprecated_kwargs(replacements, target_blocks, scout_context)
+        replacements = self._prune_deprecated_kwargs(
+            replacements,
+            target_blocks,
+            scout_context,
+            matches or [],
+        )
         self._validate_replacements_preserve_unchanged_code(
             replacements,
             target_blocks,
@@ -1706,6 +1957,7 @@ class PatchAgent:
             replacements,
             target_blocks,
             scout_context,
+            matches or [],
         )
         self._validate_replacements_against_migration_obligations(
             replacements,
@@ -2170,7 +2422,7 @@ class PatchAgent:
 
         return asyncio.run(_run_and_close())
 
-    async def preview(self, scout_output: dict, ast_scanner_output: dict) -> dict:
+    async def preview(self, scout_output: dict, ast_scanner_output: dict, on_file_progress=None) -> dict:
         package = scout_output.get("package", "unknown")
         from_v = scout_output.get("from_version", "")
         to_v = scout_output.get("to_version", "")
@@ -2200,11 +2452,24 @@ class PatchAgent:
             task_type = "patch_complex"
 
         for filepath, matches in matches_by_file.items():
+            if on_file_progress:
+                await on_file_progress({
+                    "event": "patch_file_start",
+                    "file": filepath,
+                    "message": f"Patching {Path(filepath).name}...",
+                })
             success, error_msg, llm_info, original_content, patched_content = await self._generate_patched_content(filepath, matches, scout_output, task_type)
             if llm_info:
                 report["llm_provider"] = llm_info.get("provider", report["llm_provider"])
                 report["fallback_used"] = report["fallback_used"] or llm_info.get("fallback_used", False)
 
+            if on_file_progress:
+                await on_file_progress({
+                    "event": "patch_file_done",
+                    "file": filepath,
+                    "success": success,
+                    "message": Path(filepath).name,
+                })
             report["files"].append({
                 "file": filepath,
                 "status": "success" if success else "failed",
