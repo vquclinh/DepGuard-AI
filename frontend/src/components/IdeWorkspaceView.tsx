@@ -112,6 +112,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
   const [rightPanelMode, setRightPanelMode] = useState<"dependencies" | "progress">("dependencies");
   const [explorerWidth, setExplorerWidth] = useState(EXPLORER_DEFAULT_WIDTH);
   const [isExplorerHidden, setIsExplorerHidden] = useState(false);
+  const [isExplorerPeeking, setIsExplorerPeeking] = useState(false);
   const [isResizingExplorer, setIsResizingExplorer] = useState(false);
   const [updateQueue, setUpdateQueue] = useState<PackageData[]>([]);
   const [isBatchUpdating, setIsBatchUpdating] = useState(false);
@@ -626,19 +627,41 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
       </div>
 
       <div
-        className={cn("grid min-h-0 flex-1 overflow-hidden", isResizingExplorer && "cursor-col-resize select-none")}
+        className={cn(
+          "grid min-h-0 flex-1 overflow-hidden transition-[grid-template-columns] duration-200",
+          isResizingExplorer && "cursor-col-resize select-none"
+        )}
         style={{
           gridTemplateColumns: isExplorerHidden
-            ? "0 minmax(0, 1fr) minmax(280px, 25%)"
+            ? `${isExplorerPeeking ? 44 : 8}px minmax(0, 1fr) minmax(280px, 25%)`
             : `${explorerWidth}px minmax(0, 1fr) minmax(280px, 25%)`,
         }}
       >
         <aside
+          onMouseEnter={() => isExplorerHidden && setIsExplorerPeeking(true)}
+          onMouseLeave={() => isExplorerHidden && setIsExplorerPeeking(false)}
+          onClick={() => {
+            if (!isExplorerHidden) return;
+            setIsExplorerHidden(false);
+            setIsExplorerPeeking(false);
+          }}
           className={cn(
-            "relative flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-card/70 transition-opacity lg:border-b-0 lg:border-r",
-            isExplorerHidden && "pointer-events-none opacity-0"
+            "relative flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-card/70 lg:border-b-0 lg:border-r",
+            isExplorerHidden && "cursor-pointer bg-card/90"
           )}
         >
+          {isExplorerHidden ? (
+            <div
+              className={cn(
+                "flex h-full items-start justify-center border-r border-border pt-3 text-muted-foreground transition-colors hover:border-zinc-500/70 hover:bg-muted/60 hover:text-zinc-200",
+                !isExplorerPeeking && "text-transparent"
+              )}
+              title="Show Explorer"
+            >
+              <PanelLeftOpen className="h-4 w-4 shrink-0" />
+            </div>
+          ) : (
+            <>
           <div className="flex h-10 shrink-0 items-center gap-2 border-b px-3">
             <FolderTree className="h-4 w-4" />
             <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-100">Explorer</h2>
@@ -650,7 +673,10 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
               {isLoadingFiles || isLoadingContent ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             </button>
             <button
-              onClick={() => setIsExplorerHidden(true)}
+              onClick={() => {
+                setIsExplorerHidden(true);
+                setIsExplorerPeeking(false);
+              }}
               className="rounded-md p-1 text-muted-foreground transition hover:bg-muted hover:text-foreground"
               title="Hide Explorer"
             >
@@ -714,19 +740,11 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
           >
             <GripVertical className="h-4 w-4" />
           </div>
+            </>
+          )}
         </aside>
 
         <section className="relative flex min-h-0 min-w-0 flex-col overflow-hidden border-b bg-[#101010] lg:border-b-0 lg:border-r">
-          {isExplorerHidden && (
-            <button
-              onClick={() => setIsExplorerHidden(false)}
-              className="absolute left-2 top-2 z-30 inline-flex h-7 items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-950/90 px-2 text-[11px] font-semibold text-zinc-200 shadow-lg transition hover:border-sky-500/60 hover:text-white"
-              title="Show Explorer"
-            >
-              <PanelLeftOpen className="h-3.5 w-3.5" />
-              Explorer
-            </button>
-          )}
           {!previewData && (
             <div className="flex h-10 shrink-0 items-center justify-between border-b bg-card px-3">
               <div className="flex min-w-0 items-center gap-2">
@@ -1159,27 +1177,6 @@ function DependenciesPanel({
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="shrink-0 space-y-2 border-b p-3">
-        <div className="flex items-center gap-2">
-          <button
-            onClick={onUpdateAll}
-            disabled={Boolean(updatingPackage) || isBatchUpdating || updateAllCount === 0}
-            title="Queue every outdated package and review one preview at a time"
-            className="inline-flex h-8 min-w-0 flex-1 items-center justify-center gap-2 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition hover:bg-primary/90 disabled:opacity-50"
-          >
-            {isBatchUpdating || updatingPackage ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ListTodo className="h-3.5 w-3.5" />}
-            Update All
-            <span className="rounded bg-primary-foreground/20 px-1.5 py-0.5 text-[10px]">{updateAllCount}</span>
-          </button>
-          {isBatchUpdating && (
-            <button
-              onClick={onCancelUpdateAll}
-              title="Cancel remaining queued updates"
-              className="inline-flex h-8 items-center justify-center rounded-md border bg-background px-2 text-xs font-semibold text-muted-foreground transition hover:bg-muted hover:text-foreground"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          )}
-        </div>
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
@@ -1189,19 +1186,42 @@ function DependenciesPanel({
             className="h-8 w-full rounded-md border bg-background pl-8 pr-2 text-xs outline-none transition focus:border-primary"
           />
         </div>
-        <div className="flex gap-1 overflow-x-auto pb-0.5">
-          {(["all", "outdated", "vulnerable", "unpinned"] as const).map((mode) => (
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto pb-0.5">
+            {(["all", "outdated", "vulnerable", "unpinned"] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => setFilterMode(mode)}
+                className={cn(
+                  "shrink-0 rounded-md border px-2 py-1 text-[11px] font-semibold capitalize transition",
+                  filterMode === mode ? "border-primary bg-primary text-primary-foreground" : "bg-background text-muted-foreground hover:bg-muted"
+                )}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
             <button
-              key={mode}
-              onClick={() => setFilterMode(mode)}
-              className={cn(
-                "shrink-0 rounded-md border px-2 py-1 text-[11px] font-semibold capitalize transition",
-                filterMode === mode ? "border-primary bg-primary text-primary-foreground" : "bg-background text-muted-foreground hover:bg-muted"
-              )}
+              onClick={onUpdateAll}
+              disabled={Boolean(updatingPackage) || isBatchUpdating || updateAllCount === 0}
+              title="Queue every outdated package and review one preview at a time"
+              className="inline-flex h-7 items-center gap-1.5 rounded-md border bg-background px-2 text-[11px] font-semibold text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45"
             >
-              {mode}
+              {isBatchUpdating || updatingPackage ? <Loader2 className="h-3 w-3 animate-spin" /> : <ListTodo className="h-3 w-3" />}
+              All
+              <span className="rounded bg-muted px-1 py-0.5 text-[10px]">{updateAllCount}</span>
             </button>
-          ))}
+            {isBatchUpdating && (
+              <button
+                onClick={onCancelUpdateAll}
+                title="Cancel remaining queued updates"
+                className="inline-flex h-7 items-center justify-center rounded-md border bg-background px-2 text-xs font-semibold text-muted-foreground transition hover:bg-muted hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1253,7 +1273,7 @@ function DependenciesPanel({
                       ) : canUpdatePackage ? (
                         "Update"
                       ) : (
-                        "OK"
+                        "Update"
                       )}
                     </button>
                   </div>
