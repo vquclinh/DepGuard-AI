@@ -38,22 +38,7 @@ All of this is surfaced through a live-streaming IDE-like UI where you can inspe
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                        Frontend                          │
-│   React + TypeScript + Vite + TailwindCSS               │
-│   DashboardView · IdeWorkspaceView · DiffReviewPanel    │
-└────────────────────────┬────────────────────────────────┘
-                         │ HTTP / SSE
-┌────────────────────────▼────────────────────────────────┐
-│                   FastAPI Backend                        │
-│   /scan-stream  /preview-stream  /apply  /rollback      │
-└──────┬──────────┬──────────┬───────────┬────────────────┘
-       │          │          │           │
-  ScannerAgent  ScoutAgent  PatchAgent  ProjectChecker
-  WatchdogAgent            ASTScanner   RepairAgent
-                           ImpactGraph
-```
+![DepGuard AI Architecture](frontend/src/assets/architecture.svg)
 
 ### Agents
 
