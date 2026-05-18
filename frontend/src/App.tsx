@@ -1,9 +1,10 @@
 import { useState, useEffect } from "react";
-import { ShieldCheck, Activity } from "lucide-react";
+import { Activity } from "lucide-react";
 import { scanProjectStream, getProviders, browseProject } from "@/hooks/useDepGuard";
 import type { PackageData } from "@/components/PackagesTable";
 import type { LogEntry } from "@/components/UpdateLog";
 import { DashboardView, type HealthData } from "@/components/DashboardView";
+import { DepGuardLogo } from "@/components/DepGuardLogo";
 import { IdeWorkspaceView } from "@/components/IdeWorkspaceView";
 import { cn } from "@/lib/utils";
 
@@ -114,9 +115,7 @@ function App() {
       <header className="border-b bg-card shadow-sm sticky top-0 z-10 shrink-0">
         <div className="container mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="bg-primary text-primary-foreground p-2 rounded-lg">
-              <ShieldCheck className="w-6 h-6" />
-            </div>
+            <DepGuardLogo />
             <div>
               <h1 className="text-xl font-bold tracking-tight">DepGuard AI</h1>
               <p className="text-xs text-muted-foreground font-medium">Autonomous Dependency Architect</p>
