@@ -290,7 +290,21 @@ class PatchAgent:
             }
             for match in matches[:16]
         ]
-        compact_breaking_changes = scout_context.get("breaking_changes", [])[:16]
+        target_source = "\n".join(b.get("source", "") for b in target_blocks)
+        compact_breaking_changes = [
+            {
+                **bc,
+                "parameters_changed": [
+                    p for p in (bc.get("parameters_changed") or [])
+                    if re.search(rf'\\b{re.escape(str(p.get("old_param", "") or ""))}\\s*=', target_source)
+                ] or None,
+            }
+            for bc in scout_context.get("breaking_changes", [])[:16]
+        ]
+        # Strip None parameters_changed to keep prompt compact
+        compact_breaking_changes = [
+            {k: v for k, v in bc.items() if v is not None} for bc in compact_breaking_changes
+        ]
         matches_str = json.dumps(compact_matches, separators=(",", ":"))
         bc_str = json.dumps(compact_breaking_changes, separators=(",", ":"))
         api_evidence_str = self._format_api_evidence(scout_context.get("api_evidence", []))
