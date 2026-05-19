@@ -351,7 +351,7 @@ class ASTScanner:
         if not parser:
             return None
         try:
-            tree = parser.parse(content.encode("utf-8"))
+            tree = parser.parse(content)
             if getattr(tree.root_node, "has_error", False):
                 return f"tree-sitter parse error in {file_path}"
         except Exception as exc:
@@ -396,9 +396,9 @@ class ASTScanner:
             return []
 
         ignored: list[tuple[int, int]] = []
+        encoded = content.encode("utf-8")
         try:
-            encoded = content.encode("utf-8")
-            tree = parser.parse(encoded)
+            tree = parser.parse(content)
         except Exception:
             return []
 

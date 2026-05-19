@@ -659,10 +659,14 @@ async def preview_update_stream(req: UpdateRequest):
             yield _sse({"event": "phase", "phase": "ast_scan",
                         "message": f"Scanning codebase for {package} API usages…"})
 
-            ast_scanner = ASTScanner()
-            raw_usages = await asyncio.to_thread(ast_scanner.find_api_usages, str(folder_path), package)
+            def _run_ast_scan() -> tuple:
+                scanner = ASTScanner()
+                usages = scanner.find_api_usages(str(folder_path), package)
+                contexts = scanner.find_api_usage_contexts(str(folder_path), package)
+                return usages, contexts
+
+            raw_usages, api_contexts = await asyncio.to_thread(_run_ast_scan)
             api_usages = _prefer_specific_api_usages(raw_usages)
-            api_contexts = await asyncio.to_thread(ast_scanner.find_api_usage_contexts, str(folder_path), package)
 
             usage_count = sum(len(v) for v in api_usages.values()) if isinstance(api_usages, dict) else len(api_usages)
             file_count  = len(api_usages) if isinstance(api_usages, dict) else 0
@@ -676,10 +680,14 @@ async def preview_update_stream(req: UpdateRequest):
 
             scout = ScoutAgent()
             scout_output = await asyncio.to_thread(scout.run_sync, pkg_info_dict, api_usages, api_contexts)
-            scout_output, ast_output = await asyncio.to_thread(
-                _scan_breaking_changes_with_review_fallback,
-                ast_scanner, folder_path, scout_output, package, from_v, to_v, api_usages,
-            )
+
+            def _run_breaking_changes_scan() -> tuple:
+                scanner = ASTScanner()
+                return _scan_breaking_changes_with_review_fallback(
+                    scanner, folder_path, scout_output, package, from_v, to_v, api_usages,
+                )
+
+            scout_output, ast_output = await asyncio.to_thread(_run_breaking_changes_scan)
 
             bc_count = len(scout_output.get("breaking_changes", []))
             yield _sse({"event": "scout_done", "phase": "scout",
