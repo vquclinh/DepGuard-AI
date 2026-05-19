@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import React, { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -31,7 +32,9 @@ import {
   rollbackPackage,
   type ApplyResponse,
   type ChangedFile,
+  type PreviewChange,
   type PreviewFile,
+  type PreviewHunk,
   type PreviewResponse,
   type PreviewStreamEvent,
   type ProjectFile,
@@ -81,6 +84,50 @@ type CombinedDiffEntry = {
   files: PreviewFile[];
 };
 
+type HunkDecision = "accepted" | "rejected" | "pending";
+// key = `${sessionId}:${hunkId}`
+type AllHunkDecisions = Record<string, HunkDecision>;
+
+interface MergedHunk {
+  sessionId: string;
+  hunkData: PreviewHunk;
+}
+
+interface MergedFileView {
+  relativePath: string;
+  filePath: string;
+  totalAdditions: number;
+  totalDeletions: number;
+  mergedHunks: MergedHunk[];
+}
+
+function buildMergedFiles(entries: CombinedDiffEntry[]): MergedFileView[] {
+  const fileMap = new Map<string, MergedFileView>();
+  for (const entry of entries) {
+    for (const file of entry.files) {
+      if (!fileMap.has(file.relative_path)) {
+        fileMap.set(file.relative_path, {
+          relativePath: file.relative_path,
+          filePath: file.file_path,
+          totalAdditions: 0,
+          totalDeletions: 0,
+          mergedHunks: [],
+        });
+      }
+      const merged = fileMap.get(file.relative_path)!;
+      merged.totalAdditions += file.additions;
+      merged.totalDeletions += file.deletions;
+      for (const hunk of file.hunks) {
+        merged.mergedHunks.push({ sessionId: entry.sessionId, hunkData: hunk });
+      }
+    }
+  }
+  for (const merged of fileMap.values()) {
+    merged.mergedHunks.sort((a, b) => a.hunkData.old_start - b.hunkData.old_start);
+  }
+  return Array.from(fileMap.values());
+}
+
 const EXPLORER_MIN_WIDTH = 220;
 const EXPLORER_DEFAULT_WIDTH = 300;
 const EXPLORER_MAX_WIDTH = 520;
@@ -128,11 +175,28 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
   const queueRef = useRef<PackageData[]>([]);
   const [isBatchUpdating, setIsBatchUpdating] = useState(false);
   const [combinedDiffEntries, setCombinedDiffEntries] = useState<CombinedDiffEntry[] | null>(null);
+  const [combinedActiveFile, setCombinedActiveFile] = useState("");
+  const [combinedHunkDecisions, setCombinedHunkDecisions] = useState<AllHunkDecisions>({});
+  const [combinedExpandedContext, setCombinedExpandedContext] = useState<Record<string, boolean>>({});
   const [isApplyingAll, setIsApplyingAll] = useState(false);
   const batchCollectedRef = useRef<PreviewResponse[]>([]);
   const explorerDragRef = useRef({ startX: 0, startWidth: EXPLORER_DEFAULT_WIDTH });
 
   const updateAllCandidates = useMemo(() => packages.filter(isUpdateCandidate), [packages]);
+
+  const mergedFiles = useMemo(
+    () => (combinedDiffEntries ? buildMergedFiles(combinedDiffEntries) : []),
+    [combinedDiffEntries]
+  );
+
+  const combinedFilePaths = useMemo(() => {
+    const s = new Set<string>();
+    for (const f of mergedFiles) {
+      s.add(f.filePath);
+      s.add(f.relativePath);
+    }
+    return s;
+  }, [mergedFiles]);
 
   const appendProgressLine = (line: Omit<StreamLine, "id">) =>
     setStreamLines((prev) => [...prev, { ...line, id: prev.length }]);
@@ -542,31 +606,42 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
         badge: "Review",
         detail: "All diffs are shown below. Accept to write to disk.",
       });
-      setCombinedDiffEntries(
-        collected.map((p) => ({
-          packageName: p.package,
-          fromVersion: p.from_version,
-          toVersion: p.to_version,
-          sessionId: p.session_id,
-          files: p.files,
-        }))
-      );
+      const builtEntries = collected.map((p) => ({
+        packageName: p.package,
+        fromVersion: p.from_version,
+        toVersion: p.to_version,
+        sessionId: p.session_id,
+        files: p.files,
+      }));
+      setCombinedDiffEntries(builtEntries);
+      setCombinedActiveFile(buildMergedFiles(builtEntries)[0]?.filePath ?? "");
+      setCombinedHunkDecisions({});
+      setCombinedExpandedContext({});
     }
   };
 
-  const handleApplyAll = async () => {
+  const handleApplyAll = async (hunkDecisions: AllHunkDecisions = {}) => {
     if (!combinedDiffEntries) return;
     setIsApplyingAll(true);
     try {
       for (const entry of combinedDiffEntries) {
         const decisions = Object.fromEntries(
-          entry.files.map((file) => [
-            file.relative_path,
-            {
-              file_decision: "accept",
-              hunks: Object.fromEntries(file.hunks.map((h) => [h.hunk_id, "accept"])),
-            },
-          ])
+          entry.files.map((file) => {
+            const hunkEntries = file.hunks.map((h) => {
+              const d = hunkDecisions[`${entry.sessionId}:${h.hunk_id}`] ?? "pending";
+              return [h.hunk_id, d === "rejected" ? "reject" : "accept"] as [string, string];
+            });
+            const values = hunkEntries.map((e) => e[1]);
+            const fileDecision = values.every((v) => v === "reject")
+              ? "reject"
+              : values.every((v) => v === "accept")
+              ? "accept"
+              : "partial";
+            return [
+              file.relative_path,
+              { file_decision: fileDecision, hunks: Object.fromEntries(hunkEntries) },
+            ];
+          })
         );
         await applyPreview(entry.sessionId, decisions);
         const newVersion = entry.toVersion;
@@ -581,6 +656,9 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
         });
       }
       setCombinedDiffEntries(null);
+      setCombinedActiveFile("");
+      setCombinedHunkDecisions({});
+      setCombinedExpandedContext({});
       setRightPanelMode("progress");
       appendProgressLine({ message: "All packages applied", status: "success", badge: "Done" });
       void loadFiles();
@@ -602,6 +680,9 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
       await discardPreview(entry.sessionId).catch(() => {});
     }
     setCombinedDiffEntries(null);
+    setCombinedActiveFile("");
+    setCombinedHunkDecisions({});
+    setCombinedExpandedContext({});
     setRightPanelMode("progress");
     appendProgressLine({ message: "All pending changes discarded", status: "info", badge: "Discarded" });
   };
@@ -862,9 +943,14 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
                   depth={0}
                   selectedFile={selectedFile}
                   expandedFolders={expandedFolders}
-                  previewFilePaths={previewFilePaths}
+                  previewFilePaths={combinedDiffEntries ? combinedFilePaths : previewFilePaths}
                   onToggleFolder={toggleFolder}
                   onSelectFile={(file) => {
+                    if (combinedDiffEntries) {
+                      setSelectedFile(file.path);
+                      setCombinedActiveFile(file.path);
+                      return;
+                    }
                     if (previewData) {
                       setSelectedFile(file.path);
                       if (previewFilePaths.has(file.path)) {
@@ -914,7 +1000,16 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
           {combinedDiffEntries ? (
             <CombinedDiffPanel
               entries={combinedDiffEntries}
-              onApplyAll={() => void handleApplyAll()}
+              currentFile={
+                mergedFiles.find((f) => f.filePath === combinedActiveFile || f.relativePath === combinedActiveFile)
+                ?? mergedFiles[0]
+                ?? null
+              }
+              decisions={combinedHunkDecisions}
+              onDecisionChange={setCombinedHunkDecisions}
+              expandedContext={combinedExpandedContext}
+              onExpandedContextChange={setCombinedExpandedContext}
+              onApplyAll={() => void handleApplyAll(combinedHunkDecisions)}
               onDiscardAll={() => void handleDiscardAll()}
               isApplying={isApplyingAll}
             />
@@ -1077,28 +1172,42 @@ function buildAllAcceptDecisions(preview: PreviewResponse) {
 
 function CombinedDiffPanel({
   entries,
+  currentFile,
+  decisions,
+  onDecisionChange,
+  expandedContext,
+  onExpandedContextChange,
   onApplyAll,
   onDiscardAll,
   isApplying,
 }: {
   entries: CombinedDiffEntry[];
+  currentFile: MergedFileView | null;
+  decisions: AllHunkDecisions;
+  onDecisionChange: React.Dispatch<React.SetStateAction<AllHunkDecisions>>;
+  expandedContext: Record<string, boolean>;
+  onExpandedContextChange: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
   onApplyAll: () => void;
   onDiscardAll: () => void;
   isApplying: boolean;
 }) {
-  const totalFiles = entries.reduce((sum, e) => sum + e.files.length, 0);
-  const totalAdditions = entries.reduce(
-    (sum, e) => sum + e.files.reduce((s, f) => s + f.additions, 0),
-    0
-  );
-  const totalDeletions = entries.reduce(
-    (sum, e) => sum + e.files.reduce((s, f) => s + f.deletions, 0),
-    0
-  );
+  const allMergedFiles = useMemo(() => buildMergedFiles(entries), [entries]);
+
+  const setHunkDecision = (sessionId: string, hunkId: string, d: HunkDecision) =>
+    onDecisionChange((prev) => ({ ...prev, [`${sessionId}:${hunkId}`]: d }));
+
+  const getDecision = (sessionId: string, hunkId: string): HunkDecision =>
+    decisions[`${sessionId}:${hunkId}`] ?? "pending";
+
+  const toggleContext = (key: string) =>
+    onExpandedContextChange((prev) => ({ ...prev, [key]: !prev[key] }));
+
+  const totalAdditions = allMergedFiles.reduce((s, f) => s + f.totalAdditions, 0);
+  const totalDeletions = allMergedFiles.reduce((s, f) => s + f.totalDeletions, 0);
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
-      {/* Sticky header */}
+      {/* ── Toolbar ── */}
       <div className="flex h-11 shrink-0 items-center justify-between border-b bg-card px-3">
         <div className="flex items-center gap-3">
           <GitCompareArrows className="h-4 w-4 shrink-0 text-sky-400" />
@@ -1106,7 +1215,7 @@ function CombinedDiffPanel({
             {entries.length} package{entries.length !== 1 ? "s" : ""}
           </span>
           <span className="text-[11px] text-zinc-500">
-            {totalFiles} file{totalFiles !== 1 ? "s" : ""} &nbsp;·&nbsp;
+            {allMergedFiles.length} file{allMergedFiles.length !== 1 ? "s" : ""}&nbsp;·&nbsp;
             <span className="text-emerald-400">+{totalAdditions}</span>
             {" / "}
             <span className="text-red-400">−{totalDeletions}</span>
@@ -1127,72 +1236,137 @@ function CombinedDiffPanel({
             className="inline-flex h-7 items-center gap-1.5 rounded-md bg-emerald-600 px-3 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
           >
             {isApplying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
-            Apply All
+            Apply
           </button>
         </div>
       </div>
 
-      {/* Scrollable combined diff */}
+      {/* ── Diff pane: shows only the file selected in the Explorer sidebar ── */}
       <div className="min-h-0 flex-1 overflow-auto font-mono text-xs leading-5">
-        {entries.map((entry) => (
-          <div key={entry.sessionId}>
-            {/* Package header */}
-            <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-zinc-700 bg-zinc-900/95 px-3 py-2 backdrop-blur">
-              <span className="text-[10px] font-bold uppercase tracking-widest text-sky-400">
-                {entry.packageName}
-              </span>
-              <span className="text-[11px] text-zinc-500">
-                {entry.fromVersion} → {entry.toVersion}
-              </span>
-              <span className="ml-auto text-[10px] text-zinc-600">
-                {entry.files.length} file{entry.files.length !== 1 ? "s" : ""}
-              </span>
+        {currentFile ? (
+          <>
+            {/* Sticky file path header */}
+            <div className="sticky top-0 z-10 flex items-center gap-3 border-b border-zinc-800 bg-zinc-800/95 px-3 py-1.5 backdrop-blur">
+              <FileCode2 className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+              <span className="flex-1 truncate text-zinc-200">{currentFile.relativePath}</span>
+              <span className="shrink-0 text-[11px] text-emerald-400">+{currentFile.totalAdditions}</span>
+              <span className="shrink-0 text-[11px] text-red-400">−{currentFile.totalDeletions}</span>
             </div>
 
-            {entry.files.map((file) => (
-              <div key={file.file_path}>
-                {/* File header */}
-                <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-800/60 px-3 py-1.5">
-                  <FileCode2 className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
-                  <span className="flex-1 text-zinc-200">{file.relative_path}</span>
-                  <span className="text-emerald-400 text-[11px]">+{file.additions}</span>
-                  <span className="text-red-400 text-[11px]">−{file.deletions}</span>
-                </div>
+            {currentFile.mergedHunks.map(({ sessionId, hunkData: hunk }: MergedHunk) => {
+              const key = `${sessionId}:${hunk.hunk_id}`;
+              const contextVisible = expandedContext[key] === true;
+              const decision = getDecision(sessionId, hunk.hunk_id);
+              const added    = hunk.changes.filter((c: PreviewChange) => c.type === "addition").length;
+              const removed  = hunk.changes.filter((c: PreviewChange) => c.type === "deletion").length;
+              const ctxCount = hunk.changes.filter((c: PreviewChange) => c.type === "context").length;
 
-                {file.hunks.map((hunk) => (
-                  <div key={hunk.hunk_id}>
-                    {/* Hunk header */}
-                    <div className="border-b border-zinc-800 bg-blue-950/30 px-3 py-0.5 text-[11px] text-blue-400">
+              return (
+                <div key={key}>
+                  {/* @@ header — double-click to expand/collapse context lines */}
+                  <div
+                    className={cn(
+                      "flex items-center gap-2 border-b border-zinc-800 px-3 py-1 select-none",
+                      decision === "accepted" && "bg-emerald-950/40",
+                      decision === "rejected" && "bg-red-950/20",
+                      decision === "pending"  && "bg-[#0d1a2e]"
+                    )}
+                    onDoubleClick={() => toggleContext(key)}
+                  >
+                    <ChevronRight
+                      className={cn(
+                        "h-3 w-3 shrink-0 cursor-pointer text-blue-500 transition-transform duration-150",
+                        contextVisible && "rotate-90"
+                      )}
+                      onClick={(e) => { e.stopPropagation(); toggleContext(key); }}
+                    />
+                    <span className="flex-1 font-mono text-[11px] text-blue-400">
                       @@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},{hunk.new_lines} @@
-                    </div>
-                    {hunk.changes.map((change, idx) => (
-                      <div
-                        key={idx}
+                    </span>
+                    {ctxCount > 0 && (
+                      <span className="font-sans text-[10px] text-zinc-600">
+                        {ctxCount} hidden · dbl-click
+                      </span>
+                    )}
+                    <span className="font-sans text-[10px] text-zinc-600">
+                      <span className="text-emerald-500">+{added}</span>
+                      {" "}
+                      <span className="text-red-500">−{removed}</span>
+                    </span>
+                    {/* Per-hunk Accept / Reject */}
+                    <div
+                      className="flex shrink-0 gap-1 font-sans"
+                      onClick={(e) => e.stopPropagation()}
+                      onDoubleClick={(e) => e.stopPropagation()}
+                    >
+                      <button
+                        onClick={() =>
+                          setHunkDecision(sessionId, hunk.hunk_id,
+                            decision === "accepted" ? "pending" : "accepted")
+                        }
                         className={cn(
-                          "flex min-w-max border-l-2 px-0",
-                          change.type === "addition" && "border-emerald-500 bg-emerald-500/10 text-emerald-100",
-                          change.type === "deletion" && "border-red-500 bg-red-500/10 text-red-200",
-                          change.type === "context"  && "border-transparent text-zinc-500"
+                          "inline-flex h-5 items-center gap-1 rounded border px-1.5 text-[10px] font-semibold transition",
+                          decision === "accepted"
+                            ? "border-emerald-500 bg-emerald-600/30 text-emerald-300"
+                            : "border-emerald-700/40 bg-emerald-950/50 text-emerald-500 hover:bg-emerald-900/50"
                         )}
                       >
-                        <span className="w-10 select-none pr-2 text-right text-zinc-600">
-                          {change.line_number_old ?? ""}
-                        </span>
-                        <span className="w-10 select-none pr-2 text-right text-zinc-600">
-                          {change.line_number_new ?? ""}
-                        </span>
-                        <span className="w-4 select-none text-center">
-                          {change.type === "addition" ? "+" : change.type === "deletion" ? "-" : " "}
-                        </span>
-                        <code className="flex-1 whitespace-pre pl-1">{change.content || " "}</code>
-                      </div>
-                    ))}
+                        <Check className="h-2.5 w-2.5" /> Accept
+                      </button>
+                      <button
+                        onClick={() =>
+                          setHunkDecision(sessionId, hunk.hunk_id,
+                            decision === "rejected" ? "pending" : "rejected")
+                        }
+                        className={cn(
+                          "inline-flex h-5 items-center gap-1 rounded border px-1.5 text-[10px] font-semibold transition",
+                          decision === "rejected"
+                            ? "border-red-500 bg-red-600/30 text-red-300"
+                            : "border-red-700/40 bg-red-950/50 text-red-500 hover:bg-red-900/50"
+                        )}
+                      >
+                        <X className="h-2.5 w-2.5" /> Reject
+                      </button>
+                    </div>
                   </div>
-                ))}
-              </div>
-            ))}
+
+                  {/* Change lines always visible; context hidden until expanded */}
+                  <div className={cn(decision === "rejected" && "opacity-40")}>
+                    {hunk.changes.map((change: PreviewChange, idx: number) => {
+                      if (change.type === "context" && !contextVisible) return null;
+                      return (
+                        <div
+                          key={idx}
+                          className={cn(
+                            "flex min-w-max border-l-2",
+                            change.type === "addition" && "border-emerald-500 bg-emerald-500/10 text-emerald-100",
+                            change.type === "deletion"  && "border-red-500 bg-red-500/10 text-red-200",
+                            change.type === "context"   && "border-transparent text-zinc-500"
+                          )}
+                        >
+                          <span className="w-10 select-none pr-2 text-right text-zinc-600">
+                            {change.line_number_old ?? ""}
+                          </span>
+                          <span className="w-10 select-none pr-2 text-right text-zinc-600">
+                            {change.line_number_new ?? ""}
+                          </span>
+                          <span className="w-4 select-none text-center">
+                            {change.type === "addition" ? "+" : change.type === "deletion" ? "-" : " "}
+                          </span>
+                          <code className="flex-1 whitespace-pre pl-1">{change.content || " "}</code>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </>
+        ) : (
+          <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+            Select a changed file in the Explorer to review
           </div>
-        ))}
+        )}
       </div>
     </div>
   );
