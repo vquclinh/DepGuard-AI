@@ -632,7 +632,9 @@ function FullFileDiffViewer({
           row.hunkId !== null
             ? (decisions[file.relative_path]?.hunks[row.hunkId]?.decision ?? "pending")
             : "pending";
-        const isRejected = decision === "rejected";
+
+        if (decision === "accepted" && row.type === "deletion") return null;
+        if (decision === "rejected" && row.type === "addition") return null;
 
         return (
           <div key={`row-${index}`}>
@@ -648,28 +650,31 @@ function FullFileDiffViewer({
                 <span className="font-sans text-[10px] text-zinc-500">
                   @@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},{hunk.new_lines} @@
                 </span>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => onSetHunkDecision(file, hunk.hunk_id, "accepted")}
-                    className="inline-flex h-6 items-center gap-1 rounded border border-emerald-700/40 bg-emerald-950/50 px-2 font-sans text-[10px] font-semibold text-emerald-400 transition hover:bg-emerald-900/50"
-                  >
-                    <Check className="h-3 w-3" /> Accept
-                  </button>
-                  <button
-                    onClick={() => onSetHunkDecision(file, hunk.hunk_id, "rejected")}
-                    className="inline-flex h-6 items-center gap-1 rounded border border-red-700/40 bg-red-950/50 px-2 font-sans text-[10px] font-semibold text-red-400 transition hover:bg-red-900/50"
-                  >
-                    <X className="h-3 w-3" /> Reject
-                  </button>
-                </div>
+                {decision === "pending" && (
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => onSetHunkDecision(file, hunk.hunk_id, "accepted")}
+                      className="inline-flex h-6 items-center gap-1 rounded border border-emerald-700/40 bg-emerald-950/50 px-2 font-sans text-[10px] font-semibold text-emerald-400 transition hover:bg-emerald-900/50"
+                    >
+                      <Check className="h-3 w-3" /> Accept
+                    </button>
+                    <button
+                      onClick={() => onSetHunkDecision(file, hunk.hunk_id, "rejected")}
+                      className="inline-flex h-6 items-center gap-1 rounded border border-red-700/40 bg-red-950/50 px-2 font-sans text-[10px] font-semibold text-red-400 transition hover:bg-red-900/50"
+                    >
+                      <X className="h-3 w-3" /> Reject
+                    </button>
+                  </div>
+                )}
               </div>
             )}
             <div
               className={cn(
                 "grid min-w-max grid-cols-[3rem_3rem_1.25rem_1fr] leading-5",
                 (row.type === "gap" || row.type === "context") && "text-zinc-100",
-                row.type === "deletion" && "bg-red-950/50 text-red-300",
-                row.type === "addition" && "bg-emerald-950/50 text-emerald-200"
+                row.type === "deletion" && decision === "pending" && "bg-red-950/50 text-red-300",
+                row.type === "addition" && decision === "pending" && "bg-emerald-950/50 text-emerald-200",
+                (row.type === "deletion" || row.type === "addition") && decision !== "pending" && "text-zinc-100"
               )}
             >
               <span className="select-none pr-2 text-right text-[10px] text-zinc-500">
@@ -679,11 +684,9 @@ function FullFileDiffViewer({
                 {(row.type === "gap" || row.type === "context" || row.type === "addition") && (row.newLine ?? "")}
               </span>
               <span className="select-none text-center">
-                {row.type === "deletion" ? "-" : row.type === "addition" ? "+" : " "}
+                {decision === "pending" && row.type === "deletion" ? "-" : decision === "pending" && row.type === "addition" ? "+" : " "}
               </span>
-              <code className={cn(isRejected && row.type !== "context" && row.type !== "gap" && "opacity-50 line-through")}>
-                {row.content || " "}
-              </code>
+              <code>{row.content || " "}</code>
             </div>
           </div>
         );

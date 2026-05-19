@@ -33,7 +33,6 @@ import {
   rollbackPackage,
   type ApplyResponse,
   type ChangedFile,
-  type PreviewChange,
   type PreviewFile,
   type PreviewHunk,
   type PreviewResponse,
@@ -178,7 +177,6 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
   const [combinedDiffEntries, setCombinedDiffEntries] = useState<CombinedDiffEntry[] | null>(null);
   const [combinedActiveFile, setCombinedActiveFile] = useState("");
   const [combinedHunkDecisions, setCombinedHunkDecisions] = useState<AllHunkDecisions>({});
-  const [combinedExpandedContext, setCombinedExpandedContext] = useState<Record<string, boolean>>({});
   const [isApplyingAll, setIsApplyingAll] = useState(false);
   const batchCollectedRef = useRef<PreviewResponse[]>([]);
   const explorerDragRef = useRef({ startX: 0, startWidth: EXPLORER_DEFAULT_WIDTH });
@@ -617,7 +615,6 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
       setCombinedDiffEntries(builtEntries);
       setCombinedActiveFile(buildMergedFiles(builtEntries)[0]?.filePath ?? "");
       setCombinedHunkDecisions({});
-      setCombinedExpandedContext({});
     }
   };
 
@@ -659,7 +656,6 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
       setCombinedDiffEntries(null);
       setCombinedActiveFile("");
       setCombinedHunkDecisions({});
-      setCombinedExpandedContext({});
       setRightPanelMode("progress");
       appendProgressLine({ message: "All packages applied", status: "success", badge: "Done" });
       void loadFiles();
@@ -683,7 +679,6 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     setCombinedDiffEntries(null);
     setCombinedActiveFile("");
     setCombinedHunkDecisions({});
-    setCombinedExpandedContext({});
     setRightPanelMode("progress");
     appendProgressLine({ message: "All pending changes discarded", status: "info", badge: "Discarded" });
   };
@@ -1018,10 +1013,16 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
                     setCombinedActiveFile(filePath);
                     setSelectedFile(filePath);
                   }}
+                  folderPath={folderPath}
                   decisions={combinedHunkDecisions}
                   onDecisionChange={setCombinedHunkDecisions}
-                  expandedContext={combinedExpandedContext}
-                  onExpandedContextChange={setCombinedExpandedContext}
+                  onAcceptAll={() => {
+                    setCombinedDiffEntries(null);
+                    setCombinedActiveFile("");
+                    setCombinedHunkDecisions({});
+                    setRightPanelMode("progress");
+                    void handleApplyAll({});
+                  }}
                   onApplyAll={() => void handleApplyAll(combinedHunkDecisions)}
                   onDiscardAll={() => void handleDiscardAll()}
                   isApplying={isApplyingAll}
@@ -1213,15 +1214,46 @@ function buildAllAcceptDecisions(preview: PreviewResponse) {
   );
 }
 
+interface MergedUnifiedRow {
+  type: "gap" | "context" | "deletion" | "addition";
+  oldLine: number | null;
+  newLine: number | null;
+  content: string;
+  sessionId: string | null;
+  hunkId: string | null;
+  hunk: PreviewHunk | null;
+}
+
+function buildMergedUnifiedRows(originalLines: string[], mergedHunks: MergedHunk[]): MergedUnifiedRow[] {
+  const rows: MergedUnifiedRow[] = [];
+  let oldCursor = 1;
+  let newOffset = 0;
+  const sorted = [...mergedHunks].sort((a, b) => a.hunkData.old_start - b.hunkData.old_start);
+  for (const { sessionId, hunkData: hunk } of sorted) {
+    for (let ln = oldCursor; ln < hunk.old_start; ln++) {
+      rows.push({ type: "gap", oldLine: ln, newLine: ln + newOffset, content: originalLines[ln - 1] ?? "", sessionId: null, hunkId: null, hunk: null });
+    }
+    for (const c of hunk.changes) {
+      rows.push({ type: c.type, oldLine: c.line_number_old, newLine: c.line_number_new, content: c.content, sessionId, hunkId: hunk.hunk_id, hunk });
+    }
+    newOffset += hunk.new_lines - hunk.old_lines;
+    oldCursor = hunk.old_start + hunk.old_lines;
+  }
+  for (let ln = oldCursor; ln <= originalLines.length; ln++) {
+    rows.push({ type: "gap", oldLine: ln, newLine: ln + newOffset, content: originalLines[ln - 1] ?? "", sessionId: null, hunkId: null, hunk: null });
+  }
+  return rows;
+}
+
 function CombinedDiffPanel({
   entries,
   allFiles,
   currentFile,
+  folderPath,
   onFileChange,
   decisions,
   onDecisionChange,
-  expandedContext,
-  onExpandedContextChange,
+  onAcceptAll,
   onApplyAll,
   onDiscardAll,
   isApplying,
@@ -1229,11 +1261,11 @@ function CombinedDiffPanel({
   entries: CombinedDiffEntry[];
   allFiles: MergedFileView[];
   currentFile: MergedFileView | null;
+  folderPath: string;
   onFileChange: (filePath: string) => void;
   decisions: AllHunkDecisions;
   onDecisionChange: React.Dispatch<React.SetStateAction<AllHunkDecisions>>;
-  expandedContext: Record<string, boolean>;
-  onExpandedContextChange: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  onAcceptAll: () => void;
   onApplyAll: () => void;
   onDiscardAll: () => void;
   isApplying: boolean;
@@ -1241,6 +1273,23 @@ function CombinedDiffPanel({
   const allMergedFiles = allFiles;
   const scrollRef = useRef<HTMLDivElement>(null);
   const [isFileListOpen, setIsFileListOpen] = useState(false);
+  const [originalLines, setOriginalLines] = useState<string[]>([]);
+  const [loadingFile, setLoadingFile] = useState(false);
+
+  useEffect(() => {
+    if (!currentFile) return;
+    setLoadingFile(true);
+    setOriginalLines([]);
+    getFileContent(folderPath, currentFile.filePath)
+      .then((r) => setOriginalLines(r.content.split("\n")))
+      .catch(() => setOriginalLines([]))
+      .finally(() => setLoadingFile(false));
+  }, [currentFile?.filePath, folderPath]);
+
+  const rows = useMemo(
+    () => (currentFile && originalLines.length > 0 ? buildMergedUnifiedRows(originalLines, currentFile.mergedHunks) : []),
+    [originalLines, currentFile]
+  );
 
   const currentIndex = currentFile
     ? allMergedFiles.findIndex((f) => f.filePath === currentFile.filePath)
@@ -1259,14 +1308,17 @@ function CombinedDiffPanel({
   const getDecision = (sessionId: string, hunkId: string): HunkDecision =>
     decisions[`${sessionId}:${hunkId}`] ?? "pending";
 
-  const toggleContext = (key: string) =>
-    onExpandedContextChange((prev) => ({ ...prev, [key]: !prev[key] }));
+  const setFileDecision = (file: MergedFileView, d: HunkDecision) =>
+    onDecisionChange((prev) => ({
+      ...prev,
+      ...Object.fromEntries(file.mergedHunks.map(({ sessionId, hunkData }) => [`${sessionId}:${hunkData.hunk_id}`, d])),
+    }));
 
   const totalAdditions = allMergedFiles.reduce((s, f) => s + f.totalAdditions, 0);
   const totalDeletions = allMergedFiles.reduce((s, f) => s + f.totalDeletions, 0);
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden">
       {/* ── Toolbar ── */}
       <div className="flex h-11 shrink-0 items-center justify-between border-b bg-card px-3">
         <div className="flex items-center gap-3">
@@ -1283,19 +1335,26 @@ function CombinedDiffPanel({
         </div>
         <div className="flex items-center gap-2">
           <button
+            onClick={onAcceptAll}
+            disabled={isApplying}
+            className="inline-flex h-7 items-center gap-1.5 rounded-md bg-emerald-600 px-3 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
+          >
+            {isApplying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+            Accept All
+          </button>
+          <button
             onClick={onDiscardAll}
             disabled={isApplying}
-            className="inline-flex h-7 items-center gap-1.5 rounded-md border bg-background px-3 text-xs font-semibold text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-50"
+            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-red-700/40 bg-red-950/50 px-3 text-xs font-semibold text-red-400 transition hover:bg-red-900/50 disabled:opacity-50"
           >
             <X className="h-3.5 w-3.5" />
-            Discard All
+            Reject All
           </button>
           <button
             onClick={onApplyAll}
             disabled={isApplying}
-            className="inline-flex h-7 items-center gap-1.5 rounded-md bg-emerald-600 px-3 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:opacity-50"
+            className="inline-flex h-7 items-center gap-1.5 rounded-md border bg-background px-3 text-xs font-semibold text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:opacity-50"
           >
-            {isApplying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
             Apply
           </button>
         </div>
@@ -1315,182 +1374,158 @@ function CombinedDiffPanel({
       )}
 
       {/* ── Diff pane ── */}
-      <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-auto font-mono text-xs leading-5">
-        {currentFile ? (
-          <div className="pb-16">
-            {/* Hunks */}
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto font-mono text-xs leading-5">
+        {!currentFile ? (
+          <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+            Select a changed file in the Explorer to review
+          </div>
+        ) : loadingFile ? (
+          <div className="flex items-center justify-center py-16">
+            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+          </div>
+        ) : (
+          <div className="overflow-x-auto pb-16">
+            {rows.map((row, index) => {
+              const prevRow = index > 0 ? rows[index - 1] : null;
+              const isHunkStart = row.hunkId !== null && prevRow?.hunkId !== row.hunkId;
+              const decision = row.sessionId && row.hunkId ? getDecision(row.sessionId, row.hunkId) : "pending";
 
-            {currentFile.mergedHunks.map(({ sessionId, hunkData: hunk }: MergedHunk) => {
-              const key = `${sessionId}:${hunk.hunk_id}`;
-              const contextVisible = expandedContext[key] === true;
-              const decision = getDecision(sessionId, hunk.hunk_id);
-              const added    = hunk.changes.filter((c: PreviewChange) => c.type === "addition").length;
-              const removed  = hunk.changes.filter((c: PreviewChange) => c.type === "deletion").length;
-              const ctxCount = hunk.changes.filter((c: PreviewChange) => c.type === "context").length;
+              // Block-level visual: accepted = red lines gone, rejected = green lines gone
+              if (decision === "accepted" && row.type === "deletion") return null;
+              if (decision === "rejected" && row.type === "addition") return null;
 
               return (
-                <div key={key}>
-                  {/* @@ header — double-click to expand/collapse context lines */}
+                <div key={`row-${index}`}>
+                  {isHunkStart && row.hunk !== null && (
+                    <div
+                      className={cn(
+                        "sticky top-0 z-10 flex items-center justify-between border-y border-dashed px-3 py-1 backdrop-blur-sm",
+                        decision === "accepted" && "border-emerald-500/30 bg-emerald-950/30",
+                        decision === "rejected" && "border-red-500/20 bg-red-950/20 opacity-60",
+                        decision === "pending" && "border-zinc-700 bg-[#0d1117]/95"
+                      )}
+                    >
+                      <span className="font-sans text-[10px] text-zinc-500">
+                        @@ -{row.hunk.old_start},{row.hunk.old_lines} +{row.hunk.new_start},{row.hunk.new_lines} @@
+                      </span>
+                      {decision === "pending" && (
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => setHunkDecision(row.sessionId!, row.hunk!.hunk_id, "accepted")}
+                            className="inline-flex h-5 items-center gap-1 rounded border border-emerald-700/40 bg-emerald-950/50 px-1.5 text-[10px] font-semibold text-emerald-500 transition hover:bg-emerald-900/50"
+                          >
+                            <Check className="h-2.5 w-2.5" /> Accept
+                          </button>
+                          <button
+                            onClick={() => setHunkDecision(row.sessionId!, row.hunk!.hunk_id, "rejected")}
+                            className="inline-flex h-5 items-center gap-1 rounded border border-red-700/40 bg-red-950/50 px-1.5 text-[10px] font-semibold text-red-500 transition hover:bg-red-900/50"
+                          >
+                            <X className="h-2.5 w-2.5" /> Reject
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <div
                     className={cn(
-                      "flex items-center gap-2 border-b border-zinc-800 px-3 py-1 select-none",
-                      decision === "accepted" && "bg-emerald-950/40",
-                      decision === "rejected" && "bg-red-950/20",
-                      decision === "pending"  && "bg-[#0d1a2e]"
+                      "grid min-w-max grid-cols-[3rem_3rem_1.25rem_1fr] leading-5",
+                      (row.type === "gap" || row.type === "context") && "text-zinc-100",
+                      row.type === "deletion" && decision === "pending" && "bg-red-950/50 text-red-300",
+                      row.type === "addition" && decision === "pending" && "bg-emerald-950/50 text-emerald-200",
+                      (row.type === "deletion" || row.type === "addition") && decision !== "pending" && "text-zinc-100"
                     )}
-                    onDoubleClick={() => toggleContext(key)}
                   >
-                    <ChevronRight
-                      className={cn(
-                        "h-3 w-3 shrink-0 cursor-pointer text-blue-500 transition-transform duration-150",
-                        contextVisible && "rotate-90"
-                      )}
-                      onClick={(e) => { e.stopPropagation(); toggleContext(key); }}
-                    />
-                    <span className="flex-1 font-mono text-[11px] text-blue-400">
-                      @@ -{hunk.old_start},{hunk.old_lines} +{hunk.new_start},{hunk.new_lines} @@
+                    <span className="select-none pr-2 text-right text-[10px] text-zinc-500">
+                      {(row.type === "gap" || row.type === "context" || row.type === "deletion") ? (row.oldLine ?? "") : ""}
                     </span>
-                    {ctxCount > 0 && (
-                      <span className="font-sans text-[10px] text-zinc-600">
-                        {ctxCount} hidden · dbl-click
-                      </span>
-                    )}
-                    <span className="font-sans text-[10px] text-zinc-600">
-                      <span className="text-emerald-500">+{added}</span>
-                      {" "}
-                      <span className="text-red-500">−{removed}</span>
+                    <span className="select-none pr-2 text-right text-[10px] text-zinc-500">
+                      {(row.type === "gap" || row.type === "context" || row.type === "addition") ? (row.newLine ?? "") : ""}
                     </span>
-                    {/* Per-hunk Accept / Reject */}
-                    <div
-                      className="flex shrink-0 gap-1 font-sans"
-                      onClick={(e) => e.stopPropagation()}
-                      onDoubleClick={(e) => e.stopPropagation()}
-                    >
-                      <button
-                        onClick={() =>
-                          setHunkDecision(sessionId, hunk.hunk_id,
-                            decision === "accepted" ? "pending" : "accepted")
-                        }
-                        className={cn(
-                          "inline-flex h-5 items-center gap-1 rounded border px-1.5 text-[10px] font-semibold transition",
-                          decision === "accepted"
-                            ? "border-emerald-500 bg-emerald-600/30 text-emerald-300"
-                            : "border-emerald-700/40 bg-emerald-950/50 text-emerald-500 hover:bg-emerald-900/50"
-                        )}
-                      >
-                        <Check className="h-2.5 w-2.5" /> Accept
-                      </button>
-                      <button
-                        onClick={() =>
-                          setHunkDecision(sessionId, hunk.hunk_id,
-                            decision === "rejected" ? "pending" : "rejected")
-                        }
-                        className={cn(
-                          "inline-flex h-5 items-center gap-1 rounded border px-1.5 text-[10px] font-semibold transition",
-                          decision === "rejected"
-                            ? "border-red-500 bg-red-600/30 text-red-300"
-                            : "border-red-700/40 bg-red-950/50 text-red-500 hover:bg-red-900/50"
-                        )}
-                      >
-                        <X className="h-2.5 w-2.5" /> Reject
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Change lines always visible; context hidden until expanded */}
-                  <div className={cn(decision === "rejected" && "opacity-40")}>
-                    {hunk.changes.map((change: PreviewChange, idx: number) => {
-                      if (change.type === "context" && !contextVisible) return null;
-                      return (
-                        <div
-                          key={idx}
-                          className={cn(
-                            "flex min-w-max border-l-2",
-                            change.type === "addition" && "border-emerald-500 bg-emerald-500/10 text-emerald-100",
-                            change.type === "deletion"  && "border-red-500 bg-red-500/10 text-red-200",
-                            change.type === "context"   && "border-transparent text-zinc-500"
-                          )}
-                        >
-                          <span className="w-10 select-none pr-2 text-right text-zinc-600">
-                            {change.line_number_old ?? ""}
-                          </span>
-                          <span className="w-10 select-none pr-2 text-right text-zinc-600">
-                            {change.line_number_new ?? ""}
-                          </span>
-                          <span className="w-4 select-none text-center">
-                            {change.type === "addition" ? "+" : change.type === "deletion" ? "-" : " "}
-                          </span>
-                          <code className="flex-1 whitespace-pre pl-1">{change.content || " "}</code>
-                        </div>
-                      );
-                    })}
+                    <span className="select-none text-center">
+                      {decision === "pending" && row.type === "deletion" ? "-" : decision === "pending" && row.type === "addition" ? "+" : " "}
+                    </span>
+                    <code className="whitespace-pre pl-1">
+                      {row.content || " "}
+                    </code>
                   </div>
                 </div>
               );
             })}
           </div>
-        ) : (
-          <div className="flex h-full items-center justify-center text-sm text-zinc-500">
-            Select a changed file in the Explorer to review
-          </div>
-        )}
-
-        {/* ── Floating file navigator (same as single-package DiffReviewPanel) ── */}
-        {allMergedFiles.length > 0 && (
-          <div className="absolute bottom-4 left-1/2 z-20 w-[min(520px,calc(100%-2rem))] -translate-x-1/2 rounded-lg border bg-card/95 p-1 shadow-2xl backdrop-blur">
-            {isFileListOpen && (
-              <div className="absolute bottom-full left-1/2 mb-1.5 max-h-56 w-[min(480px,calc(100vw-3rem))] -translate-x-1/2 overflow-auto rounded-lg border bg-card p-1.5 shadow-2xl">
-                <div className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                  {allMergedFiles.length} changed file{allMergedFiles.length === 1 ? "" : "s"}
-                </div>
-                <div className="space-y-0.5">
-                  {allMergedFiles.map((file, index) => (
-                    <button
-                      key={file.filePath}
-                      onClick={() => { goToFile(index); setIsFileListOpen(false); }}
-                      className={cn(
-                        "flex h-7 w-full min-w-0 items-center justify-between gap-2 rounded px-2 text-left text-[11px] transition",
-                        index === currentIndex ? "bg-primary text-primary-foreground" : "hover:bg-muted"
-                      )}
-                    >
-                      <span className="min-w-0 truncate font-mono">{file.relativePath}</span>
-                      <span className="shrink-0 text-[10px] opacity-70">
-                        +{file.totalAdditions}/−{file.totalDeletions}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-            <div className="flex items-center gap-1">
-              <button
-                onClick={() => goToFile(currentIndex - 1)}
-                disabled={allMergedFiles.length <= 1}
-                title="Previous file"
-                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border bg-background text-xs transition hover:bg-muted disabled:opacity-40"
-              >
-                <ChevronLeft className="h-3.5 w-3.5" />
-              </button>
-              <button
-                onClick={() => setIsFileListOpen((o) => !o)}
-                className="min-w-0 flex-1 rounded bg-muted px-2 py-1 text-center text-[11px] font-semibold transition hover:bg-muted/80"
-              >
-                <span>{allMergedFiles.length} file{allMergedFiles.length === 1 ? "" : "s"} changed</span>
-                <span className="mx-1.5 text-muted-foreground">|</span>
-                <span>{currentIndex + 1}/{allMergedFiles.length}</span>
-              </button>
-              <button
-                onClick={() => goToFile(currentIndex + 1)}
-                disabled={allMergedFiles.length <= 1}
-                title="Next file"
-                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border bg-background text-xs transition hover:bg-muted disabled:opacity-40"
-              >
-                <ChevronRight className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
         )}
       </div>
+
+      {/* ── Floating file navigator — outside scroll container so it stays fixed at bottom ── */}
+      {allMergedFiles.length > 0 && (
+        <div className="absolute bottom-4 left-1/2 z-20 w-[min(520px,calc(100%-2rem))] -translate-x-1/2 rounded-lg border bg-card/95 p-1 shadow-2xl backdrop-blur">
+          {isFileListOpen && (
+            <div className="absolute bottom-full left-1/2 mb-1.5 max-h-56 w-[min(480px,calc(100vw-3rem))] -translate-x-1/2 overflow-auto rounded-lg border bg-card p-1.5 shadow-2xl">
+              <div className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                {allMergedFiles.length} changed file{allMergedFiles.length === 1 ? "" : "s"}
+              </div>
+              <div className="space-y-0.5">
+                {allMergedFiles.map((file, index) => (
+                  <button
+                    key={file.filePath}
+                    onClick={() => { goToFile(index); setIsFileListOpen(false); }}
+                    className={cn(
+                      "flex h-7 w-full min-w-0 items-center justify-between gap-2 rounded px-2 text-left text-[11px] transition",
+                      index === currentIndex ? "bg-primary text-primary-foreground" : "hover:bg-muted"
+                    )}
+                  >
+                    <span className="min-w-0 truncate font-mono">{file.relativePath}</span>
+                    <span className="shrink-0 text-[10px] opacity-70">
+                      +{file.totalAdditions}/−{file.totalDeletions}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => goToFile(currentIndex - 1)}
+              disabled={allMergedFiles.length <= 1}
+              title="Previous file"
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border bg-background text-xs transition hover:bg-muted disabled:opacity-40"
+            >
+              <ChevronLeft className="h-3.5 w-3.5" />
+            </button>
+            <button
+              onClick={() => setIsFileListOpen((o) => !o)}
+              className="min-w-0 flex-1 rounded bg-muted px-2 py-1 text-center text-[11px] font-semibold transition hover:bg-muted/80"
+            >
+              <span>{allMergedFiles.length} file{allMergedFiles.length === 1 ? "" : "s"} changed</span>
+              <span className="mx-1.5 text-muted-foreground">|</span>
+              <span>{currentIndex + 1}/{allMergedFiles.length}</span>
+            </button>
+            <button
+              onClick={() => currentFile && setFileDecision(currentFile, "accepted")}
+              disabled={!currentFile}
+              className="inline-flex h-7 shrink-0 items-center gap-1 rounded border bg-background px-2 text-[11px] font-semibold text-emerald-500 transition hover:bg-muted disabled:opacity-40"
+            >
+              <Check className="h-3.5 w-3.5" />
+              Accept
+            </button>
+            <button
+              onClick={() => currentFile && setFileDecision(currentFile, "rejected")}
+              disabled={!currentFile}
+              className="inline-flex h-7 shrink-0 items-center gap-1 rounded border bg-background px-2 text-[11px] font-semibold text-red-500 transition hover:bg-muted disabled:opacity-40"
+            >
+              <X className="h-3.5 w-3.5" />
+              Reject
+            </button>
+            <button
+              onClick={() => goToFile(currentIndex + 1)}
+              disabled={allMergedFiles.length <= 1}
+              title="Next file"
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border bg-background text-xs transition hover:bg-muted disabled:opacity-40"
+            >
+              <ChevronRight className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
