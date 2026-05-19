@@ -5,6 +5,7 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   FileCode2,
   Folder,
@@ -948,7 +949,11 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
                   onSelectFile={(file) => {
                     if (combinedDiffEntries) {
                       setSelectedFile(file.path);
-                      setCombinedActiveFile(file.path);
+                      if (combinedFilePaths.has(file.path)) {
+                        setCombinedActiveFile(file.path);
+                      } else {
+                        void loadContent(file.path);
+                      }
                       return;
                     }
                     if (previewData) {
@@ -998,21 +1003,59 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
           )}
 
           {combinedDiffEntries ? (
-            <CombinedDiffPanel
-              entries={combinedDiffEntries}
-              currentFile={
-                mergedFiles.find((f) => f.filePath === combinedActiveFile || f.relativePath === combinedActiveFile)
-                ?? mergedFiles[0]
-                ?? null
-              }
-              decisions={combinedHunkDecisions}
-              onDecisionChange={setCombinedHunkDecisions}
-              expandedContext={combinedExpandedContext}
-              onExpandedContextChange={setCombinedExpandedContext}
-              onApplyAll={() => void handleApplyAll(combinedHunkDecisions)}
-              onDiscardAll={() => void handleDiscardAll()}
-              isApplying={isApplyingAll}
-            />
+            <>
+              {/* Diff panel — hidden when browsing an unchanged file */}
+              <div className={cn("flex-1 min-h-0 overflow-hidden", !combinedFilePaths.has(selectedFile) && "hidden")}>
+                <CombinedDiffPanel
+                  entries={combinedDiffEntries}
+                  allFiles={mergedFiles}
+                  currentFile={
+                    mergedFiles.find((f) => f.filePath === combinedActiveFile || f.relativePath === combinedActiveFile)
+                    ?? mergedFiles[0]
+                    ?? null
+                  }
+                  onFileChange={(filePath) => {
+                    setCombinedActiveFile(filePath);
+                    setSelectedFile(filePath);
+                  }}
+                  decisions={combinedHunkDecisions}
+                  onDecisionChange={setCombinedHunkDecisions}
+                  expandedContext={combinedExpandedContext}
+                  onExpandedContextChange={setCombinedExpandedContext}
+                  onApplyAll={() => void handleApplyAll(combinedHunkDecisions)}
+                  onDiscardAll={() => void handleDiscardAll()}
+                  isApplying={isApplyingAll}
+                />
+              </div>
+              {/* Regular file view when an unchanged file is selected */}
+              {!combinedFilePaths.has(selectedFile) && (
+                <div className="flex flex-1 min-h-0 flex-col overflow-hidden">
+                  <div className="flex h-10 shrink-0 items-center justify-between border-b bg-card px-3">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <FileCode2 className="h-4 w-4 shrink-0 text-zinc-400" />
+                      <p className="min-w-0 truncate text-xs text-zinc-200">{selectedFile || "Select a file"}</p>
+                    </div>
+                    {combinedActiveFile && (
+                      <button
+                        onClick={() => setSelectedFile(combinedActiveFile)}
+                        className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border bg-background px-2 text-xs font-semibold transition hover:bg-muted"
+                      >
+                        <GitCompareArrows className="h-3.5 w-3.5" />
+                        Back to diff
+                      </button>
+                    )}
+                  </div>
+                  {isLoadingContent ? (
+                    <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Loading file
+                    </div>
+                  ) : (
+                    <CodeViewer content={fileContent} />
+                  )}
+                </div>
+              )}
+            </>
           ) : previewData ? (
             <>
               {/* Always mounted — hidden when browsing a non-preview file so decision state is preserved */}
@@ -1172,7 +1215,9 @@ function buildAllAcceptDecisions(preview: PreviewResponse) {
 
 function CombinedDiffPanel({
   entries,
+  allFiles,
   currentFile,
+  onFileChange,
   decisions,
   onDecisionChange,
   expandedContext,
@@ -1182,7 +1227,9 @@ function CombinedDiffPanel({
   isApplying,
 }: {
   entries: CombinedDiffEntry[];
+  allFiles: MergedFileView[];
   currentFile: MergedFileView | null;
+  onFileChange: (filePath: string) => void;
   decisions: AllHunkDecisions;
   onDecisionChange: React.Dispatch<React.SetStateAction<AllHunkDecisions>>;
   expandedContext: Record<string, boolean>;
@@ -1191,7 +1238,20 @@ function CombinedDiffPanel({
   onDiscardAll: () => void;
   isApplying: boolean;
 }) {
-  const allMergedFiles = useMemo(() => buildMergedFiles(entries), [entries]);
+  const allMergedFiles = allFiles;
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [isFileListOpen, setIsFileListOpen] = useState(false);
+
+  const currentIndex = currentFile
+    ? allMergedFiles.findIndex((f) => f.filePath === currentFile.filePath)
+    : 0;
+
+  const goToFile = (index: number) => {
+    if (allMergedFiles.length === 0) return;
+    const wrapped = ((index % allMergedFiles.length) + allMergedFiles.length) % allMergedFiles.length;
+    onFileChange(allMergedFiles[wrapped].filePath);
+    scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  };
 
   const setHunkDecision = (sessionId: string, hunkId: string, d: HunkDecision) =>
     onDecisionChange((prev) => ({ ...prev, [`${sessionId}:${hunkId}`]: d }));
@@ -1241,17 +1301,24 @@ function CombinedDiffPanel({
         </div>
       </div>
 
-      {/* ── Diff pane: shows only the file selected in the Explorer sidebar ── */}
-      <div className="min-h-0 flex-1 overflow-auto font-mono text-xs leading-5">
+      {/* ── File sub-header ── */}
+      {currentFile && (
+        <div className="flex h-11 shrink-0 items-center gap-2 border-b bg-background px-4">
+          <FileCode2 className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 flex-1 truncate text-sm font-semibold">{currentFile.relativePath}</span>
+          <span className="shrink-0 text-xs text-muted-foreground">
+            <span className="text-emerald-400">+{currentFile.totalAdditions}</span>
+            {" / "}
+            <span className="text-red-400">−{currentFile.totalDeletions}</span>
+          </span>
+        </div>
+      )}
+
+      {/* ── Diff pane ── */}
+      <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-auto font-mono text-xs leading-5">
         {currentFile ? (
-          <>
-            {/* Sticky file path header */}
-            <div className="sticky top-0 z-10 flex items-center gap-3 border-b border-zinc-800 bg-zinc-800/95 px-3 py-1.5 backdrop-blur">
-              <FileCode2 className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
-              <span className="flex-1 truncate text-zinc-200">{currentFile.relativePath}</span>
-              <span className="shrink-0 text-[11px] text-emerald-400">+{currentFile.totalAdditions}</span>
-              <span className="shrink-0 text-[11px] text-red-400">−{currentFile.totalDeletions}</span>
-            </div>
+          <div className="pb-16">
+            {/* Hunks */}
 
             {currentFile.mergedHunks.map(({ sessionId, hunkData: hunk }: MergedHunk) => {
               const key = `${sessionId}:${hunk.hunk_id}`;
@@ -1361,10 +1428,66 @@ function CombinedDiffPanel({
                 </div>
               );
             })}
-          </>
+          </div>
         ) : (
           <div className="flex h-full items-center justify-center text-sm text-zinc-500">
             Select a changed file in the Explorer to review
+          </div>
+        )}
+
+        {/* ── Floating file navigator (same as single-package DiffReviewPanel) ── */}
+        {allMergedFiles.length > 0 && (
+          <div className="absolute bottom-4 left-1/2 z-20 w-[min(520px,calc(100%-2rem))] -translate-x-1/2 rounded-lg border bg-card/95 p-1 shadow-2xl backdrop-blur">
+            {isFileListOpen && (
+              <div className="absolute bottom-full left-1/2 mb-1.5 max-h-56 w-[min(480px,calc(100vw-3rem))] -translate-x-1/2 overflow-auto rounded-lg border bg-card p-1.5 shadow-2xl">
+                <div className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  {allMergedFiles.length} changed file{allMergedFiles.length === 1 ? "" : "s"}
+                </div>
+                <div className="space-y-0.5">
+                  {allMergedFiles.map((file, index) => (
+                    <button
+                      key={file.filePath}
+                      onClick={() => { goToFile(index); setIsFileListOpen(false); }}
+                      className={cn(
+                        "flex h-7 w-full min-w-0 items-center justify-between gap-2 rounded px-2 text-left text-[11px] transition",
+                        index === currentIndex ? "bg-primary text-primary-foreground" : "hover:bg-muted"
+                      )}
+                    >
+                      <span className="min-w-0 truncate font-mono">{file.relativePath}</span>
+                      <span className="shrink-0 text-[10px] opacity-70">
+                        +{file.totalAdditions}/−{file.totalDeletions}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => goToFile(currentIndex - 1)}
+                disabled={allMergedFiles.length <= 1}
+                title="Previous file"
+                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border bg-background text-xs transition hover:bg-muted disabled:opacity-40"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+              </button>
+              <button
+                onClick={() => setIsFileListOpen((o) => !o)}
+                className="min-w-0 flex-1 rounded bg-muted px-2 py-1 text-center text-[11px] font-semibold transition hover:bg-muted/80"
+              >
+                <span>{allMergedFiles.length} file{allMergedFiles.length === 1 ? "" : "s"} changed</span>
+                <span className="mx-1.5 text-muted-foreground">|</span>
+                <span>{currentIndex + 1}/{allMergedFiles.length}</span>
+              </button>
+              <button
+                onClick={() => goToFile(currentIndex + 1)}
+                disabled={allMergedFiles.length <= 1}
+                title="Next file"
+                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border bg-background text-xs transition hover:bg-muted disabled:opacity-40"
+              >
+                <ChevronRight className="h-3.5 w-3.5" />
+              </button>
+            </div>
           </div>
         )}
       </div>
