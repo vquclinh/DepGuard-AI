@@ -181,8 +181,19 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
   const [isApplyingAll, setIsApplyingAll] = useState(false);
   const batchCollectedRef = useRef<PreviewResponse[]>([]);
   const explorerDragRef = useRef({ startX: 0, startWidth: EXPLORER_DEFAULT_WIDTH });
+  const contentRequestRef = useRef(0);
+  const selectedFileRef = useRef("");
+  const reviewModeRef = useRef(false);
 
   const updateAllCandidates = useMemo(() => packages.filter(isUpdateCandidate), [packages]);
+
+  useEffect(() => {
+    selectedFileRef.current = selectedFile;
+  }, [selectedFile]);
+
+  useEffect(() => {
+    reviewModeRef.current = Boolean(previewData || combinedDiffEntries);
+  }, [combinedDiffEntries, previewData]);
 
   const mergedFiles = useMemo(
     () => (combinedDiffEntries ? buildMergedFiles(combinedDiffEntries) : []),
@@ -218,7 +229,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     try {
       const data = await getProjectFiles(folderPath);
       setFiles(data.files);
-      if ((selectFirstFile || !selectedFile) && data.files.length > 0) {
+      if ((selectFirstFile || !selectedFileRef.current) && data.files.length > 0 && !reviewModeRef.current) {
         setSelectedFile(data.files[0].path);
       }
     } catch (error) {
@@ -232,15 +243,20 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     if (!folderPath || !filePath) return;
 
     setIsLoadingContent(true);
+    const requestId = ++contentRequestRef.current;
     try {
       const data = await getFileContent(folderPath, filePath);
+      if (requestId !== contentRequestRef.current) return;
       setSelectedFile(data.path);
       setFileContent(data.content);
       setActiveChangedFile("");
     } catch (error) {
+      if (requestId !== contentRequestRef.current) return;
       onLog(`Could not open ${filePath}: ${error instanceof Error ? error.message : "Unknown error"}`, "error");
     } finally {
-      setIsLoadingContent(false);
+      if (requestId === contentRequestRef.current) {
+        setIsLoadingContent(false);
+      }
     }
   };
 
@@ -456,10 +472,15 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
         startNextQueuedUpdate();
       } else {
         // Single package: show for immediate review
+        const firstPreviewFile = result.files[0]?.file_path ?? "";
+        reviewModeRef.current = true;
+        contentRequestRef.current += 1;
+        setActiveChangedFile("");
+        setIsLoadingContent(false);
         setPreviewData(result);
         setPreviewPackageName(pkg.name);
-        setPreviewActiveFile(result.files[0]?.file_path ?? "");
-        setSelectedFile(result.files[0]?.file_path ?? "");
+        setPreviewActiveFile(firstPreviewFile);
+        setSelectedFile(firstPreviewFile);
         setRightPanelMode("progress");
         onLog(`Preview ready for ${pkg.name}: ${result.summary.total_files_changed} file(s) changed.`, "info");
       }
@@ -613,8 +634,13 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
         sessionId: p.session_id,
         files: p.files,
       }));
+      const firstMergedFile = buildMergedFiles(builtEntries)[0]?.filePath ?? "";
+      reviewModeRef.current = true;
+      contentRequestRef.current += 1;
+      setIsLoadingContent(false);
       setCombinedDiffEntries(builtEntries);
-      setCombinedActiveFile(buildMergedFiles(builtEntries)[0]?.filePath ?? "");
+      setCombinedActiveFile(firstMergedFile);
+      setSelectedFile(firstMergedFile);
       setCombinedHunkDecisions({});
     }
   };
