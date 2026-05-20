@@ -84,6 +84,10 @@ class ApplyPreviewRequest(BaseModel):
     session_id: str
     decisions: dict
 
+class ApplyPreviewSelectionRequest(BaseModel):
+    session_id: str
+    decisions: dict
+
 PREVIEW_SESSIONS: dict[str, dict] = {}
 PREVIEW_SESSION_TTL_SECONDS = 30 * 60
 
@@ -451,6 +455,68 @@ def _apply_partial_hunks(original: str, patched: str, accepted_hunk_ids: set[str
 
     trailing_newline = "\n" if original.endswith("\n") or patched.endswith("\n") else ""
     return "\n".join(merged_lines) + trailing_newline
+
+def _session_set(session: dict, key: str) -> set[str]:
+    values = session.get(key, set())
+    if not isinstance(values, set):
+        values = set(values)
+    session[key] = values
+    return values
+
+def _ensure_preview_checkpoint(session: dict, folder_path: Path) -> str:
+    if session.get("checkpoint_id"):
+        return session["checkpoint_id"]
+
+    package_name = session.get("package_info", {}).get("name", "unknown")
+    checkpoint_id = f"depguard_checkpoint_{uuid.uuid4().hex[:8]}"
+    try:
+        subprocess.run(["git", "add", "."], capture_output=True, check=False, cwd=str(folder_path))
+        res = subprocess.run(
+            ["git", "commit", "-m", f"depguard: checkpoint before patching {package_name} {checkpoint_id}"],
+            capture_output=True,
+            check=False,
+            cwd=str(folder_path),
+        )
+        if res.returncode == 0:
+            session["checkpoint_id"] = checkpoint_id
+    except Exception:
+        pass
+    return session.get("checkpoint_id", "")
+
+def _selection_hunk_sets(original: str, patched: str, file_decision: dict) -> tuple[set[str], set[str], set[str]]:
+    hunks, _additions, _deletions = _build_hunks(original, patched)
+    all_hunk_ids = {hunk["hunk_id"] for hunk in hunks}
+    decision = file_decision.get("file_decision")
+    hunk_decisions = file_decision.get("hunks", {})
+
+    if decision == "accept":
+        return all_hunk_ids, all_hunk_ids, all_hunk_ids
+    if decision == "reject":
+        return all_hunk_ids, all_hunk_ids, set()
+
+    decided_hunk_ids = set(hunk_decisions.keys()) & all_hunk_ids
+    accepted_hunk_ids = {
+        hunk_id for hunk_id, hunk_decision in hunk_decisions.items()
+        if hunk_decision == "accept"
+    } & all_hunk_ids
+    return all_hunk_ids, decided_hunk_ids, accepted_hunk_ids
+
+def _write_preview_file(
+    session: dict,
+    folder_path: Path,
+    relative_path: str,
+    original: str,
+    final_content: str,
+) -> str:
+    _ensure_preview_checkpoint(session, folder_path)
+    target = _safe_project_path(folder_path, relative_path)
+    if target.exists():
+        current_on_disk = _read_text_if_exists(target)
+        if current_on_disk != original:
+            final_content = _apply_delta(original, final_content, current_on_disk)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(final_content, encoding="utf-8")
+    return _read_text_if_exists(target)
 
 # ------------------------------ Health Check Endpoint ---------------------------------
 @app.get("/health")
@@ -931,6 +997,100 @@ def apply_preview(req: ApplyPreviewRequest):
     except Exception as e:
         logger.error(f"Error applying preview: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to apply preview: {e}")
+
+@app.post("/apply-selection")
+def apply_preview_selection(req: ApplyPreviewSelectionRequest):
+    _cleanup_preview_sessions()
+    session = PREVIEW_SESSIONS.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Preview session not found or expired")
+
+    folder_path = Path(session["folder_path"])
+    files_accepted = _session_set(session, "files_accepted")
+    files_rejected = _session_set(session, "files_rejected")
+    dependency_file_updated = session.get("dependency_file_updated", "")
+
+    try:
+        for relative_path, file_decision in req.decisions.items():
+            if relative_path not in session.get("files_original", {}):
+                continue
+
+            original = session["files_original"][relative_path]
+            patched = session.get("files_patched", {}).get(relative_path, original)
+            if original == patched:
+                session["files_original"].pop(relative_path, None)
+                session["files_patched"].pop(relative_path, None)
+                continue
+
+            all_hunk_ids, decided_hunk_ids, accepted_hunk_ids = _selection_hunk_sets(
+                original,
+                patched,
+                file_decision,
+            )
+            if not decided_hunk_ids:
+                continue
+
+            current_after_decision = _read_text_if_exists(_safe_project_path(folder_path, relative_path))
+            if accepted_hunk_ids:
+                accepted_content = (
+                    patched
+                    if accepted_hunk_ids == all_hunk_ids
+                    else _apply_partial_hunks(original, patched, accepted_hunk_ids)
+                )
+                current_after_decision = _write_preview_file(
+                    session,
+                    folder_path,
+                    relative_path,
+                    original,
+                    accepted_content,
+                )
+                files_accepted.add(relative_path)
+                files_rejected.discard(relative_path)
+
+                package_info = session.get("package_info", {})
+                try:
+                    dep_relative = _relative_path(folder_path, package_info.get("file_path", ""))
+                    if relative_path == dep_relative:
+                        dependency_file_updated = Path(relative_path).name
+                        session["dependency_file_updated"] = dependency_file_updated
+                except Exception:
+                    pass
+
+            remaining_hunk_ids = all_hunk_ids - decided_hunk_ids
+            if remaining_hunk_ids:
+                pending_content = _apply_partial_hunks(
+                    original,
+                    patched,
+                    accepted_hunk_ids | remaining_hunk_ids,
+                )
+                if current_after_decision != original:
+                    pending_content = _apply_delta(original, pending_content, current_after_decision)
+                session["files_original"][relative_path] = current_after_decision
+                session["files_patched"][relative_path] = pending_content
+            else:
+                session["files_original"].pop(relative_path, None)
+                session["files_patched"].pop(relative_path, None)
+                if relative_path not in files_accepted:
+                    files_rejected.add(relative_path)
+
+        session["created_at"] = time.time()
+        preview = _preview_response(session)
+        complete = preview["summary"]["total_files_changed"] == 0
+        response = {
+            "status": "success",
+            "complete": complete,
+            "preview": None if complete else preview,
+            "files_accepted": sorted(files_accepted),
+            "files_rejected": sorted(files_rejected),
+            "dependency_file_updated": dependency_file_updated,
+            "checkpoint_id": session.get("checkpoint_id", ""),
+        }
+        if complete:
+            PREVIEW_SESSIONS.pop(req.session_id, None)
+        return response
+    except Exception as e:
+        logger.error(f"Error applying preview selection: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to apply preview selection: {e}")
 
 @app.delete("/preview/{session_id}")
 def discard_preview(session_id: str):

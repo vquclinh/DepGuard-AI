@@ -25,6 +25,7 @@ import {
 import { type PackageData } from "@/components/PackagesTable";
 import {
   applyPreview,
+  applyPreviewSelection,
   batchSandboxCheckStream,
   discardPreview,
   getFileContent,
@@ -673,14 +674,93 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
 
   const handleDiscardAll = async () => {
     if (!combinedDiffEntries) return;
-    for (const entry of combinedDiffEntries) {
-      await discardPreview(entry.sessionId).catch(() => {});
-    }
+    const entries = combinedDiffEntries;
     setCombinedDiffEntries(null);
     setCombinedActiveFile("");
     setCombinedHunkDecisions({});
     setRightPanelMode("progress");
+    for (const entry of entries) {
+      await discardPreview(entry.sessionId).catch(() => {});
+    }
     appendProgressLine({ message: "All pending changes discarded", status: "info", badge: "Discarded" });
+  };
+
+  const reconcileCombinedSelectionResults = (
+    results: Array<[string, Awaited<ReturnType<typeof applyPreviewSelection>>]>
+  ) => {
+    if (!combinedDiffEntries) return;
+
+    const resultBySession = new Map(results);
+    const nextEntries = combinedDiffEntries.flatMap((entry) => {
+      const result = resultBySession.get(entry.sessionId);
+      if (!result) return [entry];
+      if (result.complete || !result.preview) return [];
+      return [{
+        ...entry,
+        packageName: result.preview.package || entry.packageName,
+        fromVersion: result.preview.from_version || entry.fromVersion,
+        toVersion: result.preview.to_version || entry.toVersion,
+        files: result.preview.files,
+      }];
+    });
+
+    for (const [sessionId, result] of results) {
+      const entry = combinedDiffEntries.find((item) => item.sessionId === sessionId);
+      if (result.checkpoint_id) setLastCheckpointId(result.checkpoint_id);
+      if (!entry || !result.complete || result.files_accepted.length === 0) continue;
+      onPackagesUpdated?.((prev) =>
+        prev.map((pkg) =>
+          pkg.name === entry.packageName ? { ...pkg, current_version: entry.toVersion } : pkg
+        )
+      );
+    }
+
+    setCombinedDiffEntries(nextEntries.length > 0 ? nextEntries : null);
+    setCombinedHunkDecisions({});
+    const nextMergedFiles = buildMergedFiles(nextEntries);
+    const activeStillPending = nextMergedFiles.some(
+      (file) => file.filePath === combinedActiveFile || file.relativePath === combinedActiveFile
+    );
+    const nextActiveFile = activeStillPending
+      ? combinedActiveFile
+      : nextMergedFiles[0]?.filePath ?? "";
+    setCombinedActiveFile(nextActiveFile);
+    if (nextActiveFile) {
+      setSelectedFile(nextActiveFile);
+    } else {
+      setRightPanelMode("progress");
+      appendProgressLine({ message: "All reviewed changes resolved", status: "success", badge: "Done" });
+      if (selectedFile) void loadContent(selectedFile);
+    }
+    void loadFiles();
+  };
+
+  const applyCombinedSelections = async (
+    requests: Array<[string, object]>,
+    successMessage?: string,
+  ) => {
+    if (!combinedDiffEntries || requests.length === 0) return;
+    setIsApplyingAll(true);
+    try {
+      const results: Array<[string, Awaited<ReturnType<typeof applyPreviewSelection>>]> = [];
+      for (const [sessionId, decisions] of requests) {
+        const result = await applyPreviewSelection(sessionId, decisions);
+        results.push([sessionId, result]);
+      }
+      reconcileCombinedSelectionResults(results);
+      if (successMessage) {
+        appendProgressLine({ message: successMessage, status: "sub", badge: "Reviewed" });
+      }
+    } catch (error) {
+      appendProgressLine({
+        message: `Apply selection failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+        status: "error",
+        badge: "Error",
+      });
+      setCombinedHunkDecisions({});
+    } finally {
+      setIsApplyingAll(false);
+    }
   };
 
   const handlePreviewApplied = (result: ApplyResponse) => {
@@ -745,6 +825,27 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
     if (selectedFile) {
       void loadContent(selectedFile);
     }
+  };
+
+  const handlePreviewUpdated = (preview: PreviewResponse) => {
+    setPreviewData(preview);
+    const pendingPaths = new Set<string>();
+    preview.files.forEach((file) => {
+      pendingPaths.add(file.file_path);
+      pendingPaths.add(file.relative_path);
+    });
+    const currentPath = previewActiveFile || selectedFile;
+    const nextPath = pendingPaths.has(currentPath)
+      ? currentPath
+      : preview.files[0]?.file_path ?? "";
+
+    setPreviewActiveFile(nextPath);
+    if (nextPath) {
+      setSelectedFile(nextPath);
+    } else if (selectedFile) {
+      void loadContent(selectedFile);
+    }
+    void loadFiles();
   };
 
   const handleRollback = async () => {
@@ -1016,6 +1117,20 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
                   folderPath={folderPath}
                   decisions={combinedHunkDecisions}
                   onDecisionChange={setCombinedHunkDecisions}
+                  onApplyHunkDecision={(file, sessionId, hunkId, decision) => {
+                    const shortFile = file.relativePath.split("/").pop() ?? file.relativePath;
+                    void applyCombinedSelections(
+                      [[sessionId, buildCombinedHunkSelectionDecision(file, hunkId, decision)]],
+                      `Hunk ${decision === "accepted" ? "accepted" : "rejected"} in ${shortFile}`,
+                    );
+                  }}
+                  onApplyFileDecision={(file, decision) => {
+                    const shortFile = file.relativePath.split("/").pop() ?? file.relativePath;
+                    void applyCombinedSelections(
+                      buildCombinedFileSelectionDecisions(file, decision),
+                      `${decision === "accepted" ? "Accepted" : "Rejected"} all hunks in ${shortFile}`,
+                    );
+                  }}
                   onAcceptAll={() => {
                     setCombinedDiffEntries(null);
                     setCombinedActiveFile("");
@@ -1071,6 +1186,7 @@ export function IdeWorkspaceView({ folderPath, packages, onBack, onLog, onPackag
                   onApplied={handlePreviewApplied}
                   onDiscarded={handlePreviewDiscarded}
                   onError={(message) => onLog(message, "error")}
+                  onPreviewUpdated={handlePreviewUpdated}
                   onDecision={(file, scope, decision) => {
                     const shortFile = file.split("/").pop() ?? file;
                     const label = scope === "file"
@@ -1214,6 +1330,37 @@ function buildAllAcceptDecisions(preview: PreviewResponse) {
   );
 }
 
+function buildCombinedHunkSelectionDecision(file: MergedFileView, hunkId: string, decision: HunkDecision) {
+  return {
+    [file.relativePath]: {
+      file_decision: "partial",
+      hunks: {
+        [hunkId]: decision === "rejected" ? "reject" : "accept",
+      },
+    },
+  };
+}
+
+function buildCombinedFileSelectionDecisions(file: MergedFileView, decision: HunkDecision): Array<[string, object]> {
+  const applyDecision = decision === "rejected" ? "reject" : "accept";
+  const hunksBySession = new Map<string, string[]>();
+  for (const { sessionId, hunkData } of file.mergedHunks) {
+    const hunks = hunksBySession.get(sessionId) ?? [];
+    hunks.push(hunkData.hunk_id);
+    hunksBySession.set(sessionId, hunks);
+  }
+
+  return Array.from(hunksBySession.entries()).map(([sessionId, hunkIds]) => [
+    sessionId,
+    {
+      [file.relativePath]: {
+        file_decision: applyDecision,
+        hunks: Object.fromEntries(hunkIds.map((hunkId) => [hunkId, applyDecision])),
+      },
+    },
+  ]);
+}
+
 interface MergedUnifiedRow {
   type: "gap" | "context" | "deletion" | "addition";
   oldLine: number | null;
@@ -1253,6 +1400,8 @@ function CombinedDiffPanel({
   onFileChange,
   decisions,
   onDecisionChange,
+  onApplyHunkDecision,
+  onApplyFileDecision,
   onAcceptAll,
   onApplyAll,
   onDiscardAll,
@@ -1265,6 +1414,8 @@ function CombinedDiffPanel({
   onFileChange: (filePath: string) => void;
   decisions: AllHunkDecisions;
   onDecisionChange: React.Dispatch<React.SetStateAction<AllHunkDecisions>>;
+  onApplyHunkDecision: (file: MergedFileView, sessionId: string, hunkId: string, decision: HunkDecision) => void;
+  onApplyFileDecision: (file: MergedFileView, decision: HunkDecision) => void;
   onAcceptAll: () => void;
   onApplyAll: () => void;
   onDiscardAll: () => void;
@@ -1275,6 +1426,10 @@ function CombinedDiffPanel({
   const [isFileListOpen, setIsFileListOpen] = useState(false);
   const [originalLines, setOriginalLines] = useState<string[]>([]);
   const [loadingFile, setLoadingFile] = useState(false);
+  const hunkSignature = useMemo(
+    () => currentFile?.mergedHunks.map(({ sessionId, hunkData }) => `${sessionId}:${hunkData.hunk_id}:${hunkData.old_start}:${hunkData.old_lines}:${hunkData.new_start}:${hunkData.new_lines}`).join("|") ?? "",
+    [currentFile]
+  );
 
   useEffect(() => {
     if (!currentFile) return;
@@ -1284,7 +1439,7 @@ function CombinedDiffPanel({
       .then((r) => setOriginalLines(r.content.split("\n")))
       .catch(() => setOriginalLines([]))
       .finally(() => setLoadingFile(false));
-  }, [currentFile?.filePath, folderPath]);
+  }, [currentFile?.filePath, folderPath, hunkSignature]);
 
   const rows = useMemo(
     () => (currentFile && originalLines.length > 0 ? buildMergedUnifiedRows(originalLines, currentFile.mergedHunks) : []),
@@ -1302,17 +1457,23 @@ function CombinedDiffPanel({
     scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  const setHunkDecision = (sessionId: string, hunkId: string, d: HunkDecision) =>
+  const setHunkDecision = (sessionId: string, hunkId: string, d: HunkDecision) => {
     onDecisionChange((prev) => ({ ...prev, [`${sessionId}:${hunkId}`]: d }));
+    if (currentFile) {
+      onApplyHunkDecision(currentFile, sessionId, hunkId, d);
+    }
+  };
 
   const getDecision = (sessionId: string, hunkId: string): HunkDecision =>
     decisions[`${sessionId}:${hunkId}`] ?? "pending";
 
-  const setFileDecision = (file: MergedFileView, d: HunkDecision) =>
+  const setFileDecision = (file: MergedFileView, d: HunkDecision) => {
     onDecisionChange((prev) => ({
       ...prev,
       ...Object.fromEntries(file.mergedHunks.map(({ sessionId, hunkData }) => [`${sessionId}:${hunkData.hunk_id}`, d])),
     }));
+    onApplyFileDecision(file, d);
+  };
 
   const totalAdditions = allMergedFiles.reduce((s, f) => s + f.totalAdditions, 0);
   const totalDeletions = allMergedFiles.reduce((s, f) => s + f.totalDeletions, 0);
@@ -1412,13 +1573,15 @@ function CombinedDiffPanel({
                         <div className="flex gap-2">
                           <button
                             onClick={() => setHunkDecision(row.sessionId!, row.hunk!.hunk_id, "accepted")}
-                            className="inline-flex h-5 items-center gap-1 rounded border border-emerald-700/40 bg-emerald-950/50 px-1.5 text-[10px] font-semibold text-emerald-500 transition hover:bg-emerald-900/50"
+                            disabled={isApplying}
+                            className="inline-flex h-5 items-center gap-1 rounded border border-emerald-700/40 bg-emerald-950/50 px-1.5 text-[10px] font-semibold text-emerald-500 transition hover:bg-emerald-900/50 disabled:opacity-50"
                           >
                             <Check className="h-2.5 w-2.5" /> Accept
                           </button>
                           <button
                             onClick={() => setHunkDecision(row.sessionId!, row.hunk!.hunk_id, "rejected")}
-                            className="inline-flex h-5 items-center gap-1 rounded border border-red-700/40 bg-red-950/50 px-1.5 text-[10px] font-semibold text-red-500 transition hover:bg-red-900/50"
+                            disabled={isApplying}
+                            className="inline-flex h-5 items-center gap-1 rounded border border-red-700/40 bg-red-950/50 px-1.5 text-[10px] font-semibold text-red-500 transition hover:bg-red-900/50 disabled:opacity-50"
                           >
                             <X className="h-2.5 w-2.5" /> Reject
                           </button>
@@ -1501,7 +1664,7 @@ function CombinedDiffPanel({
             </button>
             <button
               onClick={() => currentFile && setFileDecision(currentFile, "accepted")}
-              disabled={!currentFile}
+              disabled={!currentFile || isApplying}
               className="inline-flex h-7 shrink-0 items-center gap-1 rounded border bg-background px-2 text-[11px] font-semibold text-emerald-500 transition hover:bg-muted disabled:opacity-40"
             >
               <Check className="h-3.5 w-3.5" />
@@ -1509,7 +1672,7 @@ function CombinedDiffPanel({
             </button>
             <button
               onClick={() => currentFile && setFileDecision(currentFile, "rejected")}
-              disabled={!currentFile}
+              disabled={!currentFile || isApplying}
               className="inline-flex h-7 shrink-0 items-center gap-1 rounded border bg-background px-2 text-[11px] font-semibold text-red-500 transition hover:bg-muted disabled:opacity-40"
             >
               <X className="h-3.5 w-3.5" />

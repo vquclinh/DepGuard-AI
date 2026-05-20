@@ -15,9 +15,11 @@ import {
 } from "lucide-react";
 import {
   applyPreview,
+  applyPreviewSelection,
   discardPreview,
   getFileContent,
   type ApplyResponse,
+  type ApplySelectionResponse,
   type PreviewFile,
   type PreviewHunk,
   type PreviewResponse,
@@ -65,6 +67,7 @@ interface DiffReviewPanelProps {
   activeFilePath?: string;
   onFileChange?: (filePath: string) => void;
   onDecision?: (file: string, scope: "file" | "hunk", decision: "accepted" | "rejected") => void;
+  onPreviewUpdated?: (preview: PreviewResponse) => void;
 }
 
 export function DiffReviewPanel({
@@ -78,6 +81,7 @@ export function DiffReviewPanel({
   activeFilePath,
   onFileChange,
   onDecision,
+  onPreviewUpdated,
 }: DiffReviewPanelProps) {
   const [currentFileIndex, setCurrentFileIndex] = useState(0);
   const [decisions, setDecisions] = useState<Record<string, FileDecision>>(() => initializeDecisions(preview));
@@ -118,6 +122,35 @@ export function DiffReviewPanel({
     });
   }, [applyError, applyResult, isApplying, onActivityChange, preview, reviewSummary]);
 
+  const handleSelectionResult = (result: ApplySelectionResponse) => {
+    const appliedResult = selectionResultToApplyResponse(result);
+    if (result.complete) {
+      setApplyResult(appliedResult);
+      onApplied(appliedResult);
+      return;
+    }
+    if (result.preview) {
+      onPreviewUpdated?.(result.preview);
+    }
+  };
+
+  const applySelection = async (selectionDecisions: object) => {
+    setIsApplying(true);
+    setApplyError("");
+    setApplyResult(null);
+    try {
+      const result = await applyPreviewSelection(preview.session_id, selectionDecisions);
+      handleSelectionResult(result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to apply preview selection";
+      setDecisions(initializeDecisions(preview));
+      setApplyError(message);
+      onError(message);
+    } finally {
+      setIsApplying(false);
+    }
+  };
+
   const setHunkDecision = (file: PreviewFile, hunkId: string, decision: HunkDecisionState) => {
     setApplyResult(null);
     setApplyError("");
@@ -133,6 +166,7 @@ export function DiffReviewPanel({
     }));
     if (decision !== "pending") {
       onDecision?.(file.relative_path, "hunk", decision);
+      void applySelection(buildHunkSelectionDecision(file, hunkId, decision));
     }
   };
 
@@ -150,6 +184,7 @@ export function DiffReviewPanel({
     }));
     if (decision !== "pending") {
       onDecision?.(file.relative_path, "file", decision);
+      void applySelection(buildFileSelectionDecision(file, decision));
     }
   };
 
@@ -160,6 +195,7 @@ export function DiffReviewPanel({
     try {
       const result = await applyPreview(preview.session_id, applyDecisions);
       setApplyResult(result);
+      onApplied(result);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to apply preview";
       setApplyError(message);
@@ -312,6 +348,7 @@ function ReviewContent({
           file={currentFile}
           folderPath={folderPath ?? ""}
           decisions={decisions}
+          isApplying={isApplying}
           onSetHunkDecision={onSetHunkDecision}
         />
       </div>
@@ -320,6 +357,7 @@ function ReviewContent({
         files={preview.files}
         currentFile={currentFile}
         currentFileIndex={currentFileIndex}
+        isApplying={isApplying}
         onGoToFile={onGoToFile}
         onAcceptFile={() => onSetFileDecision(currentFile, "accepted")}
         onRejectFile={() => onSetFileDecision(currentFile, "rejected")}
@@ -455,6 +493,7 @@ function FileNavigator({
   files,
   currentFile,
   currentFileIndex,
+  isApplying,
   onGoToFile,
   onAcceptFile,
   onRejectFile,
@@ -462,6 +501,7 @@ function FileNavigator({
   files: PreviewFile[];
   currentFile: PreviewFile;
   currentFileIndex: number;
+  isApplying: boolean;
   onGoToFile: (index: number) => void;
   onAcceptFile: () => void;
   onRejectFile: () => void;
@@ -522,14 +562,16 @@ function FileNavigator({
         </button>
         <button
           onClick={onAcceptFile}
-          className="inline-flex h-7 shrink-0 items-center gap-1 rounded border bg-background px-2 text-[11px] font-semibold text-emerald-500 transition hover:bg-muted"
+          disabled={isApplying}
+          className="inline-flex h-7 shrink-0 items-center gap-1 rounded border bg-background px-2 text-[11px] font-semibold text-emerald-500 transition hover:bg-muted disabled:opacity-40"
         >
           <Check className="h-3.5 w-3.5" />
           Accept
         </button>
         <button
           onClick={onRejectFile}
-          className="inline-flex h-7 shrink-0 items-center gap-1 rounded border bg-background px-2 text-[11px] font-semibold text-red-500 transition hover:bg-muted"
+          disabled={isApplying}
+          className="inline-flex h-7 shrink-0 items-center gap-1 rounded border bg-background px-2 text-[11px] font-semibold text-red-500 transition hover:bg-muted disabled:opacity-40"
         >
           <X className="h-3.5 w-3.5" />
           Reject
@@ -584,15 +626,21 @@ function FullFileDiffViewer({
   file,
   folderPath,
   decisions,
+  isApplying,
   onSetHunkDecision,
 }: {
   file: PreviewFile;
   folderPath: string;
   decisions: Record<string, FileDecision>;
+  isApplying: boolean;
   onSetHunkDecision: (file: PreviewFile, hunkId: string, decision: HunkDecisionState) => void;
 }) {
   const [originalLines, setOriginalLines] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  const hunkSignature = useMemo(
+    () => file.hunks.map((hunk) => `${hunk.hunk_id}:${hunk.old_start}:${hunk.old_lines}:${hunk.new_start}:${hunk.new_lines}`).join("|"),
+    [file.hunks]
+  );
 
   useEffect(() => {
     setLoading(true);
@@ -607,7 +655,7 @@ function FullFileDiffViewer({
       .finally(() => {
         setLoading(false);
       });
-  }, [file.file_path, folderPath]);
+  }, [file.file_path, folderPath, hunkSignature]);
 
   if (loading) {
     return (
@@ -654,13 +702,15 @@ function FullFileDiffViewer({
                   <div className="flex gap-2">
                     <button
                       onClick={() => onSetHunkDecision(file, hunk.hunk_id, "accepted")}
-                      className="inline-flex h-6 items-center gap-1 rounded border border-emerald-700/40 bg-emerald-950/50 px-2 font-sans text-[10px] font-semibold text-emerald-400 transition hover:bg-emerald-900/50"
+                      disabled={isApplying}
+                      className="inline-flex h-6 items-center gap-1 rounded border border-emerald-700/40 bg-emerald-950/50 px-2 font-sans text-[10px] font-semibold text-emerald-400 transition hover:bg-emerald-900/50 disabled:opacity-50"
                     >
                       <Check className="h-3 w-3" /> Accept
                     </button>
                     <button
                       onClick={() => onSetHunkDecision(file, hunk.hunk_id, "rejected")}
-                      className="inline-flex h-6 items-center gap-1 rounded border border-red-700/40 bg-red-950/50 px-2 font-sans text-[10px] font-semibold text-red-400 transition hover:bg-red-900/50"
+                      disabled={isApplying}
+                      className="inline-flex h-6 items-center gap-1 rounded border border-red-700/40 bg-red-950/50 px-2 font-sans text-[10px] font-semibold text-red-400 transition hover:bg-red-900/50 disabled:opacity-50"
                     >
                       <X className="h-3 w-3" /> Reject
                     </button>
@@ -749,6 +799,39 @@ function RepairDetails({ repair }: { repair: RepairReport }) {
       </div>
     </div>
   );
+}
+
+function buildHunkSelectionDecision(file: PreviewFile, hunkId: string, decision: HunkDecisionState) {
+  return {
+    [file.relative_path]: {
+      file_decision: "partial",
+      hunks: {
+        [hunkId]: decision === "rejected" ? "reject" : "accept",
+      },
+    },
+  };
+}
+
+function buildFileSelectionDecision(file: PreviewFile, decision: HunkDecisionState) {
+  const applyDecision = decision === "rejected" ? "reject" : "accept";
+  return {
+    [file.relative_path]: {
+      file_decision: applyDecision,
+      hunks: Object.fromEntries(file.hunks.map((hunk) => [hunk.hunk_id, applyDecision])),
+    },
+  };
+}
+
+function selectionResultToApplyResponse(result: ApplySelectionResponse): ApplyResponse {
+  return {
+    status: result.status,
+    files_accepted: result.files_accepted,
+    files_rejected: result.files_rejected,
+    dependency_file_updated: result.dependency_file_updated,
+    verification: null,
+    repair: null,
+    checkpoint_id: result.checkpoint_id,
+  };
 }
 
 function initializeDecisions(preview: PreviewResponse): Record<string, FileDecision> {

@@ -153,6 +153,16 @@ export interface ApplyResponse {
   checkpoint_id?: string;
 }
 
+export interface ApplySelectionResponse {
+  status: string;
+  complete: boolean;
+  preview: PreviewResponse | null;
+  files_accepted: string[];
+  files_rejected: string[];
+  dependency_file_updated: string;
+  checkpoint_id?: string;
+}
+
 export interface PreviewStreamEvent {
   event: "phase" | "ast_done" | "scout_done" | "patch_file_start" | "patch_file_done" | "info" | "done" | "error" | "breaking_change" | "file_stats" | "verify_done" | "verify_fail" | "repair_attempt" | "repair_done" | "repair_fail";
   phase?: string;
@@ -254,6 +264,19 @@ export async function applyPreview(sessionId: string, decisions: object): Promis
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to apply preview');
+  }
+  return response.json();
+}
+
+export async function applyPreviewSelection(sessionId: string, decisions: object): Promise<ApplySelectionResponse> {
+  const response = await fetch('/api/apply-selection', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, decisions })
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to apply preview selection');
   }
   return response.json();
 }

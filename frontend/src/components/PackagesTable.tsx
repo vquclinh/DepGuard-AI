@@ -166,6 +166,7 @@ export function PackagesTable({ folderPath, packages, onLog }: PackagesTableProp
           onApplied={handlePreviewApplied}
           onDiscarded={handlePreviewDiscarded}
           onError={(message) => onLog(message, "error")}
+          onPreviewUpdated={setPreviewData}
         />
       )}
       {/* Controls Bar */}
