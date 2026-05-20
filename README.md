@@ -28,10 +28,10 @@ All of this is surfaced through a live-streaming IDE-like UI where you can inspe
 - **Multi-ecosystem support** — `requirements.txt`, `pyproject.toml`, `package.json`, `go.mod`, `Cargo.toml`, `pom.xml`, and more
 - **30+ language AST parser** — Tree-sitter powered analysis of Python, JS/TS, Go, Rust, Java, and others
 - **Real-time streaming UI** — Live terminal-style progress log while the pipeline runs
-- **Hunk-level review** — Accept or reject individual diff hunks before anything is written to disk
+- **Immediate hunk-level review** — Accept or reject individual hunks or files and DepGuard updates the local code right away
 - **LLM provider fallback** — Claude → Gemini → Qwen with automatic failover
 - **Impact graph** — Visual call-graph showing which code paths are affected by each dependency
-- **Undo support** — Git checkpoint created before every apply; one-click rollback
+- **Undo support** — Git checkpoint created before accepted writes; one-click rollback
 - **Verification loop** — ProjectChecker + RepairAgent retry cycle until the build is clean
 
 ---
@@ -148,9 +148,10 @@ Open [http://localhost:5173](http://localhost:5173).
 1. Select a package in the **Right Panel → Dependencies** and click **Update**
 2. The **Progress** tab streams the pipeline live: AST scan → Scout analysis → Patch generation
 3. Green/red diff hunks appear in the middle editor panel
-4. Use **Accept** / **Reject** on individual hunks or entire files
-5. Click **Apply Accepted** — DepGuard writes the files, runs the checker, and repairs any failures
-6. An **Undo** button appears after apply; clicking it rolls back via the git checkpoint
+4. Use **Accept** / **Reject** on individual hunks, entire files, or all pending changes
+5. Each decision updates the local code immediately and removes the resolved diff highlight
+6. When the last pending hunk or file is resolved, DepGuard exits preview mode
+7. An **Undo** button appears after accepted writes; clicking it rolls back via the git checkpoint
 
 ---
 
@@ -162,6 +163,7 @@ Open [http://localhost:5173](http://localhost:5173).
 | `GET` | `/providers` | LLM provider statuses |
 | `GET` | `/scan-stream` | Stream dependency scan results (SSE) |
 | `POST` | `/preview-stream` | Stream patch preview generation (SSE) |
+| `POST` | `/apply-selection` | Immediately apply or reject selected files/hunks and return the remaining preview |
 | `POST` | `/apply` | Write accepted patches; run checker + repair |
 | `DELETE` | `/preview/{session_id}` | Discard a pending preview session |
 | `POST` | `/rollback` | Roll back to a pre-apply git checkpoint |
