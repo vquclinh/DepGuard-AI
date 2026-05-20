@@ -74,7 +74,7 @@ All of this is surfaced through a live-streaming IDE-like UI where you can inspe
 ### 1. Clone
 
 ```bash
-git clone https://github.com/your-org/depguard-ai.git
+git clone https://github.com/vquclinh/DepGuard-AI
 cd depguard-ai
 ```
 
